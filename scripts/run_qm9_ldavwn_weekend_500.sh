@@ -30,7 +30,15 @@ cd "$ROOT_DIR"
 
 : "${NPZ_DIR:=qmugs_npz/qm9_pyscf_ldavwn_b631gd_atoms10_400_50_50_spacing1p5_kp}"
 : "${OUTPUT_ROOT:=transferable_outputs}"
+: "${OUTPUT_DIR:=}"
 : "${RUN_NAME:=qm9_ldavwn_b631gd_atoms9_400_50_50_spacing1p5_gamma8_kpLate_Tlate_w192_r12}"
+: "${TIMESTAMP_OUTPUT:=1}"
+: "${ROTATE_OUTPUT_DIR:=0}"
+: "${OUTPUT_ROTATION_DEPTH:=2}"
+
+: "${DEVICE:=auto}"
+: "${GPU_IDS:=}"
+: "${GPU_MEMORY_GROWTH:=1}"
 
 : "${EPOCHS:=520}"
 : "${BATCH_SIZE:=1024}"
@@ -58,8 +66,55 @@ cd "$ROOT_DIR"
 : "${KINETIC_START_EPOCH:=240}"
 : "${KINETIC_RAMP_EPOCHS:=80}"
 
-STAMP="$(date +%Y%m%d_%H%M%S)"
-TRAIN_OUTPUT_DIR="${OUTPUT_ROOT}/${RUN_NAME}_${STAMP}"
+rotated_output_path() {
+  local target="$1"
+  local generation="$2"
+  local dir name prefix
+  dir="$(dirname "$target")"
+  name="$(basename "$target")"
+  prefix="old"
+  for ((i = 2; i <= generation; i++)); do
+    prefix="${prefix}_old"
+  done
+  printf '%s/%s_%s' "$dir" "$prefix" "$name"
+}
+
+rotate_output_dir() {
+  local target="$1"
+  local depth="$2"
+  local oldest src dst first_old
+  if (( depth <= 0 )) || [[ ! -e "$target" ]]; then
+    return
+  fi
+
+  oldest="$(rotated_output_path "$target" "$depth")"
+  rm -rf "$oldest"
+  for ((generation = depth - 1; generation >= 1; generation--)); do
+    src="$(rotated_output_path "$target" "$generation")"
+    dst="$(rotated_output_path "$target" "$((generation + 1))")"
+    if [[ -e "$src" ]]; then
+      rm -rf "$dst"
+      mv "$src" "$dst"
+    fi
+  done
+  first_old="$(rotated_output_path "$target" 1)"
+  rm -rf "$first_old"
+  mv "$target" "$first_old"
+}
+
+if [[ -n "$OUTPUT_DIR" ]]; then
+  TRAIN_OUTPUT_DIR="$OUTPUT_DIR"
+elif [[ "$TIMESTAMP_OUTPUT" == "1" ]]; then
+  STAMP="$(date +%Y%m%d_%H%M%S)"
+  TRAIN_OUTPUT_DIR="${OUTPUT_ROOT}/${RUN_NAME}_${STAMP}"
+else
+  TRAIN_OUTPUT_DIR="${OUTPUT_ROOT}/${RUN_NAME}"
+fi
+
+if [[ "$ROTATE_OUTPUT_DIR" == "1" ]]; then
+  rotate_output_dir "$TRAIN_OUTPUT_DIR" "$OUTPUT_ROTATION_DEPTH"
+fi
+
 mkdir -p "$TRAIN_OUTPUT_DIR"
 PIPELINE_LOG="${TRAIN_OUTPUT_DIR}/pipeline.log"
 exec > >(tee -a "$PIPELINE_LOG") 2>&1
@@ -69,6 +124,8 @@ echo "[Pipeline] python             : $PYTHON"
 echo "[Pipeline] qm9 tar            : $QM9_TAR"
 echo "[Pipeline] npz dir            : $NPZ_DIR"
 echo "[Pipeline] output dir         : $TRAIN_OUTPUT_DIR"
+echo "[Pipeline] output rotation    : ${ROTATE_OUTPUT_DIR}, depth=${OUTPUT_ROTATION_DEPTH}"
+echo "[Pipeline] device             : ${DEVICE}, gpu_ids=${GPU_IDS:-<auto>}"
 echo "[Pipeline] split              : ${TRAIN_SYSTEM_COUNT}/${VAL_SYSTEM_COUNT}/${TEST_SYSTEM_COUNT}"
 echo "[Pipeline] model              : width=${MODEL_WIDTH}, rank=${LEARNED_RANK}, rff=${RFF_FEATURES}"
 echo "[Pipeline] schedule           : KP ${KP_START_EPOCH}+${KP_RAMP_EPOCHS}, T ${KINETIC_START_EPOCH}+${KINETIC_RAMP_EPOCHS}"
@@ -111,6 +168,9 @@ echo "[Pipeline] Starting training."
 MPLCONFIGDIR=/tmp/mplconfig \
 MPLBACKEND=Agg \
 RDM_OUTPUT_DIR="$TRAIN_OUTPUT_DIR" \
+RDM_DEVICE="$DEVICE" \
+RDM_GPU_IDS="$GPU_IDS" \
+RDM_GPU_MEMORY_GROWTH="$GPU_MEMORY_GROWTH" \
 RDM_LOG_EVERY="$LOG_EVERY" \
 RDM_NORMALIZE_RHO=1 \
 RDM_TAU_STENCIL=richardson \

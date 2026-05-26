@@ -132,6 +132,8 @@ class ExperimentConfig:
     output_dir: str = os.environ.get("RDM_OUTPUT_DIR", "transferable_outputs")
     run_name: str = os.environ.get("RDM_RUN_NAME", "transferable_ks_like")
     auto_run_dir: bool = env_flag("RDM_AUTO_RUN_DIR", False)
+    rotate_output_dir: bool = env_flag("RDM_ROTATE_OUTPUT_DIR", False)
+    output_rotation_depth: int = int(os.environ.get("RDM_OUTPUT_ROTATION_DEPTH", 2))
 
     @property
     def step(self) -> float:

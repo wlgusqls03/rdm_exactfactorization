@@ -2,11 +2,43 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
+import shutil
 from datetime import datetime
 from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
+
+
+def env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "off", "no", "n"}
+
+
+def configure_tensorflow_environment_preimport() -> None:
+    """Apply device-selection env vars before TensorFlow is imported."""
+    requested_device = os.environ.get("RDM_DEVICE", "auto").strip().lower()
+    gpu_ids = os.environ.get("RDM_GPU_IDS", "").strip()
+
+    if requested_device in {"cpu", "none"}:
+        os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+    elif requested_device in {"gpu", "cuda"}:
+        if gpu_ids:
+            os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids
+    elif requested_device == "auto":
+        if gpu_ids:
+            os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids
+    else:
+        raise ValueError("RDM_DEVICE must be one of: auto, cpu, gpu.")
+
+    if env_flag("RDM_GPU_MEMORY_GROWTH", True):
+        os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
+
+
+configure_tensorflow_environment_preimport()
 
 from transferable_rdm.config import ExperimentConfig
 from transferable_rdm.data import build_pair_features, split_systems
@@ -141,6 +173,81 @@ def apply_auto_run_dir(config: ExperimentConfig) -> ExperimentConfig:
     return replace(config, output_dir=str(output_dir))
 
 
+def rotated_output_path(path: Path, generation: int) -> Path:
+    prefix = "_".join(["old"] * generation)
+    return path.with_name(f"{prefix}_{path.name}")
+
+
+def remove_path(path: Path) -> None:
+    if path.is_dir():
+        shutil.rmtree(path)
+    elif path.exists():
+        path.unlink()
+
+
+def rotate_output_dir_if_requested(config: ExperimentConfig) -> None:
+    """Rotate an existing fixed output directory before a new run.
+
+    For RDM_OUTPUT_DIR=result and RDM_OUTPUT_ROTATION_DEPTH=2:
+        old_old_result is deleted
+        old_result -> old_old_result
+        result -> old_result
+    """
+    if not config.rotate_output_dir:
+        return
+    output_dir = Path(config.output_dir).resolve()
+    depth = max(int(config.output_rotation_depth), 0)
+    if depth <= 0 or not output_dir.exists():
+        return
+
+    oldest = rotated_output_path(output_dir, depth)
+    if oldest.exists():
+        remove_path(oldest)
+
+    for generation in range(depth - 1, 0, -1):
+        src = rotated_output_path(output_dir, generation)
+        dst = rotated_output_path(output_dir, generation + 1)
+        if src.exists():
+            if dst.exists():
+                remove_path(dst)
+            src.rename(dst)
+
+    first_old = rotated_output_path(output_dir, 1)
+    if first_old.exists():
+        remove_path(first_old)
+    output_dir.rename(first_old)
+    print_block(
+        "Output rotation",
+        [
+            ("current -> previous", f"{output_dir} -> {first_old}"),
+            ("rotation depth", depth),
+        ],
+    )
+
+
+def configure_tensorflow_runtime() -> None:
+    """Report visible TensorFlow devices and enable GPU memory growth when possible."""
+    import tensorflow as tf
+
+    requested_device = os.environ.get("RDM_DEVICE", "auto").strip().lower()
+    gpus = tf.config.list_physical_devices("GPU")
+    if gpus and env_flag("RDM_GPU_MEMORY_GROWTH", True):
+        for gpu in gpus:
+            try:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            except RuntimeError:
+                pass
+
+    rows = [
+        ("requested device", requested_device),
+        ("CUDA_VISIBLE_DEVICES", os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>")),
+        ("visible GPUs", [gpu.name for gpu in gpus] if gpus else "none"),
+    ]
+    if requested_device in {"gpu", "cuda"} and not gpus:
+        rows.append(("warning", "RDM_DEVICE=gpu was requested, but TensorFlow sees no GPU."))
+    print_block("TensorFlow runtime", rows)
+
+
 def summarize_for_json(summary: dict[str, object]) -> dict[str, object]:
     train_avg = {key: value for key, value in summary["train"].items() if isinstance(value, (int, float))}
     val_avg = {key: value for key, value in summary["val"].items() if isinstance(value, (int, float))}
@@ -262,6 +369,8 @@ def main() -> None:
     config = apply_phase_preset(base_config)
     config = apply_overrides(config, args)
     config = apply_auto_run_dir(config)
+    rotate_output_dir_if_requested(config)
+    configure_tensorflow_runtime()
     set_global_seed(config.seed)
 
     systems = build_system_corpus(config)

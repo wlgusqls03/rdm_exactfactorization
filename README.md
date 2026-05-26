@@ -204,6 +204,25 @@ RDM_INITIAL_LR
 RDM_LR
 ```
 
+Device selection is controlled by environment variables before TensorFlow is
+imported:
+
+```bash
+# Default: let TensorFlow use any visible GPU, otherwise CPU.
+RDM_DEVICE=auto
+
+# Force CPU.
+RDM_DEVICE=cpu
+
+# Request GPU 0.
+RDM_DEVICE=gpu RDM_GPU_IDS=0
+```
+
+`RDM_GPU_MEMORY_GROWTH=1` is the default and asks TensorFlow not to allocate all
+GPU memory at startup. A CUDA-capable TensorFlow installation and working NVIDIA
+driver are still required; if TensorFlow cannot see a GPU, the script prints a
+warning and the run falls back to CPU.
+
 ## Losses
 
 The main losses are:
@@ -235,6 +254,20 @@ Typical outputs:
 - `<run>_point.weights.h5`
 - `<run>_pair.weights.h5`
 - `<run>_context.weights.h5`
+
+For fixed output directories, previous results can be rotated automatically:
+
+```bash
+RDM_OUTPUT_DIR=result \
+RDM_ROTATE_OUTPUT_DIR=1 \
+RDM_OUTPUT_ROTATION_DEPTH=2 \
+python train_transferable_1rdm.py ... --no-auto-run-dir
+```
+
+With depth `2`, an existing `old_old_result` is deleted, `old_result` is moved to
+`old_old_result`, and `result` is moved to `old_result` before the new run writes
+fresh outputs. Do not combine this with `--auto-run-dir` unless you intentionally
+want to rotate timestamped directories.
 
 ## Code Layout
 
