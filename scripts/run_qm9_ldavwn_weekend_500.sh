@@ -28,6 +28,8 @@ if [[ ! -x "$PYTHON" ]]; then
   exit 1
 fi
 : "${QM9_TAR:=data/qm9_raw/dsgdb9nsd.xyz.tar.bz2}"
+: "${QM9_TAR_URL:=https://ndownloader.figshare.com/files/3195389}"
+: "${DOWNLOAD_QM9:=0}"
 
 : "${NUM_SYSTEMS:=500}"
 : "${TRAIN_SYSTEM_COUNT:=400}"
@@ -117,6 +119,26 @@ rotate_output_dir() {
   mv "$target" "$first_old"
 }
 
+valid_qm9_tar() {
+  local target="$1"
+  [[ -s "$target" ]] && tar -tjf "$target" >/dev/null 2>&1
+}
+
+download_qm9_tar() {
+  local target="$1"
+  local url="$2"
+  mkdir -p "$(dirname "$target")"
+  rm -f "$target"
+  if command -v wget >/dev/null 2>&1; then
+    wget -T 60 --tries=5 "$url" -O "$target"
+  elif command -v curl >/dev/null 2>&1; then
+    curl -L --retry 5 --connect-timeout 60 "$url" -o "$target"
+  else
+    echo "[Pipeline] ERROR: neither wget nor curl is available for downloading QM9." >&2
+    exit 1
+  fi
+}
+
 if [[ -n "$OUTPUT_DIR" ]]; then
   TRAIN_OUTPUT_DIR="$OUTPUT_DIR"
 elif [[ "$TIMESTAMP_OUTPUT" == "1" ]]; then
@@ -137,6 +159,7 @@ exec > >(tee -a "$PIPELINE_LOG") 2>&1
 echo "[Pipeline] root               : $ROOT_DIR"
 echo "[Pipeline] python             : $PYTHON"
 echo "[Pipeline] qm9 tar            : $QM9_TAR"
+echo "[Pipeline] qm9 tar url        : $QM9_TAR_URL"
 echo "[Pipeline] npz dir            : $NPZ_DIR"
 echo "[Pipeline] output dir         : $TRAIN_OUTPUT_DIR"
 echo "[Pipeline] output rotation    : ${ROTATE_OUTPUT_DIR}, depth=${OUTPUT_ROTATION_DEPTH}"
@@ -147,8 +170,21 @@ echo "[Pipeline] schedule           : KP ${KP_START_EPOCH}+${KP_RAMP_EPOCHS}, T 
 echo "[Pipeline] loss weights       : gamma=${LAMBDA_GAMMA}, rho=${LAMBDA_RHO}, kernel=${LAMBDA_KERNEL}, KP=${LAMBDA_KP}, T=${LAMBDA_KINETIC}"
 echo "[Pipeline] training           : epochs=${EPOCHS}, steps/epoch=${STEPS_PER_EPOCH}, batch=${BATCH_SIZE}"
 
-if [[ ! -f "$QM9_TAR" ]]; then
-  echo "[Pipeline] ERROR: QM9 tar file not found: $QM9_TAR" >&2
+if ! valid_qm9_tar "$QM9_TAR"; then
+  if [[ "$DOWNLOAD_QM9" == "1" ]]; then
+    echo "[Pipeline] QM9 tar is missing or invalid. Downloading from: $QM9_TAR_URL"
+    download_qm9_tar "$QM9_TAR" "$QM9_TAR_URL"
+  fi
+fi
+
+if ! valid_qm9_tar "$QM9_TAR"; then
+  echo "[Pipeline] ERROR: QM9 tar file is missing or invalid: $QM9_TAR" >&2
+  echo "[Pipeline] Download it with:" >&2
+  echo "[Pipeline]   mkdir -p $(dirname "$QM9_TAR")" >&2
+  echo "[Pipeline]   wget -T 60 --tries=5 '$QM9_TAR_URL' -O '$QM9_TAR'" >&2
+  echo "[Pipeline] Then verify with:" >&2
+  echo "[Pipeline]   file '$QM9_TAR'" >&2
+  echo "[Pipeline]   tar -tjf '$QM9_TAR' | head" >&2
   exit 1
 fi
 

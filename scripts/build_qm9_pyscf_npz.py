@@ -540,6 +540,55 @@ def write_npz(record: Qm9Record, args: argparse.Namespace, output_path: Path) ->
     }
 
 
+REQUIRED_EXISTING_NPZ_KEYS = (
+    "points",
+    "gamma_matrix",
+    "local_features",
+    "global_context",
+    "electron_count",
+)
+
+
+def manifest_row_from_existing_npz(
+    *,
+    output_path: Path,
+    record: Qm9Record,
+    args: argparse.Namespace,
+    index: int,
+) -> dict[str, object] | None:
+    """Return manifest row for a reusable NPZ, or remove it if it is invalid."""
+    try:
+        with np.load(output_path, allow_pickle=True) as payload:
+            missing = [key for key in REQUIRED_EXISTING_NPZ_KEYS if key not in payload]
+            if missing:
+                raise KeyError(f"missing required keys: {', '.join(missing)}")
+            return {
+                "index": index,
+                "split": "train" if index < 500 else "val",
+                "system_id": output_path.stem,
+                "qm9_id": record.qm9_id,
+                "formula": molecular_formula(record.symbols),
+                "smiles_gdb": record.smiles_gdb,
+                "smiles_relaxed": record.smiles_relaxed,
+                "inchi_gdb": record.inchi_gdb,
+                "inchi_relaxed": record.inchi_relaxed,
+                "n_atoms": len(record.symbols),
+                "electron_count": float(payload["electron_count"]),
+                "basis": args.basis,
+                "xc": args.xc,
+                "axis_points": int(payload["axis_points"]) if "axis_points" in payload else "",
+                "grid_spacing_bohr": float(payload["grid_spacing_bohr"]) if "grid_spacing_bohr" in payload else "",
+                "box_length_bohr": float(payload["box_length_bohr"]) if "box_length_bohr" in payload else "",
+                "npz_file": output_path.name,
+                "xyz_file": f"xyz/{output_path.stem}.xyz",
+            }
+    except Exception as exc:
+        print(f"[repair] invalid existing NPZ, rebuilding: {output_path} ({exc})")
+        if output_path.exists():
+            output_path.unlink()
+        return None
+
+
 def write_xyz(record: Qm9Record, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = [
@@ -618,31 +667,16 @@ def main() -> None:
         output_path = args.output_dir / f"{idx:04d}_{record.qm9_id}.npz"
         if output_path.exists():
             print(f"[{idx + 1}/{len(selected)}] exists: {output_path}")
-            with np.load(output_path) as payload:
-                manifest.append(
-                    {
-                        "index": idx,
-                        "split": "train" if idx < 500 else "val",
-                        "system_id": output_path.stem,
-                        "qm9_id": record.qm9_id,
-                        "formula": molecular_formula(record.symbols),
-                        "smiles_gdb": record.smiles_gdb,
-                        "smiles_relaxed": record.smiles_relaxed,
-                        "inchi_gdb": record.inchi_gdb,
-                        "inchi_relaxed": record.inchi_relaxed,
-                        "n_atoms": len(record.symbols),
-                        "electron_count": float(payload["electron_count"]),
-                        "basis": args.basis,
-                        "xc": args.xc,
-                        "axis_points": int(payload["axis_points"]) if "axis_points" in payload else "",
-                        "grid_spacing_bohr": float(payload["grid_spacing_bohr"]) if "grid_spacing_bohr" in payload else "",
-                        "box_length_bohr": float(payload["box_length_bohr"]) if "box_length_bohr" in payload else "",
-                        "npz_file": output_path.name,
-                        "xyz_file": f"xyz/{output_path.stem}.xyz",
-                    }
-                )
-            write_xyz(record, args.output_dir / "xyz" / f"{output_path.stem}.xyz")
-            continue
+            row = manifest_row_from_existing_npz(
+                output_path=output_path,
+                record=record,
+                args=args,
+                index=idx,
+            )
+            if row is not None:
+                manifest.append(row)
+                write_xyz(record, args.output_dir / "xyz" / f"{output_path.stem}.xyz")
+                continue
         print(f"[{idx + 1}/{len(selected)}] DFT -> NPZ: {record.qm9_id} ({len(record.symbols)} atoms)")
         row = write_npz(record, args, output_path)
         row.update(
