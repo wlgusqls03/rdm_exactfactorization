@@ -11,7 +11,22 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-: "${PYTHON:=/home/hbji/miniconda3/envs/polymer-gp/bin/python}"
+if [[ -z "${PYTHON:-}" ]]; then
+  if command -v python >/dev/null 2>&1; then
+    PYTHON="$(command -v python)"
+  elif command -v python3 >/dev/null 2>&1; then
+    PYTHON="$(command -v python3)"
+  else
+    echo "[Pipeline] ERROR: no python executable found. Set PYTHON=/path/to/python." >&2
+    exit 1
+  fi
+fi
+
+if [[ ! -x "$PYTHON" ]]; then
+  echo "[Pipeline] ERROR: python executable not found or not executable: $PYTHON" >&2
+  echo "[Pipeline] Set PYTHON=/path/to/python, for example: PYTHON=\$(which python)" >&2
+  exit 1
+fi
 : "${QM9_TAR:=data/qm9_raw/dsgdb9nsd.xyz.tar.bz2}"
 
 : "${NUM_SYSTEMS:=500}"
