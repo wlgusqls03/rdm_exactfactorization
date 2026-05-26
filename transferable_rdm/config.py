@@ -1,0 +1,153 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+
+
+def env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "off", "no", "n"}
+
+
+def env_float_any(names: tuple[str, ...], default: float) -> float:
+    for name in names:
+        value = os.environ.get(name)
+        if value is not None:
+            return float(value)
+    return default
+
+
+@dataclass(frozen=True)
+class ExperimentConfig:
+    """Transferable 1-RDM 실험 전체 설정.
+
+    이 설정은 "단일 toy를 외우는 실험"이 아니라, 여러 시스템을 함께 학습하고
+    held-out system에서 일반화 성능을 보는 실험을 목표로 한다.
+    """
+
+    # ------------------------------------------------------------------
+    # 데이터 모드
+    # ------------------------------------------------------------------
+    dataset_mode: str = os.environ.get("RDM_DATASET_MODE", "ks_like")
+    # "ks_like"  : synthetic separable KS-like systems 생성
+    # "npz"      : 외부 NPZ dataset 로드
+    # "mixed"    : npz가 있으면 같이 섞고, 없으면 ks_like만 사용
+    npz_glob: str = os.environ.get("RDM_NPZ_GLOB", "")
+    phase: str = os.environ.get("RDM_PHASE", "none")
+    # "none"    : 기존 설정 사용
+    # "phase1a" : QMugs-NPZ prototype, 300 train / 100 val
+    # "phase1b" : QMugs-NPZ generalization check, 800 train / 100 val / 100 test
+
+    # ------------------------------------------------------------------
+    # 시스템 / grid 설정
+    # ------------------------------------------------------------------
+    seed: int = int(os.environ.get("RDM_SEED", 0))
+    num_systems: int = int(os.environ.get("RDM_NUM_SYSTEMS", 18))
+    train_system_fraction: float = float(os.environ.get("RDM_TRAIN_SYSTEM_FRACTION", 0.75))
+    train_system_count: int = int(os.environ.get("RDM_TRAIN_SYSTEM_COUNT", 0))
+    val_system_count: int = int(os.environ.get("RDM_VAL_SYSTEM_COUNT", 0))
+    test_system_count: int = int(os.environ.get("RDM_TEST_SYSTEM_COUNT", 0))
+
+    axis_points: int = int(os.environ.get("RDM_AXIS_POINTS", 7))
+    domain_radius: float = float(os.environ.get("RDM_DOMAIN_RADIUS", 4.0))
+    max_wells: int = int(os.environ.get("RDM_MAX_WELLS", 2))
+    max_orbitals: int = int(os.environ.get("RDM_MAX_ORBITALS", 8))
+    spectral_subset_points: int = int(os.environ.get("RDM_SPECTRAL_SUBSET_POINTS", 64))
+    eval_pair_count: int = int(os.environ.get("RDM_EVAL_PAIR_COUNT", 32768))
+    full_eval_max_points: int = int(os.environ.get("RDM_FULL_EVAL_MAX_POINTS", 2500))
+
+    # ------------------------------------------------------------------
+    # 모델 설정
+    # ------------------------------------------------------------------
+    model_width: int = int(os.environ.get("RDM_MODEL_WIDTH", 192))
+    learned_rank: int = int(os.environ.get("RDM_LEARNED_RANK", 8))
+    rff_features: int = int(os.environ.get("RDM_RFF_FEATURES", 32))
+    rff_scale: float = float(os.environ.get("RDM_RFF_SCALE", 2.0))
+    occ_max: float = float(os.environ.get("RDM_OCC_MAX", 1.0))
+    normalize_rho: bool = env_flag("RDM_NORMALIZE_RHO", True)
+    tau_stencil: str = os.environ.get("RDM_TAU_STENCIL", "richardson")
+
+    # ------------------------------------------------------------------
+    # 학습 설정
+    # ------------------------------------------------------------------
+    batch_size: int = int(os.environ.get("RDM_BATCH_SIZE", 2048))
+    steps_per_epoch: int = int(os.environ.get("RDM_STEPS_PER_EPOCH", 80))
+    epochs: int = int(os.environ.get("RDM_EPOCHS", 400))
+    val_every: int = int(os.environ.get("RDM_VAL_EVERY", 5))
+    log_every: int = int(os.environ.get("RDM_LOG_EVERY", 10))
+    early_stopping_patience: int = int(os.environ.get("RDM_PATIENCE", 40))
+
+    initial_lr: float = env_float_any(("RDM_LEARNING_RATE", "RDM_INITIAL_LR", "RDM_LR"), 3e-4)
+    min_lr: float = float(os.environ.get("RDM_MIN_LR", 1e-5))
+    lr_decay: float = float(os.environ.get("RDM_LR_DECAY", 0.5))
+    lr_patience: int = int(os.environ.get("RDM_LR_PATIENCE", 12))
+    lr_min_improvement: float = float(os.environ.get("RDM_LR_MIN_IMPROVEMENT", 1e-5))
+    weight_decay: float = float(os.environ.get("RDM_WEIGHT_DECAY", 1e-6))
+
+    # ------------------------------------------------------------------
+    # loss weight
+    # ------------------------------------------------------------------
+    loss_preset: str = os.environ.get("RDM_LOSS_PRESET", "all")
+    # "all" / "custom" : individual RDM_USE_*_LOSS switches decide active terms
+    # "core5"          : gamma + rho + kernel + trace + mode only
+
+    use_gamma_loss: bool = env_flag("RDM_USE_GAMMA_LOSS", True)
+    use_rho_loss: bool = env_flag("RDM_USE_RHO_LOSS", True)
+    use_kernel_loss: bool = env_flag("RDM_USE_KERNEL_LOSS", True)
+    use_deriv_loss: bool = env_flag("RDM_USE_DERIV_LOSS", True)
+    use_tau_loss: bool = env_flag("RDM_USE_TAU_LOSS", True)
+    use_trace_loss: bool = env_flag("RDM_USE_TRACE_LOSS", True)
+    use_occ_loss: bool = env_flag("RDM_USE_OCC_LOSS", True)
+    use_mode_loss: bool = env_flag("RDM_USE_MODE_LOSS", True)
+    use_kinetic_loss: bool = env_flag("RDM_USE_KINETIC_LOSS", False)
+    use_kp_loss: bool = env_flag("RDM_USE_KP_LOSS", False)
+
+    lambda_gamma: float = float(os.environ.get("RDM_LAMBDA_GAMMA", 1.0))
+    lambda_rho: float = float(os.environ.get("RDM_LAMBDA_RHO", 8.0))
+    lambda_kernel: float = float(os.environ.get("RDM_LAMBDA_KERNEL", 1.0))
+    lambda_deriv: float = float(os.environ.get("RDM_LAMBDA_DERIV", 2.0))
+    lambda_tau: float = float(os.environ.get("RDM_LAMBDA_TAU", 0.5))
+    lambda_trace: float = float(os.environ.get("RDM_LAMBDA_TRACE", 3.0))
+    lambda_occ: float = float(os.environ.get("RDM_LAMBDA_OCC", 0.25))
+    lambda_mode: float = float(os.environ.get("RDM_LAMBDA_MODE", 1e-4))
+    lambda_kinetic: float = float(os.environ.get("RDM_LAMBDA_KINETIC", 1.0))
+    lambda_kp: float = float(os.environ.get("RDM_LAMBDA_KP", 0.25))
+
+    # ------------------------------------------------------------------
+    # loss schedule
+    # ------------------------------------------------------------------
+    # These keep the base loss definition intact, but allow expensive or
+    # delicate targets to enter only after the density/gamma fit has stabilized.
+    kp_start_epoch: int = int(os.environ.get("RDM_KP_START_EPOCH", 0))
+    kp_ramp_epochs: int = int(os.environ.get("RDM_KP_RAMP_EPOCHS", 0))
+    kinetic_start_epoch: int = int(os.environ.get("RDM_KINETIC_START_EPOCH", 0))
+    kinetic_ramp_epochs: int = int(os.environ.get("RDM_KINETIC_RAMP_EPOCHS", 0))
+
+    # ------------------------------------------------------------------
+    # 출력 설정
+    # ------------------------------------------------------------------
+    output_dir: str = os.environ.get("RDM_OUTPUT_DIR", "transferable_outputs")
+    run_name: str = os.environ.get("RDM_RUN_NAME", "transferable_ks_like")
+    auto_run_dir: bool = env_flag("RDM_AUTO_RUN_DIR", False)
+
+    @property
+    def step(self) -> float:
+        """균일 grid spacing."""
+        return 2.0 * self.domain_radius / max(self.axis_points - 1, 1)
+
+    @property
+    def cell_volume(self) -> float:
+        """uniform real-space cell volume."""
+        return self.step**3
+
+    @property
+    def n_points(self) -> int:
+        return self.axis_points**3
+
+    def output_path(self, filename: str) -> Path:
+        out_dir = Path(self.output_dir).resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir / filename

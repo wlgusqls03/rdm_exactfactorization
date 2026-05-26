@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.ipynb_checkpoints/
+
+# Local editor/session files
+*.swp
+*.swo
+.codex/
+.agents/
+
+# Large local datasets and generated DFT/ML artifacts
+data/
+qmugs_npz/
+transferable_outputs/
+*.npz
+*.weights.h5
+
+# Generated figures and reports
+*.png
+*.pdf
+*.aux
+*.log
+*.out
+
+# Local environment files
+.env
+.venv/
+venv/
+env/
