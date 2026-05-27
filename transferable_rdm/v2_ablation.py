@@ -45,6 +45,7 @@ class V2Config:
     rank: int = 8
     rff_features: int = 16
     rff_scale: float = 2.0
+    context_rff: bool = False
     residual_scale: float = 0.25
 
     batch_size: int = 1024
@@ -74,6 +75,17 @@ class V2Config:
     lambda_rho: float = 1.0
     lambda_trace: float = 1.0
     lambda_kernel: float = 1.0
+    lambda_k_highrho: float = 0.0
+    k_highrho_cut: float = 1e-6
+    k_highrho_eps: float = 1e-6
+    pair_rho_log_mean: bool = False
+    pair_rho_log_diff: bool = False
+    pair_rho_scaled_product: bool = False
+    pair_rho_eps: float = 1e-14
+    pair_rho_log_scale: float = 8.0
+    pair_rho_log_clip: float = 4.0
+    pair_rho_scaled_clip: float = 20.0
+    pair_rho_product_transform: str = "log1p"
 
     save_weights: bool = True
 
@@ -108,13 +120,16 @@ def build_mlp(
     name: str,
 ) -> tf.keras.Model:
     inputs = tf.keras.Input(shape=(input_dim,), name=f"{name}_input")
-    x = RandomFourierFeatures(
-        n_features=rff_features,
-        scale=rff_scale,
-        seed=seed,
-        include_input=True,
-        name=f"{name}_rff",
-    )(inputs)
+    if rff_features > 0:
+        x = RandomFourierFeatures(
+            n_features=rff_features,
+            scale=rff_scale,
+            seed=seed,
+            include_input=True,
+            name=f"{name}_rff",
+        )(inputs)
+    else:
+        x = inputs
     for layer_idx in range(depth):
         x = tf.keras.layers.Dense(
             width,
@@ -148,9 +163,83 @@ def uses_context(experiment: str) -> bool:
     return experiment == "gamma-context"
 
 
+def active_pair_rho_feature_names(config: V2Config) -> list[str]:
+    names: list[str] = []
+    if config.pair_rho_log_mean:
+        names.append("rho_log_mean")
+    if config.pair_rho_log_diff:
+        names.append("rho_log_diff")
+    if config.pair_rho_scaled_product:
+        names.append("rho_sqrt_product_scaled")
+    return names
+
+
+def true_rho_pair_features(
+    system: SystemRecord,
+    left_idx: np.ndarray,
+    right_idx: np.ndarray,
+    config: V2Config,
+) -> np.ndarray:
+    rho_left = np.maximum(system.rho_diag[left_idx].astype(np.float32), 0.0)
+    rho_right = np.maximum(system.rho_diag[right_idx].astype(np.float32), 0.0)
+    eps = max(float(config.pair_rho_eps), 1e-30)
+    rho_scale = max(float(np.mean(np.maximum(system.rho_diag, 0.0))), eps)
+
+    log_left = np.log(rho_left + eps)
+    log_right = np.log(rho_right + eps)
+    log_scale = math.log(rho_scale + eps)
+    log_feature_scale = max(float(config.pair_rho_log_scale), 1e-6)
+    log_feature_clip = float(config.pair_rho_log_clip)
+
+    features: list[np.ndarray] = []
+    if config.pair_rho_log_mean:
+        log_mean = (0.5 * (log_left + log_right) - log_scale) / log_feature_scale
+        if log_feature_clip > 0.0:
+            log_mean = np.clip(log_mean, -log_feature_clip, log_feature_clip)
+        features.append(log_mean.reshape(-1, 1))
+    if config.pair_rho_log_diff:
+        log_diff = np.abs(log_left - log_right) / log_feature_scale
+        if log_feature_clip > 0.0:
+            log_diff = np.clip(log_diff, 0.0, log_feature_clip)
+        features.append(log_diff.reshape(-1, 1))
+    if config.pair_rho_scaled_product:
+        scaled = np.sqrt(rho_left * rho_right) / rho_scale
+        if config.pair_rho_scaled_clip > 0.0:
+            scaled = np.clip(scaled, 0.0, config.pair_rho_scaled_clip)
+        if config.pair_rho_product_transform == "log1p":
+            product_scale = max(float(config.pair_rho_scaled_clip), 1.0)
+            scaled = np.log1p(scaled) / math.log1p(product_scale)
+        elif config.pair_rho_product_transform == "linear":
+            product_scale = max(float(config.pair_rho_scaled_clip), 1.0)
+            scaled = scaled / product_scale
+        else:
+            raise ValueError("pair_rho_product_transform must be one of: log1p, linear.")
+        features.append(scaled.reshape(-1, 1))
+
+    if not features:
+        return np.empty((len(left_idx), 0), dtype=np.float32)
+    return np.concatenate(features, axis=1).astype(np.float32)
+
+
+def build_v2_pair_features(
+    system: SystemRecord,
+    left_idx: np.ndarray,
+    right_idx: np.ndarray,
+    config: V2Config,
+) -> np.ndarray:
+    base = build_pair_features(system, left_idx, right_idx)
+    if not active_pair_rho_feature_names(config):
+        return base.astype(np.float32)
+    rho_features = true_rho_pair_features(system, left_idx, right_idx, config)
+    return np.concatenate([base, rho_features], axis=1).astype(np.float32)
+
+
 def build_v2_models(point_dim: int, pair_dim: int, global_dim: int, config: V2Config) -> V2Models:
     if config.experiment not in EXPERIMENTS:
         raise ValueError(f"Unknown V2 experiment: {config.experiment}")
+    pair_rho_names = active_pair_rho_feature_names(config)
+    if pair_rho_names and config.experiment != "k-only":
+        raise ValueError("True-rho pair features are currently allowed only for k-only oracle ablations.")
 
     point_model = None
     pair_model = None
@@ -188,7 +277,7 @@ def build_v2_models(point_dim: int, pair_dim: int, global_dim: int, config: V2Co
             width=max(32, config.width // 2),
             depth=max(1, config.depth),
             seed=config.seed + 307,
-            rff_features=max(4, config.rff_features // 2),
+            rff_features=max(4, config.rff_features // 2) if config.context_rff else 0,
             rff_scale=config.rff_scale,
             name=f"{config.experiment}_context",
         )
@@ -203,6 +292,8 @@ def build_v2_models(point_dim: int, pair_dim: int, global_dim: int, config: V2Co
             ("global dim", global_dim),
             ("rank", config.rank if uses_residual(config.experiment) else 0),
             ("kernel base alpha", config.kernel_base_alpha if pair_model is not None else "off"),
+            ("pair rho features", ", ".join(pair_rho_names) if pair_rho_names else "off"),
+            ("context RFF", config.context_rff if context_model is not None else "off"),
             ("point params", point_model.count_params() if point_model is not None else 0),
             ("pair params", pair_model.count_params() if pair_model is not None else 0),
             ("context params", context_model.count_params() if context_model is not None else 0),
@@ -312,7 +403,7 @@ def make_batch(
     gamma_true = system.gamma_values(left, right)
     rho_left = system.rho_diag[left].astype(np.float32)
     rho_right = system.rho_diag[right].astype(np.float32)
-    pair_feat = build_pair_features(system, left, right)
+    pair_feat = build_v2_pair_features(system, left, right, config)
     return {
         "left": left.astype(np.int64),
         "right": right.astype(np.int64),
@@ -335,6 +426,47 @@ def true_kernel_target(batch: dict[str, np.ndarray], config: V2Config) -> tuple[
     density_weight = np.clip(denom / rho_scale, 0.05, 1.0).astype(np.float32)
     weights = batch["weights"] * density_weight
     return target.astype(np.float32), weights.astype(np.float32)
+
+
+def highrho_kernel_loss(
+    batch: dict[str, np.ndarray],
+    gamma_pred: tf.Tensor,
+    config: V2Config,
+) -> tuple[tf.Tensor, tf.Tensor]:
+    rho_left = to_tensor(batch["rho_left_true"])
+    rho_right = to_tensor(batch["rho_right_true"])
+    denom = tf.sqrt(tf.maximum(rho_left * rho_right, 0.0))
+    mask = tf.cast(denom > config.k_highrho_cut, tf.float32)
+    weights = to_tensor(batch["weights"]) * mask
+    scaled_err = (gamma_pred - to_tensor(batch["gamma_true"])) / tf.maximum(denom, config.k_highrho_eps)
+    weight_sum = tf.reduce_sum(weights)
+    loss = tf.reduce_sum(weights * tf.square(scaled_err)) / tf.maximum(weight_sum, 1e-12)
+    active_frac = tf.reduce_mean(mask)
+    return loss, active_frac
+
+
+def highrho_kernel_metrics_np(
+    batch: dict[str, np.ndarray],
+    gamma_pred: np.ndarray,
+    config: V2Config,
+) -> dict[str, float]:
+    denom = np.sqrt(np.maximum(batch["rho_left_true"] * batch["rho_right_true"], 0.0)).astype(np.float32)
+    mask = denom > config.k_highrho_cut
+    active_frac = float(np.mean(mask))
+    if not np.any(mask):
+        return {
+            "kernel_highrho_loss": float("nan"),
+            "kernel_highrho_mae": float("nan"),
+            "kernel_highrho_frac": active_frac,
+        }
+    weights = batch["weights"] * mask.astype(np.float32)
+    scaled_err = (gamma_pred - batch["gamma_true"]) / np.maximum(denom, config.k_highrho_eps)
+    weight_sum = max(float(np.sum(weights)), 1e-12)
+    return {
+        "kernel_highrho_loss": float(np.sum(weights * scaled_err**2) / weight_sum),
+        "kernel_highrho_mae": float(np.mean(np.abs(scaled_err[mask]))),
+        "kernel_highrho_frac": active_frac,
+    }
 
 
 def weighted_mse(true: tf.Tensor, pred: tf.Tensor, weights: tf.Tensor) -> tf.Tensor:
@@ -360,10 +492,19 @@ def compute_step_loss(
     zero = tf.constant(0.0, dtype=tf.float32)
     gamma_loss = zero
     kernel_loss = zero
+    kernel_highrho_loss = zero
+    kernel_highrho_frac = zero
 
     if config.experiment == "rho-only":
         total = config.lambda_rho * rho_loss + config.lambda_trace * trace_loss
-        return total, {"rho_loss": rho_loss, "trace_loss": trace_loss, "gamma_loss": zero, "kernel_loss": zero}
+        return total, {
+            "rho_loss": rho_loss,
+            "trace_loss": trace_loss,
+            "gamma_loss": zero,
+            "kernel_loss": zero,
+            "kernel_highrho_loss": zero,
+            "kernel_highrho_frac": zero,
+        }
 
     if batch is None:
         raise RuntimeError("Pair batch is required for non-rho-only experiments.")
@@ -382,7 +523,8 @@ def compute_step_loss(
     if config.experiment == "k-only":
         kernel_target, kernel_weights = true_kernel_target(batch, config)
         kernel_loss = weighted_mse(to_tensor(kernel_target), kernel, to_tensor(kernel_weights))
-        total = config.lambda_kernel * gamma_loss
+        kernel_highrho_loss, kernel_highrho_frac = highrho_kernel_loss(batch, gamma_pred, config)
+        total = config.lambda_kernel * gamma_loss + config.lambda_k_highrho * kernel_highrho_loss
     elif config.experiment == "gamma-only":
         total = config.lambda_gamma * gamma_loss
     else:
@@ -397,6 +539,8 @@ def compute_step_loss(
         "trace_loss": trace_loss,
         "gamma_loss": gamma_loss,
         "kernel_loss": kernel_loss,
+        "kernel_highrho_loss": kernel_highrho_loss,
+        "kernel_highrho_frac": kernel_highrho_frac,
     }
 
 
@@ -503,6 +647,9 @@ def evaluate_system(
         "pair_mae": float("nan"),
         "kernel_loss": float("nan"),
         "kernel_mae": float("nan"),
+        "kernel_highrho_loss": float("nan"),
+        "kernel_highrho_mae": float("nan"),
+        "kernel_highrho_frac": float("nan"),
     }
 
     if gamma_pred_np is not None:
@@ -518,6 +665,8 @@ def evaluate_system(
             np.sum(kernel_weights * kernel_err**2) / max(float(np.sum(kernel_weights)), 1e-12)
         )
         metrics["kernel_mae"] = float(np.mean(np.abs(kernel_err)))
+        if gamma_pred_np is not None:
+            metrics.update(highrho_kernel_metrics_np(batch, gamma_pred_np, config))
 
     return metrics
 
@@ -569,6 +718,8 @@ def history_header() -> list[str]:
         "train_rho_loss",
         "train_trace_loss",
         "train_kernel_loss",
+        "train_kernel_highrho_loss",
+        "train_kernel_highrho_frac",
         "val_pair_loss",
         "val_pair_mae",
         "val_rho_loss",
@@ -576,6 +727,9 @@ def history_header() -> list[str]:
         "val_trace_rel_error",
         "val_kernel_loss",
         "val_kernel_mae",
+        "val_kernel_highrho_loss",
+        "val_kernel_highrho_mae",
+        "val_kernel_highrho_frac",
     ]
 
 
@@ -639,13 +793,34 @@ def train_v2(config: V2Config, split: DatasetSplit, point_dim: int, pair_dim: in
             ("k-only objective", "true-rho gamma loss" if config.experiment == "k-only" else "n/a"),
             ("kernel form", "exp(-alpha d^2) + sep * deltaK_pair"),
             ("kernel base alpha", config.kernel_base_alpha),
+            ("k high-rho lambda", config.lambda_k_highrho if config.experiment == "k-only" else "n/a"),
+            ("k high-rho cut", config.k_highrho_cut if config.experiment == "k-only" else "n/a"),
+            ("k high-rho eps", config.k_highrho_eps if config.experiment == "k-only" else "n/a"),
+            ("pair rho features", ", ".join(active_pair_rho_feature_names(config)) or "off"),
+            (
+                "pair rho normalization",
+                (
+                    f"eps={config.pair_rho_eps:g}, log/scale={config.pair_rho_log_scale:g}, "
+                    f"log clip={config.pair_rho_log_clip:g}, product={config.pair_rho_product_transform}"
+                )
+                if active_pair_rho_feature_names(config)
+                else "off",
+            ),
             ("pair sampling probs", config.pair_sampling_probs or "curriculum"),
             ("pair weights", config.pair_category_weights),
         ],
     )
 
     for epoch in range(config.epochs):
-        accum = {"objective": [], "gamma_loss": [], "rho_loss": [], "trace_loss": [], "kernel_loss": []}
+        accum = {
+            "objective": [],
+            "gamma_loss": [],
+            "rho_loss": [],
+            "trace_loss": [],
+            "kernel_loss": [],
+            "kernel_highrho_loss": [],
+            "kernel_highrho_frac": [],
+        }
         for _ in range(config.steps_per_epoch):
             system = choose_system(split.train_systems, rng)
             batch = None
@@ -658,7 +833,14 @@ def train_v2(config: V2Config, split: DatasetSplit, point_dim: int, pair_dim: in
             optimizer.apply_gradients((grad, var) for grad, var in zip(gradients, variables) if grad is not None)
 
             accum["objective"].append(float(total.numpy()))
-            for name in ("gamma_loss", "rho_loss", "trace_loss", "kernel_loss"):
+            for name in (
+                "gamma_loss",
+                "rho_loss",
+                "trace_loss",
+                "kernel_loss",
+                "kernel_highrho_loss",
+                "kernel_highrho_frac",
+            ):
                 accum[name].append(float(losses[name].numpy()))
 
         row: dict[str, object] = {
@@ -668,6 +850,8 @@ def train_v2(config: V2Config, split: DatasetSplit, point_dim: int, pair_dim: in
             "train_rho_loss": float(np.mean(accum["rho_loss"])),
             "train_trace_loss": float(np.mean(accum["trace_loss"])),
             "train_kernel_loss": float(np.mean(accum["kernel_loss"])),
+            "train_kernel_highrho_loss": float(np.mean(accum["kernel_highrho_loss"])),
+            "train_kernel_highrho_frac": float(np.mean(accum["kernel_highrho_frac"])),
         }
 
         should_validate = epoch == 0 or (epoch + 1) % max(config.val_every, 1) == 0 or epoch == config.epochs - 1
@@ -681,6 +865,9 @@ def train_v2(config: V2Config, split: DatasetSplit, point_dim: int, pair_dim: in
                 "trace_rel_error",
                 "kernel_loss",
                 "kernel_mae",
+                "kernel_highrho_loss",
+                "kernel_highrho_mae",
+                "kernel_highrho_frac",
             ):
                 row[f"val_{key}"] = val_avg.get(key, float("nan"))
             objective_key = "rho_loss" if config.experiment == "rho-only" else "pair_loss"
@@ -698,11 +885,20 @@ def train_v2(config: V2Config, split: DatasetSplit, point_dim: int, pair_dim: in
                     f" rho={row.get('val_rho_loss', float('nan')):.3e}"
                     f" K={row.get('val_kernel_loss', float('nan')):.3e}"
                 )
+                if config.experiment == "k-only" and config.lambda_k_highrho > 0.0:
+                    val_text += f" Khi={row.get('val_kernel_highrho_loss', float('nan')):.3e}"
+            train_highrho_text = ""
+            if config.experiment == "k-only" and config.lambda_k_highrho > 0.0:
+                train_highrho_text = (
+                    f" Khi={row['train_kernel_highrho_loss']:.3e}"
+                    f" highrho={row['train_kernel_highrho_frac']:.2f}"
+                )
             print(
                 f"Epoch {epoch:4d} | train obj={row['train_objective']:.6e}"
                 f" gamma={row['train_gamma_loss']:.3e}"
                 f" rho={row['train_rho_loss']:.3e}"
                 f" K={row['train_kernel_loss']:.3e}"
+                f"{train_highrho_text}"
                 f"{val_text}",
                 flush=True,
             )

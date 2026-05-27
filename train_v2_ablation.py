@@ -40,10 +40,10 @@ configure_tensorflow_environment_preimport()
 import tensorflow as tf
 
 from transferable_rdm.config import ExperimentConfig
-from transferable_rdm.data import DatasetSplit, build_pair_features, split_systems
+from transferable_rdm.data import DatasetSplit, split_systems
 from transferable_rdm.systems import build_system_corpus
 from transferable_rdm.utils import print_block, set_global_seed
-from transferable_rdm.v2_ablation import EXPERIMENTS, V2Config, train_v2
+from transferable_rdm.v2_ablation import EXPERIMENTS, V2Config, build_v2_pair_features, train_v2
 
 
 def env_int(name: str, default: int) -> int:
@@ -111,6 +111,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rank", type=int, default=env_int("RDM_V2_RANK", 8))
     parser.add_argument("--rff-features", type=int, default=env_int("RDM_V2_RFF_FEATURES", 16))
     parser.add_argument("--rff-scale", type=float, default=env_float("RDM_V2_RFF_SCALE", 2.0))
+    parser.add_argument(
+        "--context-rff",
+        dest="context_rff",
+        action="store_true",
+        default=env_flag("RDM_V2_CONTEXT_RFF", False),
+        help="Use random Fourier features in the context model. Default is off.",
+    )
+    parser.add_argument("--no-context-rff", dest="context_rff", action="store_false")
     parser.add_argument("--residual-scale", type=float, default=env_float("RDM_V2_RESIDUAL_SCALE", 0.25))
 
     parser.add_argument("--epochs", type=int, default=env_int("RDM_V2_EPOCHS", 120))
@@ -130,6 +138,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda-rho", type=float, default=env_float("RDM_V2_LAMBDA_RHO", 1.0))
     parser.add_argument("--lambda-trace", type=float, default=env_float("RDM_V2_LAMBDA_TRACE", 1.0))
     parser.add_argument("--lambda-kernel", type=float, default=env_float("RDM_V2_LAMBDA_KERNEL", 1.0))
+    parser.add_argument("--lambda-k-highrho", type=float, default=env_float("RDM_V2_LAMBDA_K_HIGHRHO", 0.0))
 
     parser.add_argument("--baseline-fit-batches", type=int, default=env_int("RDM_V2_BASELINE_FIT_BATCHES", 24))
     parser.add_argument("--baseline-alpha-min", type=float, default=env_float("RDM_V2_BASELINE_ALPHA_MIN", 1e-3))
@@ -146,6 +155,47 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kernel-rho-floor", type=float, default=env_float("RDM_V2_KERNEL_RHO_FLOOR", 1e-8))
     parser.add_argument("--kernel-target-clip", type=float, default=env_float("RDM_V2_KERNEL_TARGET_CLIP", 20.0))
     parser.add_argument("--kernel-base-alpha", type=float, default=env_float("RDM_V2_KERNEL_BASE_ALPHA", 0.0))
+    parser.add_argument("--k-highrho-cut", type=float, default=env_float("RDM_V2_K_HIGHRHO_CUT", 1e-6))
+    parser.add_argument("--k-highrho-eps", type=float, default=env_float("RDM_V2_K_HIGHRHO_EPS", 1e-6))
+    parser.add_argument(
+        "--pair-rho-features",
+        choices=["off", "all", "true"],
+        default=os.environ.get("RDM_V2_PAIR_RHO_FEATURES", "off").strip().lower(),
+        help="Convenience switch for true-rho pair features. 'all' or 'true' enables all three rho feature toggles.",
+    )
+    parser.add_argument(
+        "--pair-rho-log-mean",
+        action="store_true",
+        default=env_flag("RDM_V2_PAIR_RHO_LOG_MEAN", False),
+        help="Append centered log geometric mean of true rho_i and rho_j to pair features.",
+    )
+    parser.add_argument(
+        "--pair-rho-log-diff",
+        action="store_true",
+        default=env_flag("RDM_V2_PAIR_RHO_LOG_DIFF", False),
+        help="Append absolute log true-rho difference to pair features.",
+    )
+    parser.add_argument(
+        "--pair-rho-scaled-product",
+        action="store_true",
+        default=env_flag("RDM_V2_PAIR_RHO_SCALED_PRODUCT", False),
+        help="Append sqrt(true rho_i true rho_j) divided by the system mean rho to pair features.",
+    )
+    parser.add_argument("--pair-rho-eps", type=float, default=env_float("RDM_V2_PAIR_RHO_EPS", 1e-14))
+    parser.add_argument("--pair-rho-log-scale", type=float, default=env_float("RDM_V2_PAIR_RHO_LOG_SCALE", 8.0))
+    parser.add_argument("--pair-rho-log-clip", type=float, default=env_float("RDM_V2_PAIR_RHO_LOG_CLIP", 4.0))
+    parser.add_argument(
+        "--pair-rho-scaled-clip",
+        type=float,
+        default=env_float("RDM_V2_PAIR_RHO_SCALED_CLIP", 20.0),
+        help="Upper clip for the scaled true-rho product feature. Use <=0 to disable clipping.",
+    )
+    parser.add_argument(
+        "--pair-rho-product-transform",
+        choices=["log1p", "linear"],
+        default=os.environ.get("RDM_V2_PAIR_RHO_PRODUCT_TRANSFORM", "log1p").strip().lower(),
+        help="Normalize the sqrt(rho_i rho_j)/mean(rho) feature after clipping.",
+    )
     parser.add_argument("--sep-factor-scale", type=float, default=env_float("RDM_V2_SEP_FACTOR_SCALE", 0.05))
     parser.add_argument(
         "--pair-sampling-probs",
@@ -197,6 +247,7 @@ def make_v2_config(args: argparse.Namespace) -> V2Config:
         if args.normalize_rho is None
         else bool(args.normalize_rho)
     )
+    pair_rho_all = args.pair_rho_features in {"all", "true"}
 
     return V2Config(
         experiment=args.experiment,
@@ -208,6 +259,7 @@ def make_v2_config(args: argparse.Namespace) -> V2Config:
         rank=args.rank,
         rff_features=args.rff_features,
         rff_scale=args.rff_scale,
+        context_rff=args.context_rff,
         residual_scale=args.residual_scale,
         batch_size=args.batch_size,
         steps_per_epoch=args.steps_per_epoch,
@@ -233,6 +285,17 @@ def make_v2_config(args: argparse.Namespace) -> V2Config:
         lambda_rho=args.lambda_rho,
         lambda_trace=args.lambda_trace,
         lambda_kernel=args.lambda_kernel,
+        lambda_k_highrho=args.lambda_k_highrho,
+        k_highrho_cut=args.k_highrho_cut,
+        k_highrho_eps=args.k_highrho_eps,
+        pair_rho_log_mean=pair_rho_all or args.pair_rho_log_mean,
+        pair_rho_log_diff=pair_rho_all or args.pair_rho_log_diff,
+        pair_rho_scaled_product=pair_rho_all or args.pair_rho_scaled_product,
+        pair_rho_eps=args.pair_rho_eps,
+        pair_rho_log_scale=args.pair_rho_log_scale,
+        pair_rho_log_clip=args.pair_rho_log_clip,
+        pair_rho_scaled_clip=args.pair_rho_scaled_clip,
+        pair_rho_product_transform=args.pair_rho_product_transform,
         save_weights=args.save_weights,
     )
 
@@ -293,7 +356,7 @@ def main() -> None:
     split = make_overfit_split(systems, args) if args.overfit_one_system else split_systems(systems, data_config)
     point_dim = systems[0].local_features.shape[1]
     sample_left = np.array([0], dtype=np.int64)
-    pair_dim = build_pair_features(systems[0], sample_left, sample_left).shape[1]
+    pair_dim = build_v2_pair_features(systems[0], sample_left, sample_left, v2_config).shape[1]
     global_dim = len(systems[0].global_context)
 
     summary = train_v2(v2_config, split, point_dim, pair_dim, global_dim)
