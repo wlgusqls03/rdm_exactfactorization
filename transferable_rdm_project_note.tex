@@ -1,0 +1,297 @@
+\documentclass[11pt]{article}
+\usepackage{fontspec}
+\usepackage{kotex}
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{amsmath,amssymb,bm,mathtools}
+\usepackage{enumitem}
+\usepackage{setspace}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\lstset{basicstyle=\ttfamily\small,breaklines=true,frame=single,columns=fullflexible}
+\setstretch{1.14}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.45em}
+\title{Transferable 1-RDM / ML-OFDFT 현재 구현 정리}
+\author{}
+\date{\today}
+\begin{document}
+\maketitle
+작성 기준: 2026-05-20. 이 문서는 현재 폴더에서 실제로 무엇을 계산하고, 어떤 데이터를 넣고, 모델이 어떤 수학적 구조로 gamma(r,r')를 예측하는지 설명한다.
+\section*{1. 큰 그림}
+이 프로젝트의 목표는 3D real-space grid 위의 one-particle reduced density matrix, 즉 1-RDM gamma(r,r')를 직접 학습하는 것이다. 단순히 pair value 하나를 맞추는 regression이 아니라, gamma\_theta를 중간 표현으로 두고 density rho, kinetic energy density tau, particle number, occupation spectrum, symmetry를 동시에 제어한다.
+물리적으로는 KS-DFT와 density-only OFDFT 사이의 표현을 만들려는 시도다. KS orbital 전체를 들고 가면 비싸고, density만 쓰면 kinetic/nonlocal 정보가 너무 많이 사라진다. 그래서 gamma(r,r')라는 비국소 표현을 압축된 surrogate로 학습한다.
+\section*{2. 현재 실제 데이터 흐름: QM9 구조 + PySCF DFT}
+처음에는 QMugs를 후보로 보았지만, wavefunction tarball이 매우 커서 10 GB 이하 실험에는 맞지 않았다. 그래서 현재 실제 실행 경로는 QM9의 xyz 구조를 받고, PySCF로 DFT 계산을 직접 수행하여 AO density matrix를 얻는 방식이다.
+\begin{itemize}[leftmargin=1.5em]
+\item 입력 원본: data/qm9\_raw/dsgdb9nsd.xyz.tar.bz2, 약 83 MB.
+\item DFT 코드: PySCF RKS.
+\item DFT 설정: B3LYP / 6-31G(2df,p), charge=0, spin=0, closed-shell, conv\_tol=1e-8.
+\item 분자 선택: QM9 closed-shell 분자 중 max\_atoms=10, 작은 분자부터 600개 선택.
+\item split 계획: 앞 500개 train, 뒤 100개 validation.
+\item grid 설정: axis\_points=7, 따라서 N\_grid = 7^3 = 343.
+\end{itemize}
+현재 500/100 폴더에는 렌더링 시점 기준 147개의 NPZ가 있다. DFT 변환 계산이 진행 중이면 이 숫자는 계속 증가한다. 같은 변환 명령을 다시 실행하면 이미 만들어진 NPZ는 건너뛰고 남은 분자부터 이어서 계산한다.
+\section*{3. AO density matrix에서 grid gamma\_true를 만드는 방법}
+PySCF가 계산하는 DFT wavefunction은 real-space grid 위에 바로 저장되어 있지 않다. 대신 atomic orbital(AO) basis 위의 density matrix P를 얻는다. AO basis function을 chi\_mu(r)라고 쓰면, 각 grid point r\_g에서 AO 값을 평가하여 행렬 B를 만든다.
+\[
+B_{g\mu} = \chi_\mu(\mathbf{r}_g)
+\]
+closed-shell RKS에서 density matrix는 개념적으로 occupied molecular orbital coefficient C와 occupation에서 온다. PySCF에서는 mf.make\_rdm1()이 이 P를 만들어 준다.
+\[
+P_{\mu\nu} \simeq 2\sum_{i\in \mathrm{occ}} C_{\mu i} C_{\nu i}
+\]
+그러면 grid 위의 1-RDM target은 AO basis를 real-space grid에 평가한 뒤 양쪽에 붙인 것이다.
+\[
+\gamma_{\mathrm{true}}(\mathbf{r}_g,\mathbf{r}_h)=\sum_{\mu,\nu}\chi_\mu(\mathbf{r}_g)P_{\mu\nu}\chi_\nu(\mathbf{r}_h)
+\]
+\[
+\Gamma^{\mathrm{true}}_{gh}=(B P B^{T})_{gh}
+\]
+여기서 Gamma\_true는 코드의 gamma\_matrix다. 대각 원소는 density다.
+\[
+\rho_{\mathrm{true}}(\mathbf{r}_g)=\gamma_{\mathrm{true}}(\mathbf{r}_g,\mathbf{r}_g)
+\]
+변환기는 grid 적분 trace가 전자수 N과 맞도록 gamma\_matrix를 한 번 스케일한다. 거친 7^3 grid에서 trace error를 줄이기 위한 실용적 보정이다.
+\[
+\sum_g \gamma_{\mathrm{true}}(\mathbf{r}_g,\mathbf{r}_g)\,\Delta V \approx N
+\]
+\section*{4. 저장 파일과 사람이 보는 인덱스}
+학습은 NPZ를 읽지만, NPZ는 사람이 보기 어렵다. 그래서 데이터 폴더에는 학습용 바이너리와 사람이 보는 인덱스를 함께 둔다.
+\begin{lstlisting}
+qmugs_npz/qm9_pyscf_b631g2dfp_500_100_axis7/
+  *.npz                 # 학습용: points, gamma_matrix, features
+  selection_plan.json   # 600개 선택 계획과 train/val split
+  manifest.json         # 실제 변환 완료된 계산 기록
+  molecule_index.csv    # 사람이 보는 표 형식 인덱스
+  molecule_index.md     # 사람이 보는 Markdown 인덱스
+  xyz/*.xyz             # 분자 구조 확인용
+\end{lstlisting}
+중요한 점은 NPZ만으로도 학습은 가능하지만, 연구 데이터셋으로 관리하려면 CSV/Markdown/XYZ가 같이 있어야 한다는 것이다. 현재 변환 스크립트는 재실행 시 이미 만들어진 NPZ를 건너뛰면서 인덱스와 XYZ도 채울 수 있게 되어 있다.
+\section*{5. 500/100 분자 선택 계획}
+총 600개, train 500개, validation 100개, atom count 분포 \{3: 2, 4: 4, 5: 5, 6: 12, 7: 21, 8: 70, 9: 193, 10: 293\}.
+\begin{itemize}[leftmargin=1.5em]
+\item 000 train dsgdb9nsd\_000003  H2O  3 atoms  10 e  O
+\item 001 train dsgdb9nsd\_000005  HCN  3 atoms  14 e  C\#N
+\item 002 train dsgdb9nsd\_000002  H3N  4 atoms  10 e  N
+\item 003 train dsgdb9nsd\_000004  H2C2  4 atoms  14 e  C\#C
+\item 004 train dsgdb9nsd\_000006  H2CO  4 atoms  16 e  C=O
+\item 005 train dsgdb9nsd\_000025  C2N2  4 atoms  26 e  N\#CC\#N
+\item 006 train dsgdb9nsd\_000001  H4C  5 atoms  10 e  C
+\item 007 train dsgdb9nsd\_000024  HC3N  5 atoms  26 e  C\#CC\#N
+\item 008 train dsgdb9nsd\_000027  HC2NO  5 atoms  28 e  O=CC\#N
+\item 009 train dsgdb9nsd\_000177  N4O  5 atoms  36 e  O1N=NN=N1
+\item 010 train dsgdb9nsd\_000184  CF4  5 atoms  42 e  FC(F)(F)F
+\item 011 train dsgdb9nsd\_000008  H4CO  6 atoms  18 e  CO
+\end{itemize}
+12개 smoke demo에 들어간 분자 예시는 다음과 같다.
+\begin{itemize}[leftmargin=1.5em]
+\item 0000\_dsgdb9nsd\_000184: CF4, 5 atoms, 42.0 e, SMILES=FC(F)(F)F
+\item 0001\_dsgdb9nsd\_000005: HCN, 3 atoms, 14.0 e, SMILES=C\#N
+\item 0002\_dsgdb9nsd\_000486: C4N2, 6 atoms, 38.0 e, SMILES=N\#CC\#CC\#N
+\item 0003\_dsgdb9nsd\_000024: HC3N, 5 atoms, 26.0 e, SMILES=C\#CC\#N
+\item 0004\_dsgdb9nsd\_000025: C2N2, 4 atoms, 26.0 e, SMILES=N\#CC\#N
+\item 0005\_dsgdb9nsd\_000003: H2O, 3 atoms, 10.0 e, SMILES=O
+\item 0006\_dsgdb9nsd\_000779: CN2O3, 6 atoms, 44.0 e, SMILES=O=C1ON=NO1
+\item 0007\_dsgdb9nsd\_000008: H4CO, 6 atoms, 18.0 e, SMILES=CO
+\item 0008\_dsgdb9nsd\_000323: C3N2O, 6 atoms, 40.0 e, SMILES=O=C(C\#N)C\#N
+\item 0009\_dsgdb9nsd\_000004: H2C2, 4 atoms, 14.0 e, SMILES=C\#C
+\item 0010\_dsgdb9nsd\_000827: C2NF3, 6 atoms, 46.0 e, SMILES=FC(F)(F)C\#N
+\item 0011\_dsgdb9nsd\_000012: H3CNO, 6 atoms, 24.0 e, SMILES=NC=O
+\end{itemize}
+\section*{6. NPZ schema와 차원}
+axis\_points=7인 한 분자 system은 다음 배열을 가진다. 여기서 343은 7^3이고, full pair 수는 343^2 = 117,649개다.
+\begin{lstlisting}
+points           : (343, 3)
+gamma_matrix     : (343, 343)
+local_features   : (343, 15)
+global_context   : (11,)
+potential        : (343, 1)
+grad_potential   : (343, 3)
+electron_count   : scalar
+occupancies      : (n_mo,)
+orbital_energies : (n_mo,)
+\end{lstlisting}
+학습 target의 중심은 gamma\_matrix다. rho, tau, trace, occupation penalty는 이 gamma\_matrix와 모델 예측으로부터 다시 계산된다.
+\section*{7. local point feature xi(r): 15차원}
+xi(r)는 grid point 하나의 local environment를 설명한다. 현재 QM9/PySCF 변환기에서는 다음 15개 feature를 쓴다.
+\begin{lstlisting}
+1-3   normalized coordinate r/R                    3
+4     softened nuclear potential V_nuc(r)          1
+5-7   gradient of V_nuc(r)                         3
+8     radial distance |r|/R                         1
+9-13  element-wise Gaussian atom density H,C,N,O,F  5
+14    nearest atom nuclear charge / 10              1
+15    electron count / 30                           1
+\end{lstlisting}
+\section*{8. global context c: 11차원}
+c는 분자 전체를 요약한다. 같은 local coordinate라도 어떤 분자 안에 있느냐에 따라 gamma의 의미가 달라지므로, point/pair model에 global context를 함께 넣는다.
+\begin{lstlisting}
+electron_count / 30
+atom_count / 30
+heavy_atom_count / 10
+mean(Z) / 10
+std(Z) / 10
+molecular_radius / 10
+counts(H,C,N,O,F) / 10      # 5개
+\end{lstlisting}
+\section*{9. pair feature eta(r,r'): 18차원}
+eta(r,r')는 두 grid point 사이의 관계를 설명한다. gamma는 두 점 함수이므로 point feature만으로는 부족하고, separation과 local field mismatch를 직접 알려주는 pair descriptor가 필요하다.
+\begin{lstlisting}
+midpoint (r+r')/2                              3
+absolute separation |r-r'| components           3
+squared separation components                   3
+separation norm |r-r'|                          1
+squared norm |r-r'|^2                           1
+average potential [V(r)+V(r')]/2                1
+average gradient [grad V(r)+grad V(r')]/2       3
+absolute gradient difference                    3
+\end{lstlisting}
+이 feature들은 대부분 r과 r'를 바꾸어도 변하지 않는 대칭량이다. 이렇게 하면 모델이 gamma(r,r') = gamma(r',r)라는 Hermitian/symmetric 구조를 배우기 쉽다.
+\section*{10. 전체 모델은 세 개의 submodel로 구성된다}
+현재 ModelBundle은 point\_model, pair\_model, context\_model 세 개로 구성된다. 세 모델은 모두 Random Fourier Features(RFF)로 입력을 확장한 뒤 SiLU activation을 쓰는 MLP다.
+\[
+\mathrm{RFF}(x)=\left[x,\sin(2\pi x\Omega),\cos(2\pi x\Omega)\right]
+\]
+SiLU activation은 x sigmoid(x) 형태의 smooth activation이다. tau처럼 derivative-sensitive한 물리량을 맞출 때 ReLU보다 부드러운 함수가 유리하다.
+\subsection*{10.1 point model}
+point model은 한 점의 local feature xi(r)와 global context c를 받아 density logit과 residual mode amplitude를 출력한다. r과 r'에 같은 point model을 공유 적용한다.
+\[
+\mathrm{point}_\theta([\xi(\mathbf{r}),c])=\left[\ell_\rho(\mathbf{r};c),a_1(\mathbf{r};c),\ldots,a_k(\mathbf{r};c)\right]
+\]
+\[
+\rho_\theta(\mathbf{r};c)=\mathrm{softplus}(\ell_\rho(\mathbf{r};c))+\varepsilon
+\]
+\begin{lstlisting}
+입력 차원: 15 + 11 = 26
+구조: RFF -> Dense(W, SiLU) x 3 -> Dense(1+k)
+출력: density logit 1개 + residual mode amplitude k개
+\end{lstlisting}
+\subsection*{10.2 context model}
+context model은 분자 전체 descriptor c만 보고 system-specific residual mode weight를 만든다. 같은 local mode라도 분자 종류에 따라 중요도가 달라질 수 있기 때문이다.
+\[
+\mathrm{context}_\theta(c)=q(c)\in R^k
+\]
+\[
+w(c)=\left[1,w_1(c),\ldots,w_k(c)\right],\qquad w_i(c)>0
+\]
+\begin{lstlisting}
+입력 차원: 11
+구조: RFF -> Dense(max(64,W/2), SiLU) x 2 -> Dense(k)
+후처리: softplus + cumulative descending ordering + anchor mode
+\end{lstlisting}
+\subsection*{10.3 pair model}
+pair model은 eta(r,r')와 c를 받아 Gaussian baseline의 폭 alpha\_theta와 residual correction을 얼마나 섞을지 정하는 scalar gate m\_theta를 출력한다.
+\[
+\mathrm{pair}_\theta([\eta(\mathbf{r},\mathbf{r}'),c])=\left[\beta(\mathbf{r},\mathbf{r}';c),z(\mathbf{r},\mathbf{r}';c)\right]
+\]
+\[
+\alpha_\theta=\mathrm{softplus}(\beta)+\varepsilon,\qquad m_\theta=\sigma(z)
+\]
+\begin{lstlisting}
+입력 차원: 18 + 11 = 29
+구조: RFF -> Dense(W, SiLU) x 2 -> Dense(2)
+출력: beta 1개, gate logit z 1개
+\end{lstlisting}
+\section*{11. g\_theta의 정확한 정의}
+이전 문서에서는 g\_theta라는 이름이 빠져 있거나 gate와 혼동될 수 있었다. 여기서는 명확히 분리한다. g\_theta는 scalar gate가 아니라, 각 grid point를 normalized latent vector로 보내는 embedding이다.
+point model의 residual mode amplitude를 a\_theta(r;c)라고 하고, constant anchor channel을 붙인 feature를 phi\_theta라고 하자.
+\[
+a_\theta(\mathbf{r};c)=\left[a_1(\mathbf{r};c),\ldots,a_k(\mathbf{r};c)\right]
+\]
+\[
+\phi_\theta(\mathbf{r};c)=\left[1,a_1(\mathbf{r};c),\ldots,a_k(\mathbf{r};c)\right]
+\]
+context model이 만든 positive mode weight w(c)를 element-wise로 곱하고 L2 normalization하면 g\_theta가 된다.
+\[
+g_\theta(\mathbf{r};c)=\frac{\sqrt{w(c)}\odot\phi_\theta(\mathbf{r};c)}{\left\|\sqrt{w(c)}\odot\phi_\theta(\mathbf{r};c)\right\|_2}
+\]
+따라서 residual kernel은 두 점 embedding의 내적이다.
+\[
+K_{\mathrm{res},\theta}(\mathbf{r},\mathbf{r}';c)=g_\theta(\mathbf{r};c)\cdot g_\theta(\mathbf{r}';c)
+\]
+코드 변수로는 unit\_r, unit\_rp가 g\_theta에 해당하고, residual\_kernel이 위 내적에 해당한다. 반면 코드 변수 gate는 scalar m\_theta다. 이 둘은 서로 다른 개념이다.
+\section*{12. K\_theta와 gamma\_theta의 의미}
+gamma\_theta는 density amplitude와 normalized kernel의 곱으로 쓴다. K\_theta는 density scale을 제거한 뒤 남는 off-diagonal coherence를 표현한다.
+\[
+\gamma_\theta(\mathbf{r},\mathbf{r}';c)=\sqrt{\rho_\theta(\mathbf{r};c)\rho_\theta(\mathbf{r}';c)}\,K_\theta(\mathbf{r},\mathbf{r}';c)
+\]
+baseline kernel은 pair model이 예측한 alpha\_theta를 사용한 Gaussian decay다.
+\[
+K_{\mathrm{base},\theta}(\mathbf{r},\mathbf{r}';c)=\exp\left[-\alpha_\theta(\mathbf{r},\mathbf{r}';c)\|\mathbf{r}-\mathbf{r}'\|^2\right]
+\]
+최종 kernel은 baseline과 residual을 scalar gate m\_theta로 섞는다.
+\[
+K_\theta=K_{\mathrm{base},\theta}\left[(1-m_\theta)+m_\theta K_{\mathrm{res},\theta}\right]
+\]
+해석은 다음과 같다. K\_base는 가까운 pair에서 기본적인 decay를 주는 물리적 bias다. K\_res는 orbital-like nonlocal coherence correction이다. m\_theta는 이 pair에서 residual correction을 얼마나 믿을지 정하는 adaptive switch다.
+대각에서는 K\_theta(r,r) ~= 1이 되어야 gamma\_theta(r,r) = rho\_theta(r)가 된다. 그래서 loss에 kernel diagonal normalization을 넣는다.
+\section*{13. 학습 loss와 물리량}
+전체 objective는 여러 물리 조건을 동시에 반영한다.
+\[
+L=\lambda_\gamma L_\gamma+\lambda_\rho L_\rho+\lambda_K L_K+\lambda_\partial L_\partial+\lambda_\tau L_\tau+\lambda_{\mathrm{trace}}L_{\mathrm{trace}}+\lambda_{\mathrm{occ}}L_{\mathrm{occ}}+\lambda_{\mathrm{mode}}L_{\mathrm{mode}}
+\]
+\begin{itemize}[leftmargin=1.5em]
+\item L\_gamma: sampled pair gamma(r,r') weighted MSE.
+\item L\_rho: diagonal density gamma\_theta(r,r)와 rho\_true(r)의 MSE.
+\item L\_K: K\_theta(r,r)=1 normalization.
+\item L\_partial: near-diagonal mixed derivative finite-difference loss.
+\item L\_tau: kinetic energy density tau(r) loss.
+\item L\_trace: integral rho(r) dr = electron count.
+\item L\_occ: coarse 1-RDM eigenvalue가 occupation 범위를 벗어나지 않도록 하는 penalty.
+\item L\_mode: residual mode weight regularization.
+\end{itemize}
+kinetic energy density는 gamma의 대각 근처 곡률에 민감하다. 그래서 단순 pair MSE와 별개로 mixed derivative stencil을 직접 넣는다.
+\[
+\tau(\mathbf{r})=\frac{1}{2}\sum_{\alpha=x,y,z}\left.\partial_{r_\alpha}\partial_{r'_\alpha}\gamma(\mathbf{r},\mathbf{r}')\right|_{\mathbf{r}'=\mathbf{r}}
+\]
+molecular closed-shell DFT density matrix의 natural occupation 범위는 0에서 2다. 그래서 QM9/PySCF 학습에서는 RDM\_OCC\_MAX=2.0을 쓰는 것이 맞다.
+\section*{14. 학습 batch는 어떻게 만들어지는가}
+train loop는 먼저 train system 중 하나를 균등하게 고른다. 그 system에서 pair index를 뽑는다. 초반에는 diagonal/near-diagonal pair를 많이 보고, 후반에는 far off-diagonal pair 비중을 늘리는 curriculum sampling을 사용한다.
+\begin{itemize}[leftmargin=1.5em]
+\item diag pair: r = r'. density와 trace에 중요하다.
+\item near pair: kinetic energy density tau에 중요하다.
+\item mid/far pair: nonlocal coherence와 off-diagonal structure에 중요하다.
+\item pair weight: diagonal과 near-diagonal pair에 더 큰 weight를 준다.
+\end{itemize}
+\section*{15. 학습이 끝나면 얻는 output}
+학습 스크립트는 결과 그림, 요약 JSON, 세 submodel의 weight를 저장한다.
+\begin{lstlisting}
+transferable_outputs/<run_name>.png
+transferable_outputs/<run_name>_summary.json
+transferable_outputs/<run_name>_point.weights.h5
+transferable_outputs/<run_name>_pair.weights.h5
+transferable_outputs/<run_name>_context.weights.h5
+\end{lstlisting}
+PNG에는 training curve, held-out gamma parity, density slice, tau slice, natural occupation spectrum, metric summary가 들어간다.
+\section*{16. 현재 실행 명령}
+\begin{lstlisting}
+/home/hbji/miniconda3/envs/polymer-gp/bin/python scripts/build_qm9_pyscf_npz.py \
+  --num-systems 600 \
+  --axis-points 7 \
+  --max-atoms 10 \
+  --basis '6-31g(2df,p)' \
+  --xc b3lyp \
+  --selection smallest \
+  --output-dir qmugs_npz/qm9_pyscf_b631g2dfp_500_100_axis7
+\end{lstlisting}
+\begin{lstlisting}
+env MPLBACKEND=Agg RDM_OCC_MAX=2.0 \
+/home/hbji/miniconda3/envs/polymer-gp/bin/python train_transferable_1rdm.py \
+  --dataset-mode npz \
+  --npz-glob 'qmugs_npz/qm9_pyscf_b631g2dfp_500_100_axis7/*.npz' \
+  --axis-points 7 \
+  --train-system-count 500 \
+  --val-system-count 100 \
+  --run-name qm9_b631g2dfp_500_100_axis7
+\end{lstlisting}
+\section*{17. 현재 한계와 다음 단계}
+\begin{itemize}[leftmargin=1.5em]
+\item axis\_points=7은 매우 거친 grid다. 모델/데이터 흐름 검증에는 좋지만 고정밀 물리량에는 부족하다.
+\item full gamma\_matrix 저장 비용은 axis\_points^6로 증가한다. axis\_points=9 이상부터는 sampled pair 저장 또는 on-the-fly AO evaluation이 필요하다.
+\item 600개 생성은 디스크보다 SCF 계산 시간이 병목이다.
+\item 현재는 QM9 구조를 PySCF로 직접 계산한 DFT density matrix를 사용한다. QMugs wavefunction tarball을 직접 파싱한 것은 아니다.
+\item local feature는 핵전하 potential 기반의 단순 descriptor다. 더 정교한 chemical descriptor를 추가할 수 있다.
+\end{itemize}
+요약하면, 현재 폴더는 QM9/PySCF로 계산한 실제 DFT AO density matrix를 3D grid 1-RDM target으로 바꾸고, 이를 point/pair/context 구조의 transferable neural surrogate로 학습하는 연구 prototype이다.
+\end{document}
