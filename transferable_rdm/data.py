@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Sequence
 
 import numpy as np
 
@@ -177,11 +178,21 @@ def sample_pair_indices(
     epoch: int,
     total_epochs: int,
     rng: np.random.Generator,
+    category_probs: Sequence[float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """category-balanced curriculum sampling."""
-    probs = curriculum_probs(epoch, total_epochs)
     category_names = ["diag", "near", "mid", "far"]
-    counts = rng.multinomial(batch_size, [probs[name] for name in category_names])
+    if category_probs is None:
+        probs = curriculum_probs(epoch, total_epochs)
+        prob_values = [probs[name] for name in category_names]
+    else:
+        prob_array = np.asarray(category_probs, dtype=np.float64)
+        if prob_array.shape != (4,):
+            raise ValueError("category_probs must contain four values: diag,near,mid,far.")
+        if np.any(prob_array < 0.0) or float(np.sum(prob_array)) <= 0.0:
+            raise ValueError("category_probs must be non-negative and have positive sum.")
+        prob_values = (prob_array / float(np.sum(prob_array))).tolist()
+    counts = rng.multinomial(batch_size, prob_values)
 
     left_parts: list[np.ndarray] = []
     right_parts: list[np.ndarray] = []
@@ -286,8 +297,19 @@ def sample_pairs_by_category(
     return sample_far_pairs(system, count, rng)
 
 
-def pair_weights_from_categories(categories: np.ndarray) -> np.ndarray:
-    base = np.array([20.0, 8.0, 4.0, 1.0], dtype=np.float32)
+def pair_weights_from_categories(
+    categories: np.ndarray,
+    category_weights: Sequence[float] | None = None,
+) -> np.ndarray:
+    base = (
+        np.array([20.0, 8.0, 4.0, 1.0], dtype=np.float32)
+        if category_weights is None
+        else np.asarray(category_weights, dtype=np.float32)
+    )
+    if base.shape != (4,):
+        raise ValueError("category_weights must contain four values: diag,near,mid,far.")
+    if np.any(base < 0.0) or float(np.sum(base)) <= 0.0:
+        raise ValueError("category_weights must be non-negative and have positive sum.")
     weights = base[categories].reshape(-1, 1)
     return (weights / max(float(np.mean(weights)), 1e-8)).astype(np.float32)
 

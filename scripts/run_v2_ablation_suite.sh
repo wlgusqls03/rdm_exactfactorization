@@ -36,16 +36,24 @@ WIDTH="${WIDTH:-128}"
 DEPTH="${DEPTH:-2}"
 RANK="${RANK:-8}"
 RFF_FEATURES="${RFF_FEATURES:-16}"
+PAIR_SAMPLING_PROBS="${PAIR_SAMPLING_PROBS:-}"
+PAIR_CATEGORY_WEIGHTS="${PAIR_CATEGORY_WEIGHTS:-20,8,4,1}"
 
 echo "[V2] root        : ${ROOT_DIR}"
 echo "[V2] python      : ${PYTHON}"
 echo "[V2] npz glob    : ${NPZ_GLOB}"
 echo "[V2] output root : ${OUTPUT_ROOT}"
 echo "[V2] experiments : ${EXPERIMENTS}"
+echo "[V2] pair probs  : ${PAIR_SAMPLING_PROBS:-curriculum}"
+echo "[V2] pair weights: ${PAIR_CATEGORY_WEIGHTS}"
 
 for EXPERIMENT in ${EXPERIMENTS}; do
   RUN_NAME="${RUN_PREFIX}_${EXPERIMENT}"
   OUT_DIR="${OUTPUT_ROOT}/${EXPERIMENT}"
+  EXTRA_ARGS=(--pair-category-weights "${PAIR_CATEGORY_WEIGHTS}")
+  if [[ -n "${PAIR_SAMPLING_PROBS}" ]]; then
+    EXTRA_ARGS+=(--pair-sampling-probs "${PAIR_SAMPLING_PROBS}")
+  fi
   echo
   echo "[V2] Running ${EXPERIMENT} -> ${OUT_DIR}"
   "${PYTHON}" train_v2_ablation.py \
@@ -67,5 +75,6 @@ for EXPERIMENT in ${EXPERIMENTS}; do
     --width "${WIDTH}" \
     --depth "${DEPTH}" \
     --rank "${RANK}" \
-    --rff-features "${RFF_FEATURES}"
+    --rff-features "${RFF_FEATURES}" \
+    "${EXTRA_ARGS[@]}"
 done

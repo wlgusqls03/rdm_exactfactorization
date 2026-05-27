@@ -298,6 +298,28 @@ If a one-molecule run cannot drive the training loss close to zero, the issue is
 likely model capacity, feature scaling, kernel parameterization, or target scaling
 rather than generalization.
 
+Pair sampling can be fixed instead of using the default curriculum. The values
+are ordered as `diag,near,mid,far`, and category weights are normalized to mean
+one inside each batch:
+
+```bash
+python train_v2_ablation.py \
+  --experiment gamma-simple \
+  --dataset-mode npz \
+  --npz-glob 'qmugs_npz/qm9_pyscf_ldavwn_b631gd_atoms10_400_50_50_spacing1p5_kp/*.npz' \
+  --overfit-one-system \
+  --pair-sampling-probs 0.25,0.25,0.25,0.25 \
+  --pair-category-weights 1,1,1,1 \
+  --epochs 300 \
+  --steps-per-epoch 80 \
+  --batch-size 1024 \
+  --output-dir v2_outputs/overfit_gamma_simple_balanced \
+  --run-name qm9_v2_overfit_gamma_simple_balanced
+```
+
+For an off-diagonal-heavy diagnostic, use `--pair-sampling-probs 0.10,0.20,0.30,0.40`
+with the same `--pair-category-weights 1,1,1,1`.
+
 Each V2 run writes `<run>_history.csv`, `<run>_per_system_metrics.csv`,
 `<run>_summary.json`, and model weights when the experiment has trainable models.
 

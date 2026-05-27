@@ -54,6 +54,21 @@ def env_float(name: str, default: float) -> float:
     return float(os.environ.get(name, default))
 
 
+def parse_four_floats(value: str | None, *, name: str) -> tuple[float, float, float, float] | None:
+    if value is None or value.strip() == "":
+        return None
+    parts = [part.strip() for part in value.split(",")]
+    if len(parts) != 4:
+        raise argparse.ArgumentTypeError(f"{name} must contain four comma-separated values.")
+    try:
+        values = tuple(float(part) for part in parts)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"{name} must contain numeric values.") from exc
+    if any(value < 0.0 for value in values) or sum(values) <= 0.0:
+        raise argparse.ArgumentTypeError(f"{name} must be non-negative and have positive sum.")
+    return values  # type: ignore[return-value]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run ablation-first V2 experiments on existing 1-RDM NPZ data."
@@ -131,6 +146,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kernel-rho-floor", type=float, default=env_float("RDM_V2_KERNEL_RHO_FLOOR", 1e-8))
     parser.add_argument("--kernel-target-clip", type=float, default=env_float("RDM_V2_KERNEL_TARGET_CLIP", 20.0))
     parser.add_argument("--sep-factor-scale", type=float, default=env_float("RDM_V2_SEP_FACTOR_SCALE", 0.05))
+    parser.add_argument(
+        "--pair-sampling-probs",
+        type=lambda text: parse_four_floats(text, name="--pair-sampling-probs"),
+        default=parse_four_floats(os.environ.get("RDM_V2_PAIR_SAMPLING_PROBS"), name="RDM_V2_PAIR_SAMPLING_PROBS"),
+        help="Optional fixed diag,near,mid,far sampling probabilities. Default uses the curriculum.",
+    )
+    parser.add_argument(
+        "--pair-category-weights",
+        type=lambda text: parse_four_floats(text, name="--pair-category-weights"),
+        default=parse_four_floats(
+            os.environ.get("RDM_V2_PAIR_CATEGORY_WEIGHTS", "20,8,4,1"),
+            name="RDM_V2_PAIR_CATEGORY_WEIGHTS",
+        ),
+        help="diag,near,mid,far loss weights. Values are normalized to mean 1 per batch.",
+    )
     parser.add_argument("--no-save-weights", dest="save_weights", action="store_false", default=True)
     return parser.parse_args()
 
@@ -195,6 +225,8 @@ def make_v2_config(args: argparse.Namespace) -> V2Config:
         kernel_rho_floor=args.kernel_rho_floor,
         kernel_target_clip=args.kernel_target_clip,
         sep_factor_scale=args.sep_factor_scale,
+        pair_sampling_probs=args.pair_sampling_probs,
+        pair_category_weights=args.pair_category_weights,
         lambda_gamma=args.lambda_gamma,
         lambda_rho=args.lambda_rho,
         lambda_trace=args.lambda_trace,

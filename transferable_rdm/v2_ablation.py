@@ -66,6 +66,8 @@ class V2Config:
     kernel_rho_floor: float = 1e-8
     kernel_target_clip: float = 20.0
     sep_factor_scale: float = 0.05
+    pair_sampling_probs: tuple[float, float, float, float] | None = None
+    pair_category_weights: tuple[float, float, float, float] = (20.0, 8.0, 4.0, 1.0)
 
     lambda_gamma: float = 1.0
     lambda_rho: float = 1.0
@@ -289,8 +291,16 @@ def make_batch(
     epoch: int,
     total_epochs: int,
     rng: np.random.Generator,
+    config: V2Config,
 ) -> dict[str, np.ndarray]:
-    left, right, categories = sample_pair_indices(system, batch_size, epoch, total_epochs, rng)
+    left, right, categories = sample_pair_indices(
+        system,
+        batch_size,
+        epoch,
+        total_epochs,
+        rng,
+        category_probs=config.pair_sampling_probs,
+    )
     gamma_true = system.gamma_values(left, right)
     rho_left = system.rho_diag[left].astype(np.float32)
     rho_right = system.rho_diag[right].astype(np.float32)
@@ -302,7 +312,7 @@ def make_batch(
         "gamma_true": gamma_true.astype(np.float32),
         "rho_left_true": rho_left,
         "rho_right_true": rho_right,
-        "weights": pair_weights_from_categories(categories),
+        "weights": pair_weights_from_categories(categories, config.pair_category_weights),
     }
 
 
@@ -413,7 +423,7 @@ def fit_baseline_alpha(split: DatasetSplit, config: V2Config) -> float:
     n_batches = max(1, config.baseline_fit_batches)
     for batch_idx in range(n_batches):
         system = choose_system(split.train_systems, rng)
-        batch = make_batch(system, config.batch_size, batch_idx, n_batches, rng)
+        batch = make_batch(system, config.batch_size, batch_idx, n_batches, rng, config)
         gamma_true = batch["gamma_true"]
         weights = batch["weights"]
         denom = max(float(np.sum(weights)), 1e-12)
@@ -441,7 +451,7 @@ def evaluate_system(
     rng: np.random.Generator,
     alpha: float | None = None,
 ) -> dict[str, float]:
-    batch = make_batch(system, config.eval_pair_count, 0, 1, rng)
+    batch = make_batch(system, config.eval_pair_count, 0, 1, rng, config)
 
     rho_pred_np: np.ndarray
     gamma_pred_np: np.ndarray | None = None
@@ -618,6 +628,8 @@ def train_v2(config: V2Config, split: DatasetSplit, point_dim: int, pair_dim: in
             ("steps/epoch", config.steps_per_epoch),
             ("batch", config.batch_size),
             ("learning rate", config.learning_rate),
+            ("pair sampling probs", config.pair_sampling_probs or "curriculum"),
+            ("pair weights", config.pair_category_weights),
         ],
     )
 
@@ -627,7 +639,7 @@ def train_v2(config: V2Config, split: DatasetSplit, point_dim: int, pair_dim: in
             system = choose_system(split.train_systems, rng)
             batch = None
             if config.experiment != "rho-only":
-                batch = make_batch(system, config.batch_size, epoch, config.epochs, rng)
+                batch = make_batch(system, config.batch_size, epoch, config.epochs, rng, config)
             with tf.GradientTape() as tape:
                 total, losses = compute_step_loss(system, batch, models, config)
             variables = models.trainable_variables()
