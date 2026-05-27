@@ -65,6 +65,7 @@ class V2Config:
     normalize_rho: bool = True
     kernel_rho_floor: float = 1e-8
     kernel_target_clip: float = 20.0
+    kernel_base_alpha: float = 0.0
     sep_factor_scale: float = 0.05
     pair_sampling_probs: tuple[float, float, float, float] | None = None
     pair_category_weights: tuple[float, float, float, float] = (20.0, 8.0, 4.0, 1.0)
@@ -201,6 +202,7 @@ def build_v2_models(point_dim: int, pair_dim: int, global_dim: int, config: V2Co
             ("pair input dim", pair_dim + global_dim if pair_model is not None else "off"),
             ("global dim", global_dim),
             ("rank", config.rank if uses_residual(config.experiment) else 0),
+            ("kernel base alpha", config.kernel_base_alpha if pair_model is not None else "off"),
             ("point params", point_model.count_params() if point_model is not None else 0),
             ("pair params", pair_model.count_params() if pair_model is not None else 0),
             ("context params", context_model.count_params() if context_model is not None else 0),
@@ -245,6 +247,12 @@ def separation_factor(pair_feat: tf.Tensor, config: V2Config) -> tf.Tensor:
     return 1.0 - tf.exp(-sep_sq / max(config.sep_factor_scale, 1e-8))
 
 
+def kernel_base(pair_feat: tf.Tensor, config: V2Config) -> tf.Tensor:
+    sep_sq = tf.maximum(pair_feat[:, 10:11], 0.0)
+    alpha = tf.constant(max(config.kernel_base_alpha, 0.0), dtype=tf.float32)
+    return tf.exp(-alpha * sep_sq)
+
+
 def predict_kernel(
     system: SystemRecord,
     batch: dict[str, np.ndarray],
@@ -258,9 +266,9 @@ def predict_kernel(
     pair_feat = to_tensor(batch["pair_feat"])
     global_tiled = tile_global(to_tensor(system.global_context), tf.shape(pair_feat)[0])
     pair_input = tf.concat([pair_feat, global_tiled], axis=1)
-    raw = models.pair(pair_input)
+    delta_pair = models.pair(pair_input)
     sep_factor = separation_factor(pair_feat, config)
-    kernel = 1.0 + sep_factor * raw
+    kernel = kernel_base(pair_feat, config) + sep_factor * delta_pair
 
     if uses_residual(config.experiment):
         if modes_all is None:
@@ -374,7 +382,7 @@ def compute_step_loss(
     if config.experiment == "k-only":
         kernel_target, kernel_weights = true_kernel_target(batch, config)
         kernel_loss = weighted_mse(to_tensor(kernel_target), kernel, to_tensor(kernel_weights))
-        total = config.lambda_kernel * kernel_loss
+        total = config.lambda_kernel * gamma_loss
     elif config.experiment == "gamma-only":
         total = config.lambda_gamma * gamma_loss
     else:
@@ -628,6 +636,9 @@ def train_v2(config: V2Config, split: DatasetSplit, point_dim: int, pair_dim: in
             ("steps/epoch", config.steps_per_epoch),
             ("batch", config.batch_size),
             ("learning rate", config.learning_rate),
+            ("k-only objective", "true-rho gamma loss" if config.experiment == "k-only" else "n/a"),
+            ("kernel form", "exp(-alpha d^2) + sep * deltaK_pair"),
+            ("kernel base alpha", config.kernel_base_alpha),
             ("pair sampling probs", config.pair_sampling_probs or "curriculum"),
             ("pair weights", config.pair_category_weights),
         ],

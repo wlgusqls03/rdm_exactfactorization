@@ -145,6 +145,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-normalize-rho", dest="normalize_rho", action="store_false")
     parser.add_argument("--kernel-rho-floor", type=float, default=env_float("RDM_V2_KERNEL_RHO_FLOOR", 1e-8))
     parser.add_argument("--kernel-target-clip", type=float, default=env_float("RDM_V2_KERNEL_TARGET_CLIP", 20.0))
+    parser.add_argument("--kernel-base-alpha", type=float, default=env_float("RDM_V2_KERNEL_BASE_ALPHA", 0.0))
     parser.add_argument("--sep-factor-scale", type=float, default=env_float("RDM_V2_SEP_FACTOR_SCALE", 0.05))
     parser.add_argument(
         "--pair-sampling-probs",
@@ -224,6 +225,7 @@ def make_v2_config(args: argparse.Namespace) -> V2Config:
         normalize_rho=normalize_rho,
         kernel_rho_floor=args.kernel_rho_floor,
         kernel_target_clip=args.kernel_target_clip,
+        kernel_base_alpha=args.kernel_base_alpha,
         sep_factor_scale=args.sep_factor_scale,
         pair_sampling_probs=args.pair_sampling_probs,
         pair_category_weights=args.pair_category_weights,
