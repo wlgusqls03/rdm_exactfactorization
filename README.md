@@ -223,6 +223,84 @@ GPU memory at startup. A CUDA-capable TensorFlow installation and working NVIDIA
 driver are still required; if TensorFlow cannot see a GPU, the script prints a
 warning and the run falls back to CPU.
 
+## V2 Ablation Runner
+
+The full prototype can become hard to diagnose because density, kernel, residual
+modes, context conditioning, tau, KP, and kinetic energy are all coupled. The V2
+runner keeps the same NPZ data and system-level splits, but resets the model and
+loss structure into small ablation experiments.
+
+Entry point:
+
+```text
+train_v2_ablation.py
+```
+
+Implemented experiments:
+
+- `baseline`: no ML. Fits one scalar `alpha` for
+  `gamma_base(r,r') = sqrt(rho_true(r) rho_true(r')) exp(-alpha |r-r'|^2)`.
+- `rho-only`: point model only. Trains `rho_theta(r)` with density and trace loss.
+- `k-only`: pair model only. Uses true density and trains `K_theta(r,r')`.
+- `gamma-only`: point + pair model, trained only through sampled gamma loss.
+- `gamma-simple`: point + pair model, trained with gamma + rho + trace losses.
+- `gamma-residual`: adds a low-rank residual kernel.
+- `gamma-context`: adds a context model that gates residual modes by molecule.
+
+Run the four first diagnostic experiments on an existing NPZ dataset:
+
+```bash
+NPZ_GLOB='qmugs_npz/qm9_pyscf_ldavwn_b631gd_atoms10_400_50_50_spacing1p5_kp/*.npz' \
+OUTPUT_ROOT=v2_outputs \
+TRAIN_SYSTEM_COUNT=400 \
+VAL_SYSTEM_COUNT=50 \
+TEST_SYSTEM_COUNT=50 \
+EPOCHS=120 \
+STEPS_PER_EPOCH=40 \
+BATCH_SIZE=1024 \
+bash scripts/run_v2_ablation_suite.sh
+```
+
+Run one experiment directly:
+
+```bash
+python train_v2_ablation.py \
+  --experiment k-only \
+  --dataset-mode npz \
+  --npz-glob 'qmugs_npz/qm9_pyscf_ldavwn_b631gd_atoms10_400_50_50_spacing1p5_kp/*.npz' \
+  --train-system-count 400 \
+  --val-system-count 50 \
+  --test-system-count 50 \
+  --epochs 120 \
+  --steps-per-epoch 40 \
+  --batch-size 1024 \
+  --output-dir v2_outputs/k-only \
+  --run-name qm9_v2_k_only
+```
+
+For capacity debugging, force train/validation/test to be the same molecule:
+
+```bash
+python train_v2_ablation.py \
+  --experiment gamma-simple \
+  --dataset-mode npz \
+  --npz-glob 'qmugs_npz/qm9_pyscf_ldavwn_b631gd_atoms10_400_50_50_spacing1p5_kp/*.npz' \
+  --overfit-one-system \
+  --overfit-system-index 0 \
+  --epochs 300 \
+  --steps-per-epoch 80 \
+  --batch-size 1024 \
+  --output-dir v2_outputs/overfit_gamma_simple \
+  --run-name qm9_v2_overfit_gamma_simple
+```
+
+If a one-molecule run cannot drive the training loss close to zero, the issue is
+likely model capacity, feature scaling, kernel parameterization, or target scaling
+rather than generalization.
+
+Each V2 run writes `<run>_history.csv`, `<run>_per_system_metrics.csv`,
+`<run>_summary.json`, and model weights when the experiment has trainable models.
+
 ## Losses
 
 The main losses are:
@@ -276,6 +354,10 @@ train_transferable_1rdm.py
     Main training script. Builds the corpus, splits systems, constructs models,
     trains, evaluates, plots, and saves artifacts.
 
+train_v2_ablation.py
+    Separate ablation-first runner for baseline, rho-only, K-only, gamma-only,
+    residual, and context experiments.
+
 scripts/build_qm9_pyscf_npz.py
     QM9 to PySCF-DFT NPZ converter. Computes gamma, density, tau, kinetic energy,
     kinetic potential, features, and metadata.
@@ -283,6 +365,9 @@ scripts/build_qm9_pyscf_npz.py
 scripts/run_qm9_ldavwn_weekend_500.sh
     Convenience pipeline for building a 500-molecule LDA/VWN QM9 subset and
     starting a long training run.
+
+scripts/run_v2_ablation_suite.sh
+    Convenience runner for the first V2 diagnostic experiments.
 
 scripts/render_project_note_pdf.py
     Helper for rendering the project note PDF. Not needed for model training.
@@ -305,6 +390,10 @@ transferable_rdm/model.py
 transferable_rdm/training.py
     Training loop, scheduled loss weights, evaluation metrics, kinetic-potential
     loss, kinetic-energy diagnostics, and early stopping.
+
+transferable_rdm/v2_ablation.py
+    V2 ablation model classes, losses, baseline fitting, metrics, CSV/JSON output,
+    and training loop.
 
 transferable_rdm/plotting.py
     Summary plots for objectives, gamma parity, density slices, tau, KP, and
