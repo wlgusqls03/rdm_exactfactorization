@@ -57,6 +57,9 @@ class V2Config:
     weight_decay: float = 0.0
 
     eval_pair_count: int = 8192
+    cache_eval_batches: bool = True
+    steps_per_system: int = 1
+    pair_features_on_device: bool = True
     baseline_fit_batches: int = 24
     baseline_alpha_min: float = 1e-3
     baseline_alpha_max: float = 3.0
@@ -92,6 +95,10 @@ class V2Config:
     save_weights: bool = True
 
 
+_SYSTEM_TENSOR_CACHE: dict[tuple[int, str], tf.Tensor] = {}
+_EVAL_BATCH_CACHE: dict[tuple[object, ...], dict[str, object]] = {}
+
+
 @dataclass
 class V2Models:
     point: tf.keras.Model | None = None
@@ -108,6 +115,44 @@ class V2Models:
 
 def to_tensor(array: np.ndarray) -> tf.Tensor:
     return tf.convert_to_tensor(array, dtype=tf.float32)
+
+
+def system_tensor(system: SystemRecord, name: str, array: np.ndarray) -> tf.Tensor:
+    key = (id(system), name)
+    tensor = _SYSTEM_TENSOR_CACHE.get(key)
+    if tensor is None:
+        tensor = to_tensor(array)
+        _SYSTEM_TENSOR_CACHE[key] = tensor
+    return tensor
+
+
+def system_scalar(system: SystemRecord, name: str, value_factory) -> tf.Tensor:
+    key = (id(system), name)
+    tensor = _SYSTEM_TENSOR_CACHE.get(key)
+    if tensor is None:
+        tensor = tf.constant(float(value_factory()), dtype=tf.float32)
+        _SYSTEM_TENSOR_CACHE[key] = tensor
+    return tensor
+
+
+def batch_tensor(batch: dict[str, object], key: str, dtype: tf.dtypes.DType = tf.float32) -> tf.Tensor:
+    tensor_key = f"_tf_{key}"
+    cached = batch.get(tensor_key)
+    if isinstance(cached, tf.Tensor):
+        return cached
+    tensor = tf.convert_to_tensor(batch[key], dtype=dtype)
+    batch[tensor_key] = tensor
+    return tensor
+
+
+def index_tensor(indices: np.ndarray | tf.Tensor) -> tf.Tensor:
+    if isinstance(indices, tf.Tensor):
+        return tf.cast(indices, tf.int32)
+    return tf.convert_to_tensor(indices, dtype=tf.int32)
+
+
+def batch_indices(batch: dict[str, object], key: str) -> tf.Tensor:
+    return batch_tensor(batch, key, dtype=tf.int32)
 
 
 def build_mlp(
@@ -247,8 +292,8 @@ def true_rho_pair_features(
 
 def predicted_rho_pair_features(
     rho_values: tf.Tensor,
-    left_idx: np.ndarray,
-    right_idx: np.ndarray,
+    left_idx: np.ndarray | tf.Tensor,
+    right_idx: np.ndarray | tf.Tensor,
     config: V2Config,
 ) -> tf.Tensor:
     eps = tf.constant(max(float(config.pair_rho_eps), 1e-30), dtype=tf.float32)
@@ -288,7 +333,7 @@ def predicted_rho_pair_features(
         features.append(scaled)
 
     if not features:
-        return tf.zeros((tf.shape(tf.convert_to_tensor(left_idx))[0], 0), dtype=tf.float32)
+        return tf.zeros((tf.shape(index_tensor(left_idx))[0], 0), dtype=tf.float32)
     return tf.concat(features, axis=1)
 
 
@@ -387,14 +432,79 @@ def tile_global(global_context: tf.Tensor, count: tf.Tensor) -> tf.Tensor:
 
 
 def point_inputs(system: SystemRecord) -> tf.Tensor:
-    local = to_tensor(system.local_features)
-    tiled = tile_global(to_tensor(system.global_context), tf.shape(local)[0])
-    return tf.concat([local, tiled], axis=1)
+    key = (id(system), "point_inputs")
+    cached = _SYSTEM_TENSOR_CACHE.get(key)
+    if cached is not None:
+        return cached
+    local = system_tensor(system, "local_features", system.local_features)
+    tiled = tile_global(system_tensor(system, "global_context", system.global_context), tf.shape(local)[0])
+    inputs = tf.concat([local, tiled], axis=1)
+    _SYSTEM_TENSOR_CACHE[key] = inputs
+    return inputs
+
+
+def rho_diag_tensor(system: SystemRecord) -> tf.Tensor:
+    return system_tensor(system, "rho_diag", system.rho_diag)
+
+
+def global_context_tensor(system: SystemRecord) -> tf.Tensor:
+    return system_tensor(system, "global_context", system.global_context)
+
+
+def base_pair_features_tf(system: SystemRecord, left_idx: np.ndarray | tf.Tensor, right_idx: np.ndarray | tf.Tensor) -> tf.Tensor:
+    points = system_tensor(system, "points", system.points)
+    potential = system_tensor(system, "potential", system.potential)
+    grad_potential = system_tensor(system, "grad_potential", system.grad_potential)
+    left = index_tensor(left_idx)
+    right = index_tensor(right_idx)
+
+    points_r = tf.gather(points, left)
+    points_rp = tf.gather(points, right)
+    midpoint = 0.5 * (points_r + points_rp)
+    separation = points_r - points_rp
+    abs_separation = tf.abs(separation)
+    sep_sq_components = separation**2
+    sep_norm = tf.norm(separation, axis=1, keepdims=True)
+    sep_sq = tf.reduce_sum(separation**2, axis=1, keepdims=True)
+
+    pot_r = tf.gather(potential, left)
+    pot_rp = tf.gather(potential, right)
+    grad_r = tf.gather(grad_potential, left)
+    grad_rp = tf.gather(grad_potential, right)
+
+    domain_scale = system_scalar(system, "pair_domain_scale", lambda: max(float(np.max(np.abs(system.axis))), 1e-6))
+    step_scale = system_scalar(system, "pair_step_scale", lambda: max(float(system.step), 1e-6))
+    pot_scale = system_scalar(system, "pair_potential_scale", lambda: max(float(np.std(system.potential)), 1.0))
+
+    return tf.concat(
+        [
+            midpoint / domain_scale,
+            abs_separation / domain_scale,
+            sep_sq_components / (domain_scale * domain_scale),
+            sep_norm / domain_scale,
+            sep_sq / (domain_scale * domain_scale),
+            0.5 * (pot_r + pot_rp) / pot_scale,
+            0.5 * (grad_r + grad_rp) * step_scale / pot_scale,
+            tf.abs(grad_r - grad_rp) * step_scale / pot_scale,
+        ],
+        axis=1,
+    )
+
+
+def pair_feature_tensor(system: SystemRecord, batch: dict[str, object], config: V2Config) -> tf.Tensor:
+    cached = batch.get("_tf_pair_feat")
+    if isinstance(cached, tf.Tensor):
+        return cached
+    if "pair_feat" in batch:
+        return batch_tensor(batch, "pair_feat")
+    pair_feat = base_pair_features_tf(system, batch_indices(batch, "left"), batch_indices(batch, "right"))
+    batch["_tf_pair_feat"] = pair_feat
+    return pair_feat
 
 
 def predict_rho_and_modes(system: SystemRecord, models: V2Models, config: V2Config) -> tuple[tf.Tensor, tf.Tensor | None]:
     if models.point is None:
-        rho_true = to_tensor(system.rho_diag)
+        rho_true = rho_diag_tensor(system)
         return rho_true, None
 
     point_out = models.point(point_inputs(system))
@@ -408,8 +518,8 @@ def predict_rho_and_modes(system: SystemRecord, models: V2Models, config: V2Conf
     return rho, modes
 
 
-def gather(values: tf.Tensor, indices: np.ndarray) -> tf.Tensor:
-    return tf.gather(values, tf.convert_to_tensor(indices, dtype=tf.int32))
+def gather(values: tf.Tensor, indices: np.ndarray | tf.Tensor) -> tf.Tensor:
+    return tf.gather(values, index_tensor(indices))
 
 
 def separation_factor(pair_feat: tf.Tensor, config: V2Config) -> tf.Tensor:
@@ -425,7 +535,7 @@ def kernel_base(pair_feat: tf.Tensor, config: V2Config) -> tf.Tensor:
 
 def predict_kernel(
     system: SystemRecord,
-    batch: dict[str, np.ndarray],
+    batch: dict[str, object],
     models: V2Models,
     config: V2Config,
     modes_all: tf.Tensor | None,
@@ -434,16 +544,18 @@ def predict_kernel(
     if models.pair is None:
         raise RuntimeError("This experiment has no pair model.")
 
-    pair_feat = to_tensor(batch["pair_feat"])
+    pair_feat = pair_feature_tensor(system, batch, config)
+    left_idx = batch_indices(batch, "left")
+    right_idx = batch_indices(batch, "right")
     if pair_rho_source(config) == "pred":
         if rho_pred is None:
             raise RuntimeError("Predicted-rho pair features require rho_pred.")
         rho_feature_values = tf.stop_gradient(rho_pred) if config.pair_rho_stop_gradient else rho_pred
         pair_feat = tf.concat(
-            [pair_feat, predicted_rho_pair_features(rho_feature_values, batch["left"], batch["right"], config)],
+            [pair_feat, predicted_rho_pair_features(rho_feature_values, left_idx, right_idx, config)],
             axis=1,
         )
-    global_tiled = tile_global(to_tensor(system.global_context), tf.shape(pair_feat)[0])
+    global_tiled = tile_global(global_context_tensor(system), tf.shape(pair_feat)[0])
     pair_input = tf.concat([pair_feat, global_tiled], axis=1)
     delta_pair = models.pair(pair_input)
     sep_factor = separation_factor(pair_feat, config)
@@ -452,11 +564,11 @@ def predict_kernel(
     if uses_residual(config.experiment):
         if modes_all is None:
             raise RuntimeError("Residual experiment requires point modes.")
-        left_modes = gather(modes_all, batch["left"])
-        right_modes = gather(modes_all, batch["right"])
+        left_modes = gather(modes_all, left_idx)
+        right_modes = gather(modes_all, right_idx)
 
         if models.context is not None:
-            context_weights = tf.nn.softplus(models.context(tf.reshape(to_tensor(system.global_context), (1, -1)))) + 1e-6
+            context_weights = tf.nn.softplus(models.context(tf.reshape(global_context_tensor(system), (1, -1)))) + 1e-6
             left_modes = left_modes * tf.sqrt(context_weights)
             right_modes = right_modes * tf.sqrt(context_weights)
 
@@ -479,7 +591,7 @@ def make_batch(
     total_epochs: int,
     rng: np.random.Generator,
     config: V2Config,
-) -> dict[str, np.ndarray]:
+) -> dict[str, object]:
     left, right, categories = sample_pair_indices(
         system,
         batch_size,
@@ -491,16 +603,63 @@ def make_batch(
     gamma_true = system.gamma_values(left, right)
     rho_left = system.rho_diag[left].astype(np.float32)
     rho_right = system.rho_diag[right].astype(np.float32)
-    pair_feat = build_v2_pair_features(system, left, right, config)
-    return {
+    batch: dict[str, object] = {
         "left": left.astype(np.int64),
         "right": right.astype(np.int64),
-        "pair_feat": pair_feat.astype(np.float32),
         "gamma_true": gamma_true.astype(np.float32),
         "rho_left_true": rho_left,
         "rho_right_true": rho_right,
         "weights": pair_weights_from_categories(categories, config.pair_category_weights),
     }
+    if not config.pair_features_on_device or pair_rho_source(config) == "true":
+        pair_feat = build_v2_pair_features(system, left, right, config)
+        batch["pair_feat"] = pair_feat.astype(np.float32)
+    return batch
+
+
+def prepare_batch_tensors(batch: dict[str, object]) -> dict[str, object]:
+    """Warm TensorFlow tensors for arrays that are reused inside a step/eval."""
+    for key in ("left", "right"):
+        batch_indices(batch, key)
+    for key in ("gamma_true", "rho_left_true", "rho_right_true", "weights"):
+        batch_tensor(batch, key)
+    if "pair_feat" in batch:
+        batch_tensor(batch, "pair_feat")
+    return batch
+
+
+def eval_batch_cache_key(system: SystemRecord, config: V2Config) -> tuple[object, ...]:
+    return (
+        id(system),
+        config.eval_pair_count,
+        config.pair_sampling_probs,
+        config.pair_category_weights,
+        tuple(active_pair_rho_feature_names(config)),
+        pair_rho_source(config),
+        config.pair_rho_eps,
+        config.pair_rho_log_scale,
+        config.pair_rho_log_clip,
+        config.pair_rho_scaled_clip,
+        config.pair_rho_product_transform,
+        config.pair_features_on_device,
+    )
+
+
+def make_eval_batch(
+    system: SystemRecord,
+    config: V2Config,
+    rng: np.random.Generator,
+) -> dict[str, object]:
+    if not config.cache_eval_batches:
+        return prepare_batch_tensors(make_batch(system, config.eval_pair_count, 0, 1, rng, config))
+
+    key = eval_batch_cache_key(system, config)
+    cached = _EVAL_BATCH_CACHE.get(key)
+    if cached is not None:
+        return cached
+    batch = prepare_batch_tensors(make_batch(system, config.eval_pair_count, 0, 1, rng, config))
+    _EVAL_BATCH_CACHE[key] = batch
+    return batch
 
 
 def true_kernel_target(batch: dict[str, np.ndarray], config: V2Config) -> tuple[np.ndarray, np.ndarray]:
@@ -517,16 +676,16 @@ def true_kernel_target(batch: dict[str, np.ndarray], config: V2Config) -> tuple[
 
 
 def highrho_kernel_loss(
-    batch: dict[str, np.ndarray],
+    batch: dict[str, object],
     gamma_pred: tf.Tensor,
     config: V2Config,
 ) -> tuple[tf.Tensor, tf.Tensor]:
-    rho_left = to_tensor(batch["rho_left_true"])
-    rho_right = to_tensor(batch["rho_right_true"])
+    rho_left = batch_tensor(batch, "rho_left_true")
+    rho_right = batch_tensor(batch, "rho_right_true")
     denom = tf.sqrt(tf.maximum(rho_left * rho_right, 0.0))
     mask = tf.cast(denom > config.k_highrho_cut, tf.float32)
-    weights = to_tensor(batch["weights"]) * mask
-    scaled_err = (gamma_pred - to_tensor(batch["gamma_true"])) / tf.maximum(denom, config.k_highrho_eps)
+    weights = batch_tensor(batch, "weights") * mask
+    scaled_err = (gamma_pred - batch_tensor(batch, "gamma_true")) / tf.maximum(denom, config.k_highrho_eps)
     weight_sum = tf.reduce_sum(weights)
     loss = tf.reduce_sum(weights * tf.square(scaled_err)) / tf.maximum(weight_sum, 1e-12)
     active_frac = tf.reduce_mean(mask)
@@ -562,7 +721,7 @@ def weighted_mse(true: tf.Tensor, pred: tf.Tensor, weights: tf.Tensor) -> tf.Ten
 
 
 def rho_losses(system: SystemRecord, rho_pred: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
-    rho_loss = tf.reduce_mean(tf.square(rho_pred - to_tensor(system.rho_diag)))
+    rho_loss = tf.reduce_mean(tf.square(rho_pred - rho_diag_tensor(system)))
     trace_pred = tf.reduce_sum(rho_pred) * system.cell_volume
     trace_loss = tf.square((trace_pred - system.electron_count) / max(system.electron_count, 1.0))
     return rho_loss, trace_loss
@@ -570,7 +729,7 @@ def rho_losses(system: SystemRecord, rho_pred: tf.Tensor) -> tuple[tf.Tensor, tf
 
 def compute_step_loss(
     system: SystemRecord,
-    batch: dict[str, np.ndarray] | None,
+    batch: dict[str, object] | None,
     models: V2Models,
     config: V2Config,
 ) -> tuple[tf.Tensor, dict[str, tf.Tensor]]:
@@ -597,16 +756,18 @@ def compute_step_loss(
     if batch is None:
         raise RuntimeError("Pair batch is required for non-rho-only experiments.")
 
+    left_idx = batch_indices(batch, "left")
+    right_idx = batch_indices(batch, "right")
     if config.experiment == "k-only":
-        rho_left = to_tensor(batch["rho_left_true"])
-        rho_right = to_tensor(batch["rho_right_true"])
+        rho_left = batch_tensor(batch, "rho_left_true")
+        rho_right = batch_tensor(batch, "rho_right_true")
     else:
-        rho_left = gather(rho_pred, batch["left"])
-        rho_right = gather(rho_pred, batch["right"])
+        rho_left = gather(rho_pred, left_idx)
+        rho_right = gather(rho_pred, right_idx)
 
     kernel = predict_kernel(system, batch, models, config, modes_all, rho_pred)
     gamma_pred = gamma_from_rho_kernel(rho_left, rho_right, kernel)
-    gamma_loss = weighted_mse(to_tensor(batch["gamma_true"]), gamma_pred, to_tensor(batch["weights"]))
+    gamma_loss = weighted_mse(batch_tensor(batch, "gamma_true"), gamma_pred, batch_tensor(batch, "weights"))
 
     if config.experiment == "k-only":
         kernel_target, kernel_weights = true_kernel_target(batch, config)
@@ -691,7 +852,7 @@ def evaluate_system(
     rng: np.random.Generator,
     alpha: float | None = None,
 ) -> dict[str, float]:
-    batch = make_batch(system, config.eval_pair_count, 0, 1, rng, config)
+    batch = make_eval_batch(system, config, rng)
 
     rho_pred_np: np.ndarray
     gamma_pred_np: np.ndarray | None = None
@@ -701,8 +862,8 @@ def evaluate_system(
         rho_pred_np = system.rho_diag.astype(np.float32)
         gamma_pred_np = baseline_gamma(
             system,
-            batch["left"],
-            batch["right"],
+            batch["left"],  # type: ignore[arg-type]
+            batch["right"],  # type: ignore[arg-type]
             alpha=0.0 if alpha is None else alpha,
             density_power=config.baseline_density_power,
         )
@@ -711,11 +872,11 @@ def evaluate_system(
         rho_pred_np = rho_pred.numpy().astype(np.float32)
         if config.experiment != "rho-only":
             if config.experiment == "k-only":
-                rho_left = to_tensor(batch["rho_left_true"])
-                rho_right = to_tensor(batch["rho_right_true"])
+                rho_left = batch_tensor(batch, "rho_left_true")
+                rho_right = batch_tensor(batch, "rho_right_true")
             else:
-                rho_left = gather(rho_pred, batch["left"])
-                rho_right = gather(rho_pred, batch["right"])
+                rho_left = gather(rho_pred, batch_indices(batch, "left"))
+                rho_right = gather(rho_pred, batch_indices(batch, "right"))
             kernel_pred = predict_kernel(system, batch, models, config, modes_all, rho_pred)
             gamma_pred = gamma_from_rho_kernel(rho_left, rho_right, kernel_pred)
             gamma_pred_np = gamma_pred.numpy().astype(np.float32)
@@ -879,7 +1040,10 @@ def train_v2(config: V2Config, split: DatasetSplit, point_dim: int, pair_dim: in
             ("experiment", config.experiment),
             ("epochs", config.epochs),
             ("steps/epoch", config.steps_per_epoch),
+            ("steps/system", max(int(config.steps_per_system), 1)),
             ("batch", config.batch_size),
+            ("cache eval batches", config.cache_eval_batches),
+            ("pair feature placement", "tensorflow" if config.pair_features_on_device else "numpy"),
             ("learning rate", config.learning_rate),
             ("k-only objective", "true-rho gamma loss" if config.experiment == "k-only" else "n/a"),
             ("kernel form", "exp(-alpha d^2) + sep * deltaK_pair"),
@@ -914,11 +1078,15 @@ def train_v2(config: V2Config, split: DatasetSplit, point_dim: int, pair_dim: in
             "kernel_highrho_loss": [],
             "kernel_highrho_frac": [],
         }
-        for _ in range(config.steps_per_epoch):
-            system = choose_system(split.train_systems, rng)
+        steps_per_system = max(int(config.steps_per_system), 1)
+        current_system: SystemRecord | None = None
+        for step_idx in range(config.steps_per_epoch):
+            if current_system is None or step_idx % steps_per_system == 0:
+                current_system = choose_system(split.train_systems, rng)
+            system = current_system
             batch = None
             if config.experiment != "rho-only":
-                batch = make_batch(system, config.batch_size, epoch, config.epochs, rng, config)
+                batch = prepare_batch_tensors(make_batch(system, config.batch_size, epoch, config.epochs, rng, config))
             with tf.GradientTape() as tape:
                 total, losses = compute_step_loss(system, batch, models, config)
             variables = models.trainable_variables()

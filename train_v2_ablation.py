@@ -131,6 +131,38 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--weight-decay", type=float, default=env_float("RDM_V2_WEIGHT_DECAY", 0.0))
     parser.add_argument("--eval-pair-count", type=int, default=env_int("RDM_V2_EVAL_PAIR_COUNT", 8192))
+    parser.add_argument(
+        "--cache-eval-batches",
+        dest="cache_eval_batches",
+        action="store_true",
+        default=env_flag("RDM_V2_CACHE_EVAL_BATCHES", True),
+        help="Reuse fixed validation/test pair batches to reduce CPU sampling and gamma I/O.",
+    )
+    parser.add_argument(
+        "--no-cache-eval-batches",
+        dest="cache_eval_batches",
+        action="store_false",
+        help="Resample validation/test pair batches every evaluation.",
+    )
+    parser.add_argument(
+        "--steps-per-system",
+        type=int,
+        default=env_int("RDM_V2_STEPS_PER_SYSTEM", 1),
+        help="Keep the same sampled system for this many optimizer steps to amortize gamma loading.",
+    )
+    parser.add_argument(
+        "--pair-features-on-device",
+        dest="pair_features_on_device",
+        action="store_true",
+        default=env_flag("RDM_V2_PAIR_FEATURES_ON_DEVICE", True),
+        help="Build base pair features with TensorFlow tensors instead of NumPy when no true-rho oracle features are needed.",
+    )
+    parser.add_argument(
+        "--no-pair-features-on-device",
+        dest="pair_features_on_device",
+        action="store_false",
+        help="Build all pair features eagerly in NumPy.",
+    )
 
     parser.add_argument("--lambda-gamma", type=float, default=env_float("RDM_V2_LAMBDA_GAMMA", 1.0))
     parser.add_argument("--lambda-rho", type=float, default=env_float("RDM_V2_LAMBDA_RHO", 1.0))
@@ -286,6 +318,9 @@ def make_v2_config(args: argparse.Namespace) -> V2Config:
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         eval_pair_count=args.eval_pair_count,
+        cache_eval_batches=args.cache_eval_batches,
+        steps_per_system=max(int(args.steps_per_system), 1),
+        pair_features_on_device=args.pair_features_on_device,
         baseline_fit_batches=args.baseline_fit_batches,
         baseline_alpha_min=args.baseline_alpha_min,
         baseline_alpha_max=args.baseline_alpha_max,

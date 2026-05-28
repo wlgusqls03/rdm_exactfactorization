@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import glob
+import hashlib
 import os
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from .utils import flat_index, make_uniform_grid, print_block
 
 _GAMMA_CACHE: OrderedDict[str, np.ndarray] = OrderedDict()
 _GAMMA_CACHE_BYTES = 0
+_LIGHT_NPZ_CACHE_VERSION = 1
 
 
 def gamma_cache_limit_bytes() -> int:
@@ -43,6 +45,75 @@ def load_gamma_matrix_cached(path: str | Path) -> np.ndarray:
         _GAMMA_CACHE[key] = gamma
         _GAMMA_CACHE_BYTES += gamma.nbytes
     return gamma
+
+
+def npz_light_cache_dir() -> Path | None:
+    """Directory for small per-NPZ metadata caches.
+
+    The cache stores arrays such as rho_diag that are needed during corpus
+    construction. This lets later runs avoid inflating the full gamma matrix
+    before training starts.
+    """
+    value = os.environ.get("RDM_NPZ_LIGHT_CACHE_DIR", "~/.cache/rdm_exactfactorization/npz_light")
+    if value.strip().lower() in {"", "0", "false", "off", "no", "none"}:
+        return None
+    return Path(value).expanduser()
+
+
+def npz_light_cache_path(path: str | Path) -> Path | None:
+    cache_dir = npz_light_cache_dir()
+    if cache_dir is None:
+        return None
+    source = Path(path).expanduser().resolve()
+    digest = hashlib.sha1(str(source).encode("utf-8")).hexdigest()
+    return cache_dir / f"{digest}.npz"
+
+
+def read_npz_light_cache(path: str | Path) -> dict[str, np.ndarray | float] | None:
+    cache_path = npz_light_cache_path(path)
+    if cache_path is None or not cache_path.exists():
+        return None
+
+    source = Path(path).expanduser().resolve()
+    try:
+        stat = source.stat()
+        with np.load(cache_path, allow_pickle=False) as payload:
+            version = int(np.asarray(payload["cache_version"]).reshape(-1)[0])
+            source_size = int(np.asarray(payload["source_size"]).reshape(-1)[0])
+            source_mtime_ns = int(np.asarray(payload["source_mtime_ns"]).reshape(-1)[0])
+            if (
+                version != _LIGHT_NPZ_CACHE_VERSION
+                or source_size != stat.st_size
+                or source_mtime_ns != stat.st_mtime_ns
+            ):
+                return None
+            return {
+                "rho_diag": np.asarray(payload["rho_diag"], dtype=np.float32),
+                "electron_count": float(np.asarray(payload["electron_count"]).reshape(-1)[0]),
+            }
+    except (OSError, KeyError, ValueError):
+        return None
+
+
+def write_npz_light_cache(path: str | Path, rho_diag: np.ndarray, electron_count: float) -> None:
+    cache_path = npz_light_cache_path(path)
+    if cache_path is None:
+        return
+    source = Path(path).expanduser().resolve()
+    try:
+        stat = source.stat()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            cache_path,
+            cache_version=np.asarray([_LIGHT_NPZ_CACHE_VERSION], dtype=np.int32),
+            source_size=np.asarray([stat.st_size], dtype=np.int64),
+            source_mtime_ns=np.asarray([stat.st_mtime_ns], dtype=np.int64),
+            rho_diag=np.asarray(rho_diag, dtype=np.float32),
+            electron_count=np.asarray([electron_count], dtype=np.float32),
+        )
+    except OSError:
+        # Cache failures should never stop training.
+        return
 
 
 @dataclass
@@ -407,28 +478,27 @@ def mixed_derivative_from_stencil(values: np.ndarray, step: float, stencil_order
     return (4.0 * d_h - d_2h) / 3.0
 
 
-def prepare_stencil_targets(
+def stencil_offsets(axis_points: int, tau_stencil: str) -> tuple[int, ...]:
+    method = tau_stencil.strip().lower()
+    if method in {"richardson", "richardson4", "extrapolated"} and axis_points >= 5:
+        return (1, 2)
+    elif method in {"central2", "second", "second_order", "legacy"}:
+        return (1,)
+    elif axis_points < 5:
+        return (1,)
+    raise ValueError(f"Unknown RDM_TAU_STENCIL: {tau_stencil}")
+
+
+def prepare_stencil_indices(
     axis_points: int,
-    gamma_matrix: np.ndarray,
-    step: float,
     tau_stencil: str = "richardson",
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """near-diagonal mixed derivative target을 위한 stencil index와 true 값을 준비."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """near-diagonal mixed derivative target을 위한 stencil index만 준비."""
     interior = []
     left_idx = []
     right_idx = []
-    derivative_true = []
 
-    method = tau_stencil.strip().lower()
-    if method in {"richardson", "richardson4", "extrapolated"} and axis_points >= 5:
-        offsets = (1, 2)
-    elif method in {"central2", "second", "second_order", "legacy"}:
-        offsets = (1,)
-    elif axis_points < 5:
-        offsets = (1,)
-    else:
-        raise ValueError(f"Unknown RDM_TAU_STENCIL: {tau_stencil}")
-
+    offsets = stencil_offsets(axis_points, tau_stencil)
     margin = max(offsets)
     for i in range(margin, axis_points - margin):
         for j in range(margin, axis_points - margin):
@@ -438,12 +508,10 @@ def prepare_stencil_targets(
 
                 per_dim_left = []
                 per_dim_right = []
-                per_dim_true = []
 
                 for dim in range(3):
                     dim_left = []
                     dim_right = []
-                    values = []
                     for offset in offsets:
                         plus = [i, j, k]
                         minus = [i, j, k]
@@ -455,30 +523,44 @@ def prepare_stencil_targets(
 
                         dim_left.extend([idx_plus, idx_plus, idx_minus, idx_minus])
                         dim_right.extend([idx_plus, idx_minus, idx_plus, idx_minus])
-                        values.extend(
-                            [
-                                gamma_matrix[idx_plus, idx_plus],
-                                gamma_matrix[idx_plus, idx_minus],
-                                gamma_matrix[idx_minus, idx_plus],
-                                gamma_matrix[idx_minus, idx_minus],
-                            ]
-                        )
 
                     per_dim_left.append(dim_left)
                     per_dim_right.append(dim_right)
-                    deriv = mixed_derivative_from_stencil(np.asarray(values, dtype=np.float64), step, len(values))
-                    per_dim_true.append(deriv)
 
                 left_idx.append(per_dim_left)
                 right_idx.append(per_dim_right)
-                derivative_true.append(per_dim_true)
 
-    derivative_true_arr = np.asarray(derivative_true, dtype=np.float32)  # (n_interior, 3)
-    tau_true = 0.5 * np.sum(derivative_true_arr, axis=1, keepdims=True)  # (n_interior, 1)
     return (
         np.asarray(interior, dtype=np.int64),
         np.asarray(left_idx, dtype=np.int64),
         np.asarray(right_idx, dtype=np.int64),
+    )
+
+
+def prepare_stencil_targets(
+    axis_points: int,
+    gamma_matrix: np.ndarray,
+    step: float,
+    tau_stencil: str = "richardson",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """near-diagonal mixed derivative target을 위한 stencil index와 true 값을 준비."""
+    interior_idx, left_idx, right_idx = prepare_stencil_indices(axis_points, tau_stencil)
+    derivative_true = []
+
+    for per_point_left, per_point_right in zip(left_idx, right_idx):
+        per_dim_true = []
+        for dim_left, dim_right in zip(per_point_left, per_point_right):
+            values = gamma_matrix[dim_left, dim_right]
+            deriv = mixed_derivative_from_stencil(np.asarray(values, dtype=np.float64), step, len(values))
+            per_dim_true.append(deriv)
+        derivative_true.append(per_dim_true)
+
+    derivative_true_arr = np.asarray(derivative_true, dtype=np.float32)  # (n_interior, 3)
+    tau_true = 0.5 * np.sum(derivative_true_arr, axis=1, keepdims=True)  # (n_interior, 1)
+    return (
+        interior_idx,
+        left_idx,
+        right_idx,
         derivative_true_arr,
     ), tau_true.astype(np.float32)
 
@@ -507,18 +589,38 @@ def finalize_system_record(
     ks_potential: np.ndarray | None = None,
     kinetic_potential: np.ndarray | None = None,
     kinetic_potential_centered: np.ndarray | None = None,
+    rho_diag_override: np.ndarray | None = None,
 ) -> SystemRecord:
     """raw system data를 학습용 record로 정리."""
     n_points = len(points)
     step = float(axis[1] - axis[0])
-    rho_diag = np.diag(gamma_matrix).reshape(-1, 1).astype(np.float32)
+    if rho_diag_override is not None:
+        rho_diag = np.asarray(rho_diag_override, dtype=np.float32)
+        if rho_diag.shape == (n_points,):
+            rho_diag = rho_diag.reshape(-1, 1)
+        if rho_diag.shape != (n_points, 1):
+            raise ValueError(f"rho_diag must have shape ({n_points}, 1), got {rho_diag.shape}")
+    elif gamma_matrix.size:
+        rho_diag = np.diag(gamma_matrix).reshape(-1, 1).astype(np.float32)
+    else:
+        raise ValueError("gamma_matrix or rho_diag_override is required to finalize a system record.")
 
-    (interior_idx, stencil_left, stencil_right, derivative_true), tau_true = prepare_stencil_targets(
-        axis_points=len(axis),
-        gamma_matrix=gamma_matrix,
-        step=step,
-        tau_stencil=config.tau_stencil,
-    )
+    if gamma_matrix.size:
+        (interior_idx, stencil_left, stencil_right, derivative_true), tau_true = prepare_stencil_targets(
+            axis_points=len(axis),
+            gamma_matrix=gamma_matrix,
+            step=step,
+            tau_stencil=config.tau_stencil,
+        )
+    elif derivative_true_grid is not None and tau_true_grid is not None:
+        interior_idx, stencil_left, stencil_right = prepare_stencil_indices(
+            axis_points=len(axis),
+            tau_stencil=config.tau_stencil,
+        )
+        derivative_true = np.zeros((len(interior_idx), 3), dtype=np.float32)
+        tau_true = np.zeros((len(interior_idx), 1), dtype=np.float32)
+    else:
+        raise ValueError("Lazy gamma loading requires stored derivative_true_ao and tau_true_ao grids.")
     if derivative_true_grid is not None:
         derivative_grid = np.asarray(derivative_true_grid, dtype=np.float32)
         if derivative_grid.shape != (n_points, 3):
@@ -694,13 +796,14 @@ def load_npz_system(path: str | Path, config: ExperimentConfig) -> SystemRecord:
         return value.tolist()
 
     with np.load(path, allow_pickle=True) as payload:
-        required = ["points", "gamma_matrix", "local_features", "global_context"]
+        required = ["points", "local_features", "global_context"]
         missing = [key for key in required if key not in payload]
         if missing:
             raise KeyError(f"{path} is missing required keys: {missing}")
+        if "gamma_matrix" not in payload and "rho_diag" not in payload:
+            raise KeyError(f"{path} is missing gamma_matrix or rho_diag.")
 
         points = np.asarray(payload["points"], dtype=np.float32)
-        gamma_matrix = np.asarray(payload["gamma_matrix"], dtype=np.float32)
         local_features = np.asarray(payload["local_features"], dtype=np.float32)
         global_context = np.asarray(payload["global_context"], dtype=np.float32)
         axis = infer_uniform_axis(points)
@@ -736,7 +839,35 @@ def load_npz_system(path: str | Path, config: ExperimentConfig) -> SystemRecord:
             else None
         )
         tau_true_grid = np.asarray(payload["tau_true_ao"], dtype=np.float32) if "tau_true_ao" in payload else None
-        electron_count = float(payload["electron_count"]) if "electron_count" in payload else float(np.trace(gamma_matrix) * config.cell_volume)
+        electron_count_from_payload = float(payload["electron_count"]) if "electron_count" in payload else None
+        rho_diag_override = np.asarray(payload["rho_diag"], dtype=np.float32) if "rho_diag" in payload else None
+        light_cache = None if rho_diag_override is not None else read_npz_light_cache(path)
+        if rho_diag_override is None and light_cache is not None:
+            rho_diag_override = np.asarray(light_cache["rho_diag"], dtype=np.float32)
+
+        can_skip_initial_gamma = (
+            rho_diag_override is not None
+            and derivative_true_grid is not None
+            and tau_true_grid is not None
+            and (electron_count_from_payload is not None or light_cache is not None)
+        )
+        if can_skip_initial_gamma:
+            gamma_matrix = np.empty((0, 0), dtype=np.float32)
+            electron_count = (
+                electron_count_from_payload
+                if electron_count_from_payload is not None
+                else float(light_cache["electron_count"])  # type: ignore[index]
+            )
+        else:
+            gamma_matrix = np.asarray(payload["gamma_matrix"], dtype=np.float32)
+            if rho_diag_override is None:
+                rho_diag_override = np.diag(gamma_matrix).reshape(-1, 1).astype(np.float32)
+            electron_count = (
+                electron_count_from_payload
+                if electron_count_from_payload is not None
+                else float(np.trace(gamma_matrix) * config.cell_volume)
+            )
+            write_npz_light_cache(path, rho_diag_override, electron_count)
         metadata = {
             "source_path": str(path),
             "formula": scalar_payload(payload, "formula", ""),
@@ -778,6 +909,7 @@ def load_npz_system(path: str | Path, config: ExperimentConfig) -> SystemRecord:
         ks_potential=ks_potential,
         kinetic_potential=kinetic_potential,
         kinetic_potential_centered=kinetic_potential_centered,
+        rho_diag_override=rho_diag_override,
     )
 
 
@@ -792,6 +924,8 @@ def build_system_corpus(config: ExperimentConfig) -> list[SystemRecord]:
 
     if config.dataset_mode in {"npz", "mixed"}:
         paths = sorted(glob.glob(config.npz_glob)) if config.npz_glob else []
+        if config.dataset_mode == "npz" and config.num_systems > 0:
+            paths = paths[: config.num_systems]
         if config.dataset_mode == "npz" and not paths:
             raise FileNotFoundError("dataset_mode='npz' but RDM_NPZ_GLOB did not match any files.")
         for path in paths:
