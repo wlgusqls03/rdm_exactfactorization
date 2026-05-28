@@ -81,6 +81,8 @@ class V2Config:
     pair_rho_log_mean: bool = False
     pair_rho_log_diff: bool = False
     pair_rho_scaled_product: bool = False
+    pair_rho_source: str = "auto"
+    pair_rho_stop_gradient: bool = True
     pair_rho_eps: float = 1e-14
     pair_rho_log_scale: float = 8.0
     pair_rho_log_clip: float = 4.0
@@ -174,6 +176,28 @@ def active_pair_rho_feature_names(config: V2Config) -> list[str]:
     return names
 
 
+def pair_rho_source(config: V2Config) -> str:
+    if not active_pair_rho_feature_names(config):
+        return "off"
+    source = config.pair_rho_source.strip().lower()
+    if source == "auto":
+        return "true" if config.experiment == "k-only" else "pred"
+    if source not in {"true", "pred"}:
+        raise ValueError("pair_rho_source must be one of: auto, true, pred.")
+    return source
+
+
+def validate_pair_rho_config(config: V2Config) -> None:
+    source = pair_rho_source(config)
+    if source == "off":
+        return
+    if source == "true" and config.experiment != "k-only":
+        raise ValueError("True-rho pair features are allowed only for k-only oracle ablations.")
+    if source == "pred":
+        if not uses_point_model(config.experiment) or not uses_pair_model(config.experiment):
+            raise ValueError("Predicted-rho pair features require an experiment with both point and pair models.")
+
+
 def true_rho_pair_features(
     system: SystemRecord,
     left_idx: np.ndarray,
@@ -221,6 +245,53 @@ def true_rho_pair_features(
     return np.concatenate(features, axis=1).astype(np.float32)
 
 
+def predicted_rho_pair_features(
+    rho_values: tf.Tensor,
+    left_idx: np.ndarray,
+    right_idx: np.ndarray,
+    config: V2Config,
+) -> tf.Tensor:
+    eps = tf.constant(max(float(config.pair_rho_eps), 1e-30), dtype=tf.float32)
+    rho_clean = tf.maximum(rho_values, 0.0)
+    rho_scale = tf.maximum(tf.reduce_mean(rho_clean), eps)
+
+    rho_left = tf.maximum(gather(rho_values, left_idx), 0.0)
+    rho_right = tf.maximum(gather(rho_values, right_idx), 0.0)
+    log_left = tf.math.log(rho_left + eps)
+    log_right = tf.math.log(rho_right + eps)
+    log_scale = tf.math.log(rho_scale + eps)
+    log_feature_scale = tf.constant(max(float(config.pair_rho_log_scale), 1e-6), dtype=tf.float32)
+    log_feature_clip = float(config.pair_rho_log_clip)
+
+    features: list[tf.Tensor] = []
+    if config.pair_rho_log_mean:
+        log_mean = (0.5 * (log_left + log_right) - log_scale) / log_feature_scale
+        if log_feature_clip > 0.0:
+            log_mean = tf.clip_by_value(log_mean, -log_feature_clip, log_feature_clip)
+        features.append(log_mean)
+    if config.pair_rho_log_diff:
+        log_diff = tf.abs(log_left - log_right) / log_feature_scale
+        if log_feature_clip > 0.0:
+            log_diff = tf.clip_by_value(log_diff, 0.0, log_feature_clip)
+        features.append(log_diff)
+    if config.pair_rho_scaled_product:
+        scaled = tf.sqrt(tf.maximum(rho_left * rho_right, 0.0)) / rho_scale
+        if config.pair_rho_scaled_clip > 0.0:
+            scaled = tf.clip_by_value(scaled, 0.0, float(config.pair_rho_scaled_clip))
+        product_scale = max(float(config.pair_rho_scaled_clip), 1.0)
+        if config.pair_rho_product_transform == "log1p":
+            scaled = tf.math.log1p(scaled) / math.log1p(product_scale)
+        elif config.pair_rho_product_transform == "linear":
+            scaled = scaled / product_scale
+        else:
+            raise ValueError("pair_rho_product_transform must be one of: log1p, linear.")
+        features.append(scaled)
+
+    if not features:
+        return tf.zeros((tf.shape(tf.convert_to_tensor(left_idx))[0], 0), dtype=tf.float32)
+    return tf.concat(features, axis=1)
+
+
 def build_v2_pair_features(
     system: SystemRecord,
     left_idx: np.ndarray,
@@ -228,18 +299,24 @@ def build_v2_pair_features(
     config: V2Config,
 ) -> np.ndarray:
     base = build_pair_features(system, left_idx, right_idx)
-    if not active_pair_rho_feature_names(config):
+    if pair_rho_source(config) != "true":
         return base.astype(np.float32)
     rho_features = true_rho_pair_features(system, left_idx, right_idx, config)
     return np.concatenate([base, rho_features], axis=1).astype(np.float32)
 
 
+def v2_pair_feature_dim(system: SystemRecord, config: V2Config) -> int:
+    sample_idx = np.array([0], dtype=np.int64)
+    base_dim = build_pair_features(system, sample_idx, sample_idx).shape[1]
+    return base_dim + len(active_pair_rho_feature_names(config))
+
+
 def build_v2_models(point_dim: int, pair_dim: int, global_dim: int, config: V2Config) -> V2Models:
     if config.experiment not in EXPERIMENTS:
         raise ValueError(f"Unknown V2 experiment: {config.experiment}")
+    validate_pair_rho_config(config)
     pair_rho_names = active_pair_rho_feature_names(config)
-    if pair_rho_names and config.experiment != "k-only":
-        raise ValueError("True-rho pair features are currently allowed only for k-only oracle ablations.")
+    rho_source = pair_rho_source(config)
 
     point_model = None
     pair_model = None
@@ -293,6 +370,8 @@ def build_v2_models(point_dim: int, pair_dim: int, global_dim: int, config: V2Co
             ("rank", config.rank if uses_residual(config.experiment) else 0),
             ("kernel base alpha", config.kernel_base_alpha if pair_model is not None else "off"),
             ("pair rho features", ", ".join(pair_rho_names) if pair_rho_names else "off"),
+            ("pair rho source", rho_source if pair_rho_names else "off"),
+            ("pair rho stop-gradient", config.pair_rho_stop_gradient if rho_source == "pred" else "n/a"),
             ("context RFF", config.context_rff if context_model is not None else "off"),
             ("point params", point_model.count_params() if point_model is not None else 0),
             ("pair params", pair_model.count_params() if pair_model is not None else 0),
@@ -350,11 +429,20 @@ def predict_kernel(
     models: V2Models,
     config: V2Config,
     modes_all: tf.Tensor | None,
+    rho_pred: tf.Tensor | None = None,
 ) -> tf.Tensor:
     if models.pair is None:
         raise RuntimeError("This experiment has no pair model.")
 
     pair_feat = to_tensor(batch["pair_feat"])
+    if pair_rho_source(config) == "pred":
+        if rho_pred is None:
+            raise RuntimeError("Predicted-rho pair features require rho_pred.")
+        rho_feature_values = tf.stop_gradient(rho_pred) if config.pair_rho_stop_gradient else rho_pred
+        pair_feat = tf.concat(
+            [pair_feat, predicted_rho_pair_features(rho_feature_values, batch["left"], batch["right"], config)],
+            axis=1,
+        )
     global_tiled = tile_global(to_tensor(system.global_context), tf.shape(pair_feat)[0])
     pair_input = tf.concat([pair_feat, global_tiled], axis=1)
     delta_pair = models.pair(pair_input)
@@ -516,7 +604,7 @@ def compute_step_loss(
         rho_left = gather(rho_pred, batch["left"])
         rho_right = gather(rho_pred, batch["right"])
 
-    kernel = predict_kernel(system, batch, models, config, modes_all)
+    kernel = predict_kernel(system, batch, models, config, modes_all, rho_pred)
     gamma_pred = gamma_from_rho_kernel(rho_left, rho_right, kernel)
     gamma_loss = weighted_mse(to_tensor(batch["gamma_true"]), gamma_pred, to_tensor(batch["weights"]))
 
@@ -628,7 +716,7 @@ def evaluate_system(
             else:
                 rho_left = gather(rho_pred, batch["left"])
                 rho_right = gather(rho_pred, batch["right"])
-            kernel_pred = predict_kernel(system, batch, models, config, modes_all)
+            kernel_pred = predict_kernel(system, batch, models, config, modes_all, rho_pred)
             gamma_pred = gamma_from_rho_kernel(rho_left, rho_right, kernel_pred)
             gamma_pred_np = gamma_pred.numpy().astype(np.float32)
             kernel_pred_np = kernel_pred.numpy().astype(np.float32)
@@ -751,6 +839,7 @@ def save_json(path: Path, payload: dict[str, object]) -> None:
 
 
 def train_v2(config: V2Config, split: DatasetSplit, point_dim: int, pair_dim: int, global_dim: int) -> dict[str, object]:
+    validate_pair_rho_config(config)
     out_dir = Path(config.output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -781,6 +870,8 @@ def train_v2(config: V2Config, split: DatasetSplit, point_dim: int, pair_dim: in
     history: list[dict[str, object]] = []
     best_val = math.inf
     best_summary: dict[str, object] = {}
+    pair_rho_names = active_pair_rho_feature_names(config)
+    rho_source = pair_rho_source(config)
 
     print_block(
         "V2 training",
@@ -796,14 +887,16 @@ def train_v2(config: V2Config, split: DatasetSplit, point_dim: int, pair_dim: in
             ("k high-rho lambda", config.lambda_k_highrho if config.experiment == "k-only" else "n/a"),
             ("k high-rho cut", config.k_highrho_cut if config.experiment == "k-only" else "n/a"),
             ("k high-rho eps", config.k_highrho_eps if config.experiment == "k-only" else "n/a"),
-            ("pair rho features", ", ".join(active_pair_rho_feature_names(config)) or "off"),
+            ("pair rho features", ", ".join(pair_rho_names) or "off"),
+            ("pair rho source", rho_source if pair_rho_names else "off"),
+            ("pair rho stop-gradient", config.pair_rho_stop_gradient if rho_source == "pred" else "n/a"),
             (
                 "pair rho normalization",
                 (
                     f"eps={config.pair_rho_eps:g}, log/scale={config.pair_rho_log_scale:g}, "
                     f"log clip={config.pair_rho_log_clip:g}, product={config.pair_rho_product_transform}"
                 )
-                if active_pair_rho_feature_names(config)
+                if pair_rho_names
                 else "off",
             ),
             ("pair sampling probs", config.pair_sampling_probs or "curriculum"),

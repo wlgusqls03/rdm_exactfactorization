@@ -6,8 +6,6 @@ from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
-
 
 def env_flag(name: str, default: bool) -> bool:
     value = os.environ.get(name)
@@ -43,7 +41,7 @@ from transferable_rdm.config import ExperimentConfig
 from transferable_rdm.data import DatasetSplit, split_systems
 from transferable_rdm.systems import build_system_corpus
 from transferable_rdm.utils import print_block, set_global_seed
-from transferable_rdm.v2_ablation import EXPERIMENTS, V2Config, build_v2_pair_features, train_v2
+from transferable_rdm.v2_ablation import EXPERIMENTS, V2Config, train_v2, v2_pair_feature_dim
 
 
 def env_int(name: str, default: int) -> int:
@@ -161,25 +159,44 @@ def parse_args() -> argparse.Namespace:
         "--pair-rho-features",
         choices=["off", "all", "true"],
         default=os.environ.get("RDM_V2_PAIR_RHO_FEATURES", "off").strip().lower(),
-        help="Convenience switch for true-rho pair features. 'all' or 'true' enables all three rho feature toggles.",
+        help="Convenience switch for rho pair features. 'all' or 'true' enables all three rho feature toggles.",
+    )
+    parser.add_argument(
+        "--pair-rho-source",
+        choices=["auto", "true", "pred"],
+        default=os.environ.get("RDM_V2_PAIR_RHO_SOURCE", "auto").strip().lower(),
+        help="Source for rho pair features. auto uses true rho for k-only and predicted rho otherwise.",
+    )
+    parser.add_argument(
+        "--pair-rho-stop-gradient",
+        dest="pair_rho_stop_gradient",
+        action="store_true",
+        default=env_flag("RDM_V2_PAIR_RHO_STOP_GRADIENT", True),
+        help="For predicted-rho pair features, prevent pair loss from backpropagating through the rho feature path.",
+    )
+    parser.add_argument(
+        "--no-pair-rho-stop-gradient",
+        dest="pair_rho_stop_gradient",
+        action="store_false",
+        help="Allow gradients through predicted-rho pair features.",
     )
     parser.add_argument(
         "--pair-rho-log-mean",
         action="store_true",
         default=env_flag("RDM_V2_PAIR_RHO_LOG_MEAN", False),
-        help="Append centered log geometric mean of true rho_i and rho_j to pair features.",
+        help="Append centered log geometric mean of rho_i and rho_j to pair features.",
     )
     parser.add_argument(
         "--pair-rho-log-diff",
         action="store_true",
         default=env_flag("RDM_V2_PAIR_RHO_LOG_DIFF", False),
-        help="Append absolute log true-rho difference to pair features.",
+        help="Append absolute log-rho difference to pair features.",
     )
     parser.add_argument(
         "--pair-rho-scaled-product",
         action="store_true",
         default=env_flag("RDM_V2_PAIR_RHO_SCALED_PRODUCT", False),
-        help="Append sqrt(true rho_i true rho_j) divided by the system mean rho to pair features.",
+        help="Append sqrt(rho_i rho_j) divided by the system mean rho to pair features.",
     )
     parser.add_argument("--pair-rho-eps", type=float, default=env_float("RDM_V2_PAIR_RHO_EPS", 1e-14))
     parser.add_argument("--pair-rho-log-scale", type=float, default=env_float("RDM_V2_PAIR_RHO_LOG_SCALE", 8.0))
@@ -188,7 +205,7 @@ def parse_args() -> argparse.Namespace:
         "--pair-rho-scaled-clip",
         type=float,
         default=env_float("RDM_V2_PAIR_RHO_SCALED_CLIP", 20.0),
-        help="Upper clip for the scaled true-rho product feature. Use <=0 to disable clipping.",
+        help="Upper clip for the scaled rho product feature. Use <=0 to disable clipping.",
     )
     parser.add_argument(
         "--pair-rho-product-transform",
@@ -291,6 +308,8 @@ def make_v2_config(args: argparse.Namespace) -> V2Config:
         pair_rho_log_mean=pair_rho_all or args.pair_rho_log_mean,
         pair_rho_log_diff=pair_rho_all or args.pair_rho_log_diff,
         pair_rho_scaled_product=pair_rho_all or args.pair_rho_scaled_product,
+        pair_rho_source=args.pair_rho_source,
+        pair_rho_stop_gradient=args.pair_rho_stop_gradient,
         pair_rho_eps=args.pair_rho_eps,
         pair_rho_log_scale=args.pair_rho_log_scale,
         pair_rho_log_clip=args.pair_rho_log_clip,
@@ -355,8 +374,7 @@ def main() -> None:
     systems = build_system_corpus(data_config)
     split = make_overfit_split(systems, args) if args.overfit_one_system else split_systems(systems, data_config)
     point_dim = systems[0].local_features.shape[1]
-    sample_left = np.array([0], dtype=np.int64)
-    pair_dim = build_v2_pair_features(systems[0], sample_left, sample_left, v2_config).shape[1]
+    pair_dim = v2_pair_feature_dim(systems[0], v2_config)
     global_dim = len(systems[0].global_context)
 
     summary = train_v2(v2_config, split, point_dim, pair_dim, global_dim)
