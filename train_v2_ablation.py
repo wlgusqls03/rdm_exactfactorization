@@ -130,6 +130,50 @@ def parse_args() -> argparse.Namespace:
         default=env_float("RDM_V2_LR", env_float("RDM_LEARNING_RATE", env_float("RDM_LR", 3e-4))),
     )
     parser.add_argument("--weight-decay", type=float, default=env_float("RDM_V2_WEIGHT_DECAY", 0.0))
+    parser.add_argument(
+        "--lr-decay-factor",
+        type=float,
+        default=env_float("RDM_V2_LR_DECAY_FACTOR", 1.0),
+        help="Multiply learning rate by this factor after validation plateau. Use <1 to enable.",
+    )
+    parser.add_argument(
+        "--lr-decay-patience",
+        type=int,
+        default=env_int("RDM_V2_LR_DECAY_PATIENCE", 0),
+        help="Epochs without validation improvement before decaying learning rate. 0 disables.",
+    )
+    parser.add_argument(
+        "--lr-decay-min",
+        type=float,
+        default=env_float("RDM_V2_LR_DECAY_MIN", 1e-6),
+        help="Minimum learning rate for plateau decay.",
+    )
+    parser.add_argument(
+        "--lr-decay-min-delta",
+        type=float,
+        default=env_float("RDM_V2_LR_DECAY_MIN_DELTA", 0.0),
+        help="Minimum validation improvement counted by LR plateau decay.",
+    )
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=env_int("RDM_V2_EARLY_STOPPING_PATIENCE", 0),
+        help="Epochs without validation improvement before stopping. 0 disables.",
+    )
+    parser.add_argument(
+        "--early-stopping-min-delta",
+        type=float,
+        default=env_float("RDM_V2_EARLY_STOPPING_MIN_DELTA", 0.0),
+        help="Minimum validation improvement counted by early stopping.",
+    )
+    parser.add_argument(
+        "--restore-best-weights",
+        dest="restore_best_weights",
+        action="store_true",
+        default=env_flag("RDM_V2_RESTORE_BEST_WEIGHTS", False),
+        help="Restore the best validation checkpoint before final train/val/test evaluation.",
+    )
+    parser.add_argument("--no-restore-best-weights", dest="restore_best_weights", action="store_false")
     parser.add_argument("--eval-pair-count", type=int, default=env_int("RDM_V2_EVAL_PAIR_COUNT", 8192))
     parser.add_argument(
         "--cache-eval-batches",
@@ -317,6 +361,13 @@ def make_v2_config(args: argparse.Namespace) -> V2Config:
         log_every=args.log_every,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
+        lr_decay_factor=args.lr_decay_factor,
+        lr_decay_patience=max(int(args.lr_decay_patience), 0),
+        lr_decay_min=args.lr_decay_min,
+        lr_decay_min_delta=max(float(args.lr_decay_min_delta), 0.0),
+        early_stopping_patience=max(int(args.early_stopping_patience), 0),
+        early_stopping_min_delta=max(float(args.early_stopping_min_delta), 0.0),
+        restore_best_weights=args.restore_best_weights,
         eval_pair_count=args.eval_pair_count,
         cache_eval_batches=args.cache_eval_batches,
         steps_per_system=max(int(args.steps_per_system), 1),
@@ -422,6 +473,12 @@ def main() -> None:
             ("test pair loss", f"{summary.get('test', {}).get('pair_loss', float('nan')):.6e}"),
             ("val rho MAE", f"{summary.get('val', {}).get('rho_mae', float('nan')):.6e}"),
             ("val K loss", f"{summary.get('val', {}).get('kernel_loss', float('nan')):.6e}"),
+            ("best epoch", summary.get("best", {}).get("epoch", "n/a")),
+            (
+                "best val pair",
+                f"{summary.get('best', {}).get('val', {}).get('pair_loss', float('nan')):.6e}",
+            ),
+            ("stopped epoch", summary.get("stopped_epoch", "n/a")),
         ],
     )
 

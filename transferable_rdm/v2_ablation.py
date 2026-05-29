@@ -55,6 +55,13 @@ class V2Config:
     log_every: int = 1
     learning_rate: float = 3e-4
     weight_decay: float = 0.0
+    lr_decay_factor: float = 1.0
+    lr_decay_patience: int = 0
+    lr_decay_min: float = 1e-6
+    lr_decay_min_delta: float = 0.0
+    early_stopping_patience: int = 0
+    early_stopping_min_delta: float = 0.0
+    restore_best_weights: bool = False
 
     eval_pair_count: int = 8192
     cache_eval_batches: bool = True
@@ -111,6 +118,14 @@ class V2Models:
             if model is not None:
                 variables.extend(model.trainable_variables)
         return variables
+
+    def get_weights(self) -> list[list[np.ndarray] | None]:
+        return [model.get_weights() if model is not None else None for model in (self.point, self.pair, self.context)]
+
+    def set_weights(self, weights: list[list[np.ndarray] | None]) -> None:
+        for model, model_weights in zip((self.point, self.pair, self.context), weights):
+            if model is not None and model_weights is not None:
+                model.set_weights(model_weights)
 
 
 def to_tensor(array: np.ndarray) -> tf.Tensor:
@@ -969,6 +984,7 @@ def history_header() -> list[str]:
         "train_kernel_loss",
         "train_kernel_highrho_loss",
         "train_kernel_highrho_frac",
+        "learning_rate",
         "val_pair_loss",
         "val_pair_mae",
         "val_rho_loss",
@@ -997,6 +1013,20 @@ def save_json(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
+
+
+def optimizer_learning_rate(optimizer: tf.keras.optimizers.Optimizer) -> float:
+    lr = optimizer.learning_rate
+    if callable(lr):
+        lr = lr(optimizer.iterations)
+    return float(tf.keras.backend.get_value(lr))
+
+
+def set_optimizer_learning_rate(optimizer: tf.keras.optimizers.Optimizer, value: float) -> None:
+    try:
+        tf.keras.backend.set_value(optimizer.learning_rate, float(value))
+    except (AttributeError, TypeError):
+        optimizer.learning_rate = float(value)
 
 
 def train_v2(config: V2Config, split: DatasetSplit, point_dim: int, pair_dim: int, global_dim: int) -> dict[str, object]:
@@ -1031,6 +1061,10 @@ def train_v2(config: V2Config, split: DatasetSplit, point_dim: int, pair_dim: in
     history: list[dict[str, object]] = []
     best_val = math.inf
     best_summary: dict[str, object] = {}
+    best_weights: list[list[np.ndarray] | None] | None = None
+    epochs_since_best = 0
+    lr_plateau_epochs = 0
+    stopped_epoch: int | None = None
     pair_rho_names = active_pair_rho_feature_names(config)
     rho_source = pair_rho_source(config)
 
@@ -1045,6 +1079,25 @@ def train_v2(config: V2Config, split: DatasetSplit, point_dim: int, pair_dim: in
             ("cache eval batches", config.cache_eval_batches),
             ("pair feature placement", "tensorflow" if config.pair_features_on_device else "numpy"),
             ("learning rate", config.learning_rate),
+            (
+                "lr decay",
+                (
+                    f"factor={config.lr_decay_factor:g}, patience={config.lr_decay_patience}, "
+                    f"min={config.lr_decay_min:g}, min_delta={config.lr_decay_min_delta:g}"
+                )
+                if config.lr_decay_factor < 1.0 and config.lr_decay_patience > 0
+                else "off",
+            ),
+            (
+                "early stopping",
+                (
+                    f"patience={config.early_stopping_patience}, "
+                    f"min_delta={config.early_stopping_min_delta:g}, "
+                    f"restore_best={config.restore_best_weights}"
+                )
+                if config.early_stopping_patience > 0
+                else "off",
+            ),
             ("k-only objective", "true-rho gamma loss" if config.experiment == "k-only" else "n/a"),
             ("kernel form", "exp(-alpha d^2) + sep * deltaK_pair"),
             ("kernel base alpha", config.kernel_base_alpha),
@@ -1113,6 +1166,7 @@ def train_v2(config: V2Config, split: DatasetSplit, point_dim: int, pair_dim: in
             "train_kernel_loss": float(np.mean(accum["kernel_loss"])),
             "train_kernel_highrho_loss": float(np.mean(accum["kernel_highrho_loss"])),
             "train_kernel_highrho_frac": float(np.mean(accum["kernel_highrho_frac"])),
+            "learning_rate": optimizer_learning_rate(optimizer),
         }
 
         should_validate = epoch == 0 or (epoch + 1) % max(config.val_every, 1) == 0 or epoch == config.epochs - 1
@@ -1133,9 +1187,34 @@ def train_v2(config: V2Config, split: DatasetSplit, point_dim: int, pair_dim: in
                 row[f"val_{key}"] = val_avg.get(key, float("nan"))
             objective_key = "rho_loss" if config.experiment == "rho-only" else "pair_loss"
             val_objective = float(val_avg.get(objective_key, float("nan")))
-            if np.isfinite(val_objective) and val_objective < best_val:
+            min_delta = max(config.early_stopping_min_delta, config.lr_decay_min_delta, 0.0)
+            improved = np.isfinite(val_objective) and val_objective < best_val - min_delta
+            if improved:
                 best_val = val_objective
                 best_summary = {"epoch": epoch, "val": val_avg}
+                if config.restore_best_weights:
+                    best_weights = models.get_weights()
+                epochs_since_best = 0
+                lr_plateau_epochs = 0
+            elif np.isfinite(val_objective):
+                epochs_since_best += max(config.val_every, 1)
+                lr_plateau_epochs += max(config.val_every, 1)
+
+                if config.lr_decay_factor < 1.0 and config.lr_decay_patience > 0:
+                    if lr_plateau_epochs >= config.lr_decay_patience:
+                        current_lr = optimizer_learning_rate(optimizer)
+                        new_lr = max(config.lr_decay_min, current_lr * config.lr_decay_factor)
+                        if new_lr < current_lr:
+                            set_optimizer_learning_rate(optimizer, new_lr)
+                            row["learning_rate"] = new_lr
+                            print(
+                                f"Epoch {epoch:4d} | reduce lr {current_lr:.3e} -> {new_lr:.3e}",
+                                flush=True,
+                            )
+                        lr_plateau_epochs = 0
+
+                if config.early_stopping_patience > 0 and epochs_since_best >= config.early_stopping_patience:
+                    stopped_epoch = epoch
         history.append(row)
 
         if epoch == 0 or (epoch + 1) % max(config.log_every, 1) == 0 or epoch == config.epochs - 1:
@@ -1159,10 +1238,22 @@ def train_v2(config: V2Config, split: DatasetSplit, point_dim: int, pair_dim: in
                 f" gamma={row['train_gamma_loss']:.3e}"
                 f" rho={row['train_rho_loss']:.3e}"
                 f" K={row['train_kernel_loss']:.3e}"
+                f" lr={row['learning_rate']:.3e}"
                 f"{train_highrho_text}"
                 f"{val_text}",
                 flush=True,
             )
+
+        if stopped_epoch is not None:
+            print(
+                f"Early stopping at epoch {stopped_epoch}; best validation epoch={best_summary.get('epoch', 'n/a')}.",
+                flush=True,
+            )
+            break
+
+    if config.restore_best_weights and best_weights is not None:
+        models.set_weights(best_weights)
+        print(f"Restored best weights from epoch {best_summary.get('epoch', 'n/a')}.", flush=True)
 
     train_avg, train_rows = evaluate_split(split.train_systems, "train", models, config, None, seed_offset=1001)
     val_avg, val_rows = evaluate_split(split.val_systems, "val", models, config, None, seed_offset=1101)
@@ -1170,6 +1261,7 @@ def train_v2(config: V2Config, split: DatasetSplit, point_dim: int, pair_dim: in
     summary = {
         "config": asdict(config),
         "best": best_summary,
+        "stopped_epoch": stopped_epoch,
         "train": train_avg,
         "val": val_avg,
         "test": test_avg,
