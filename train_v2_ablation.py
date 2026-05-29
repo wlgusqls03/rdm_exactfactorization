@@ -67,6 +67,42 @@ def parse_four_floats(value: str | None, *, name: str) -> tuple[float, float, fl
     return values  # type: ignore[return-value]
 
 
+def infer_experiment_from_text(text: str | None) -> str | None:
+    if not text:
+        return None
+    normalized = text.lower().replace("_", "-")
+    matches = [experiment for experiment in EXPERIMENTS if experiment != "baseline" and experiment in normalized]
+    if not matches:
+        return None
+    return max(matches, key=len)
+
+
+def apply_cli_inferences(args: argparse.Namespace, parser: argparse.ArgumentParser) -> argparse.Namespace:
+    if args.dataset_mode is None and args.npz_glob:
+        args.dataset_mode = "npz"
+
+    experiment_from_env = os.environ.get("RDM_V2_EXPERIMENT")
+    if args.experiment == "baseline" and not experiment_from_env:
+        inferred = infer_experiment_from_text(args.run_name) or infer_experiment_from_text(args.output_dir)
+        if inferred is not None:
+            args.experiment = inferred
+
+    pair_rho_requested = (
+        args.pair_rho_source == "pred"
+        or args.pair_rho_features in {"all", "true"}
+        or args.pair_rho_log_mean
+        or args.pair_rho_log_diff
+        or args.pair_rho_scaled_product
+    )
+    if pair_rho_requested and args.experiment in {"baseline", "rho-only"}:
+        parser.error(
+            "rho pair features require --experiment k-only, gamma-only, gamma-simple, "
+            "gamma-residual, or gamma-context. Add e.g. --experiment gamma-residual."
+        )
+
+    return args
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run ablation-first V2 experiments on existing 1-RDM NPZ data."
@@ -306,7 +342,7 @@ def parse_args() -> argparse.Namespace:
         help="diag,near,mid,far loss weights. Values are normalized to mean 1 per batch.",
     )
     parser.add_argument("--no-save-weights", dest="save_weights", action="store_false", default=True)
-    return parser.parse_args()
+    return apply_cli_inferences(parser.parse_args(), parser)
 
 
 def apply_data_overrides(config: ExperimentConfig, args: argparse.Namespace) -> ExperimentConfig:
