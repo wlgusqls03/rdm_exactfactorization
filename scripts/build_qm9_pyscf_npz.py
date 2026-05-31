@@ -53,6 +53,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--basis", type=str, default="sto-3g")
     parser.add_argument("--xc", type=str, default="b3lyp")
     parser.add_argument("--grid-level", type=int, default=1)
+    parser.add_argument("--scf-max-cycle", type=int, default=200)
+    parser.add_argument("--charged-scf-damp", type=float, default=0.2)
+    parser.add_argument("--charged-scf-level-shift", type=float, default=0.3)
+    parser.add_argument(
+        "--no-charged-scf-retries",
+        action="store_false",
+        dest="charged_scf_retries",
+        help="Disable the damped and Newton retries for charged open-shell calculations.",
+    )
+    parser.set_defaults(charged_scf_retries=True)
     parser.add_argument(
         "--skip-kinetic-potential",
         action="store_true",
@@ -265,6 +275,11 @@ def run_dft(
     *,
     charge: int = 0,
     spin: int = 0,
+    dm0: np.ndarray | None = None,
+    max_cycle: int = 200,
+    retry_scf: bool = False,
+    retry_damp: float = 0.2,
+    retry_level_shift: float = 0.3,
 ) -> tuple[gto.Mole, dft.rks.RKS | dft.uks.UKS, np.ndarray]:
     atom_spec = [
         (symbol, tuple(coord.tolist()))
@@ -279,17 +294,45 @@ def run_dft(
     mol.verbose = 0
     mol.build()
 
-    mf = dft.RKS(mol) if spin == 0 else dft.UKS(mol)
-    mf.xc = xc
-    mf.grids.level = grid_level
-    mf.conv_tol = 1e-8
-    mf.max_cycle = 80
-    energy = mf.kernel()
-    if not mf.converged:
-        raise RuntimeError(
-            f"SCF did not converge for {record.qm9_id} charge={charge:+d} spin={spin}; last energy={energy}"
+    attempts = [("default", False, 0.0, 0.0)]
+    if retry_scf:
+        attempts.extend(
+            [
+                ("damped", False, retry_damp, retry_level_shift),
+                ("newton", True, 0.0, 0.0),
+            ]
         )
-    return mol, mf, mf.make_rdm1().astype(np.float64)
+
+    guess = dm0
+    last_energy = float("nan")
+    for attempt_idx, (label, use_newton, damp, level_shift) in enumerate(attempts):
+        mf = dft.RKS(mol) if spin == 0 else dft.UKS(mol)
+        mf.xc = xc
+        mf.grids.level = grid_level
+        mf.conv_tol = 1e-8
+        mf.max_cycle = max_cycle
+        mf.damp = damp
+        mf.level_shift = level_shift
+        if use_newton:
+            mf = mf.newton()
+            mf.max_cycle = max_cycle
+        if attempt_idx:
+            print(
+                f"[retry:{label}] {record.qm9_id} charge={charge:+d} spin={spin} "
+                f"max_cycle={max_cycle} damp={damp:g} level_shift={level_shift:g}"
+            )
+        last_energy = mf.kernel(dm0=guess)
+        if mf.converged:
+            return mol, mf, mf.make_rdm1().astype(np.float64)
+        try:
+            guess = mf.make_rdm1()
+        except Exception:
+            pass
+
+    raise RuntimeError(
+        f"SCF did not converge for {record.qm9_id} charge={charge:+d} spin={spin} "
+        f"after {len(attempts)} attempt(s); last energy={last_energy}"
+    )
 
 
 def spin_summed_dm(dm: np.ndarray) -> np.ndarray:
@@ -319,15 +362,31 @@ def normalized_density_on_grid(
     return rho.astype(np.float64), float(scale)
 
 
+def charged_uks_initial_dm(neutral_dm: np.ndarray, neutral_electrons: int, charged_electrons: int) -> np.ndarray:
+    """Split the neutral RKS density into a spin-polarized UKS initial guess."""
+    n_alpha = (charged_electrons + 1) // 2
+    n_beta = charged_electrons - n_alpha
+    return np.stack(
+        [
+            neutral_dm * (n_alpha / neutral_electrons),
+            neutral_dm * (n_beta / neutral_electrons),
+        ],
+        axis=0,
+    )
+
+
 def charged_density_oracles(
     record: Qm9Record,
     args: argparse.Namespace,
     absolute_grid_bohr: np.ndarray,
     cell_volume: float,
+    neutral_dm: np.ndarray,
+    neutral_electrons: int,
 ) -> dict[str, np.ndarray]:
     """Compute optional N-1 and N+1 spin-summed density oracle channels."""
     payload: dict[str, np.ndarray] = {}
     for label, charge in (("cation", +1), ("anion", -1)):
+        charged_electrons = neutral_electrons - charge
         mol, _, dm = run_dft(
             record,
             basis=args.basis,
@@ -335,6 +394,11 @@ def charged_density_oracles(
             grid_level=args.grid_level,
             charge=charge,
             spin=1,
+            dm0=charged_uks_initial_dm(neutral_dm, neutral_electrons, charged_electrons),
+            max_cycle=args.scf_max_cycle,
+            retry_scf=args.charged_scf_retries,
+            retry_damp=args.charged_scf_damp,
+            retry_level_shift=args.charged_scf_level_shift,
         )
         rho, scale = normalized_density_on_grid(mol, dm, absolute_grid_bohr, cell_volume)
         payload[f"rho_{label}"] = rho.astype(np.float32)
@@ -462,7 +526,13 @@ def kinetic_potential_reference(
 
 
 def write_npz(record: Qm9Record, args: argparse.Namespace, output_path: Path) -> dict[str, object]:
-    mol, mf, dm = run_dft(record, basis=args.basis, xc=args.xc, grid_level=args.grid_level)
+    mol, mf, dm = run_dft(
+        record,
+        basis=args.basis,
+        xc=args.xc,
+        grid_level=args.grid_level,
+        max_cycle=args.scf_max_cycle,
+    )
     kinetic_energy = kinetic_energy_from_dm(mol, dm)
     coords_bohr = record.coords_angstrom * ANGSTROM_TO_BOHR
     coords_bohr_centered = coords_bohr - np.mean(coords_bohr, axis=0, keepdims=True)
@@ -500,6 +570,8 @@ def write_npz(record: Qm9Record, args: argparse.Namespace, output_path: Path) ->
             args,
             absolute_grid_bohr,
             cell_volume=step**3,
+            neutral_dm=dm,
+            neutral_electrons=mol.nelectron,
         )
     kp_payload: dict[str, object] = {}
     if not args.skip_kinetic_potential:
