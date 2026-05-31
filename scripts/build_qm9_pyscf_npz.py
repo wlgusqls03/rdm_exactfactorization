@@ -738,16 +738,19 @@ def main() -> None:
     else:
         rng = np.random.default_rng(args.seed)
         rng.shuffle(records)
-    selected = records[: args.num_systems]
-    if len(selected) < args.num_systems:
-        raise RuntimeError(f"Only found {len(selected)} suitable QM9 records.")
+    if len(records) < args.num_systems:
+        raise RuntimeError(f"Only found {len(records)} suitable QM9 records.")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     manifest = []
-    for idx, record in enumerate(selected):
+    skipped_records = []
+    for candidate_idx, record in enumerate(records):
+        if len(manifest) >= args.num_systems:
+            break
+        idx = len(manifest)
         output_path = args.output_dir / f"{idx:04d}_{record.qm9_id}.npz"
         if output_path.exists():
-            print(f"[{idx + 1}/{len(selected)}] exists: {output_path}")
+            print(f"[{idx + 1}/{args.num_systems}] exists: {output_path}")
             row = manifest_row_from_existing_npz(
                 output_path=output_path,
                 record=record,
@@ -758,8 +761,22 @@ def main() -> None:
                 manifest.append(row)
                 write_xyz(record, args.output_dir / "xyz" / f"{output_path.stem}.xyz")
                 continue
-        print(f"[{idx + 1}/{len(selected)}] DFT -> NPZ: {record.qm9_id} ({len(record.symbols)} atoms)")
-        row = write_npz(record, args, output_path)
+        print(
+            f"[{idx + 1}/{args.num_systems}] DFT -> NPZ: {record.qm9_id} "
+            f"({len(record.symbols)} atoms; candidate {candidate_idx + 1}/{len(records)})"
+        )
+        try:
+            row = write_npz(record, args, output_path)
+        except RuntimeError as exc:
+            print(f"[skip] {record.qm9_id}: {exc}")
+            skipped_records.append(
+                {
+                    "qm9_id": record.qm9_id,
+                    "n_atoms": len(record.symbols),
+                    "reason": str(exc),
+                }
+            )
+            continue
         row.update(
             {
                 "index": idx,
@@ -771,10 +788,19 @@ def main() -> None:
         manifest.append(row)
         write_xyz(record, args.output_dir / "xyz" / f"{output_path.stem}.xyz")
 
+    skipped_path = args.output_dir / "skipped_records.json"
+    skipped_path.write_text(json.dumps(skipped_records, indent=2), encoding="utf-8")
+    if len(manifest) < args.num_systems:
+        raise RuntimeError(
+            f"Only wrote {len(manifest)}/{args.num_systems} NPZ files after trying "
+            f"{len(records)} suitable QM9 records. See {skipped_path}."
+        )
+
     manifest_path = args.output_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     write_readable_indices(args.output_dir, manifest)
     print(f"Wrote {len(manifest)} NPZ files to {args.output_dir}")
+    print(f"Skipped {len(skipped_records)} records; wrote details to {skipped_path}")
     print(f"Wrote manifest to {manifest_path}")
     print(f"Wrote readable index to {args.output_dir / 'molecule_index.csv'}")
 
