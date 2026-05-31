@@ -58,6 +58,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not store kinetic-potential reference arrays in the NPZ files.",
     )
+    parser.add_argument(
+        "--include-charged-density-oracles",
+        action="store_true",
+        help="Also run UKS calculations for the N-1 cation and N+1 anion and store their spin-summed densities.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--selection", choices=["random", "smallest"], default="random")
     return parser.parse_args()
@@ -252,7 +257,15 @@ def build_global_context(symbols: list[str], coords_bohr_centered: np.ndarray, e
     return context.astype(np.float32)
 
 
-def run_dft(record: Qm9Record, basis: str, xc: str, grid_level: int) -> tuple[gto.Mole, dft.rks.RKS, np.ndarray]:
+def run_dft(
+    record: Qm9Record,
+    basis: str,
+    xc: str,
+    grid_level: int,
+    *,
+    charge: int = 0,
+    spin: int = 0,
+) -> tuple[gto.Mole, dft.rks.RKS | dft.uks.UKS, np.ndarray]:
     atom_spec = [
         (symbol, tuple(coord.tolist()))
         for symbol, coord in zip(record.symbols, record.coords_angstrom)
@@ -261,20 +274,72 @@ def run_dft(record: Qm9Record, basis: str, xc: str, grid_level: int) -> tuple[gt
     mol.atom = atom_spec
     mol.unit = "Angstrom"
     mol.basis = basis
-    mol.charge = 0
-    mol.spin = 0
+    mol.charge = charge
+    mol.spin = spin
     mol.verbose = 0
     mol.build()
 
-    mf = dft.RKS(mol)
+    mf = dft.RKS(mol) if spin == 0 else dft.UKS(mol)
     mf.xc = xc
     mf.grids.level = grid_level
     mf.conv_tol = 1e-8
     mf.max_cycle = 80
     energy = mf.kernel()
     if not mf.converged:
-        raise RuntimeError(f"SCF did not converge for {record.qm9_id}; last energy={energy}")
+        raise RuntimeError(
+            f"SCF did not converge for {record.qm9_id} charge={charge:+d} spin={spin}; last energy={energy}"
+        )
     return mol, mf, mf.make_rdm1().astype(np.float64)
+
+
+def spin_summed_dm(dm: np.ndarray) -> np.ndarray:
+    """Return a spatial AO density matrix for either RKS or UKS output."""
+    dm = np.asarray(dm, dtype=np.float64)
+    if dm.ndim == 2:
+        return dm
+    if dm.ndim == 3 and dm.shape[0] == 2:
+        return np.sum(dm, axis=0)
+    raise ValueError(f"Unsupported density-matrix shape: {dm.shape}")
+
+
+def normalized_density_on_grid(
+    mol: gto.Mole,
+    dm: np.ndarray,
+    absolute_grid_bohr: np.ndarray,
+    cell_volume: float,
+) -> tuple[np.ndarray, float]:
+    """Evaluate spin-summed rho on the Cartesian grid and normalize its trace."""
+    ao = mol.eval_gto("GTOval_sph", absolute_grid_bohr)
+    rho = np.einsum("gi,ij,gj->g", ao, spin_summed_dm(dm), ao, optimize=True).reshape(-1, 1)
+    trace_grid = float(np.sum(rho) * cell_volume)
+    scale = 1.0
+    if abs(trace_grid) > 1e-12:
+        scale = mol.nelectron / trace_grid
+        rho *= scale
+    return rho.astype(np.float64), float(scale)
+
+
+def charged_density_oracles(
+    record: Qm9Record,
+    args: argparse.Namespace,
+    absolute_grid_bohr: np.ndarray,
+    cell_volume: float,
+) -> dict[str, np.ndarray]:
+    """Compute optional N-1 and N+1 spin-summed density oracle channels."""
+    payload: dict[str, np.ndarray] = {}
+    for label, charge in (("cation", +1), ("anion", -1)):
+        mol, _, dm = run_dft(
+            record,
+            basis=args.basis,
+            xc=args.xc,
+            grid_level=args.grid_level,
+            charge=charge,
+            spin=1,
+        )
+        rho, scale = normalized_density_on_grid(mol, dm, absolute_grid_bohr, cell_volume)
+        payload[f"rho_{label}"] = rho.astype(np.float32)
+        payload[f"rho_{label}_trace_scale"] = np.asarray(scale, dtype=np.float32)
+    return payload
 
 
 def kinetic_energy_from_dm(mol: gto.Mole, dm: np.ndarray) -> float:
@@ -428,6 +493,14 @@ def write_npz(record: Qm9Record, args: argparse.Namespace, output_path: Path) ->
 
     potential, grad = nuclear_potential_and_grad(points_bohr, coords_bohr_centered, atomic_numbers)
     rho_diag = np.diag(gamma_matrix).reshape(-1, 1).astype(np.float64)
+    charged_payload: dict[str, np.ndarray] = {}
+    if args.include_charged_density_oracles:
+        charged_payload = charged_density_oracles(
+            record,
+            args,
+            absolute_grid_bohr,
+            cell_volume=step**3,
+        )
     kp_payload: dict[str, object] = {}
     if not args.skip_kinetic_potential:
         kp_payload = kinetic_potential_reference(
@@ -511,6 +584,7 @@ def write_npz(record: Qm9Record, args: argparse.Namespace, output_path: Path) ->
         kinetic_potential_reference=np.asarray(
             str(kp_payload.get("kinetic_potential_reference", "not_computed"))
         ),
+        **charged_payload,
     )
     return {
         "system_id": output_path.stem,
@@ -537,6 +611,7 @@ def write_npz(record: Qm9Record, args: argparse.Namespace, output_path: Path) ->
         "box_length_bohr": float(axis[-1] - axis[0]),
         "basis": args.basis,
         "xc": args.xc,
+        "charged_density_oracles": bool(args.include_charged_density_oracles),
     }
 
 
@@ -559,7 +634,10 @@ def manifest_row_from_existing_npz(
     """Return manifest row for a reusable NPZ, or remove it if it is invalid."""
     try:
         with np.load(output_path, allow_pickle=True) as payload:
-            missing = [key for key in REQUIRED_EXISTING_NPZ_KEYS if key not in payload]
+            required = list(REQUIRED_EXISTING_NPZ_KEYS)
+            if args.include_charged_density_oracles:
+                required.extend(["rho_cation", "rho_anion"])
+            missing = [key for key in required if key not in payload]
             if missing:
                 raise KeyError(f"missing required keys: {', '.join(missing)}")
             return {
@@ -579,12 +657,15 @@ def manifest_row_from_existing_npz(
                 "axis_points": int(payload["axis_points"]) if "axis_points" in payload else "",
                 "grid_spacing_bohr": float(payload["grid_spacing_bohr"]) if "grid_spacing_bohr" in payload else "",
                 "box_length_bohr": float(payload["box_length_bohr"]) if "box_length_bohr" in payload else "",
+                "charged_density_oracles": "rho_cation" in payload and "rho_anion" in payload,
                 "npz_file": output_path.name,
                 "xyz_file": f"xyz/{output_path.stem}.xyz",
             }
     except Exception as exc:
         print(f"[repair] invalid existing NPZ, rebuilding: {output_path} ({exc})")
-        if output_path.exists():
+        # Charged-oracle upgrades may fail for difficult ions. Preserve the
+        # existing neutral NPZ until the replacement has been computed fully.
+        if output_path.exists() and not args.include_charged_density_oracles:
             output_path.unlink()
         return None
 

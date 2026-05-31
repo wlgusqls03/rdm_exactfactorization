@@ -91,6 +91,9 @@ class V2Config:
     pair_rho_log_mean: bool = False
     pair_rho_log_diff: bool = False
     pair_rho_scaled_product: bool = False
+    pair_rho_grad_norm: bool = False
+    pair_rho_laplacian: bool = False
+    pair_rho_directional_grad: bool = False
     pair_rho_source: str = "auto"
     pair_rho_stop_gradient: bool = True
     pair_rho_eps: float = 1e-14
@@ -98,12 +101,16 @@ class V2Config:
     pair_rho_log_clip: float = 4.0
     pair_rho_scaled_clip: float = 20.0
     pair_rho_product_transform: str = "log1p"
+    pair_rho_laplacian_clip: float = 50.0
+    pair_rho_oracle_mode: str = "off"
 
     save_weights: bool = True
+    pretrained_point_weights: str | None = None
 
 
 _SYSTEM_TENSOR_CACHE: dict[tuple[int, str], tf.Tensor] = {}
 _EVAL_BATCH_CACHE: dict[tuple[object, ...], dict[str, object]] = {}
+_TRUE_FIELD_DERIVATIVE_CACHE: dict[tuple[int, str], tuple[np.ndarray, np.ndarray]] = {}
 
 
 @dataclass
@@ -233,7 +240,19 @@ def active_pair_rho_feature_names(config: V2Config) -> list[str]:
         names.append("rho_log_diff")
     if config.pair_rho_scaled_product:
         names.append("rho_sqrt_product_scaled")
+    if config.pair_rho_grad_norm:
+        names.append("rho_grad_norm")
+    if config.pair_rho_laplacian:
+        names.append("rho_laplacian")
+    if config.pair_rho_directional_grad:
+        names.append("rho_directional_grad")
+    if config.pair_rho_oracle_mode != "off":
+        names.append(f"oracle_{config.pair_rho_oracle_mode}")
     return names
+
+
+def needs_rho_derivatives(config: V2Config) -> bool:
+    return config.pair_rho_grad_norm or config.pair_rho_laplacian or config.pair_rho_directional_grad
 
 
 def pair_rho_source(config: V2Config) -> str:
@@ -241,6 +260,10 @@ def pair_rho_source(config: V2Config) -> str:
         return "off"
     source = config.pair_rho_source.strip().lower()
     if source == "auto":
+        # Derivatives always require the point model (pred), but if only scalars
+        # are used and we are in k-only, we can use true.
+        if needs_rho_derivatives(config):
+            return "pred"
         return "true" if config.experiment == "k-only" else "pred"
     if source not in {"true", "pred"}:
         raise ValueError("pair_rho_source must be one of: auto, true, pred.")
@@ -248,14 +271,164 @@ def pair_rho_source(config: V2Config) -> str:
 
 
 def validate_pair_rho_config(config: V2Config) -> None:
+    oracle_mode = config.pair_rho_oracle_mode.strip().lower()
+    if oracle_mode not in {"off", "neutral-derivatives", "three-density", "fukui"}:
+        raise ValueError(
+            "pair_rho_oracle_mode must be one of: off, neutral-derivatives, three-density, fukui."
+        )
     source = pair_rho_source(config)
     if source == "off":
         return
     if source == "true" and config.experiment != "k-only":
         raise ValueError("True-rho pair features are allowed only for k-only oracle ablations.")
+    if source == "true" and needs_rho_derivatives(config):
+        raise ValueError("Derivative features are currently only implemented for predicted-rho source.")
+    if oracle_mode != "off" and source != "true":
+        raise ValueError("Oracle rho descriptor modes require --pair-rho-source true.")
+    if oracle_mode != "off" and config.experiment != "k-only":
+        raise ValueError("Oracle rho descriptor modes are k-only ablations. Use --experiment k-only.")
     if source == "pred":
         if not uses_point_model(config.experiment) or not uses_pair_model(config.experiment):
             raise ValueError("Predicted-rho pair features require an experiment with both point and pair models.")
+
+
+def richardson_gradient_3d(grid_values: tf.Tensor, n_axis: int, h: float) -> tf.Tensor:
+    """Compute an O(h^4) 3D gradient with symmetric boundary extension."""
+    vol = tf.reshape(grid_values, (n_axis, n_axis, n_axis))
+    padded = tf.pad(vol, [[2, 2], [2, 2], [2, 2]], mode="SYMMETRIC")
+    n = n_axis
+    grad_x = (
+        padded[0:n, 2 : n + 2, 2 : n + 2]
+        - 8.0 * padded[1 : n + 1, 2 : n + 2, 2 : n + 2]
+        + 8.0 * padded[3 : n + 3, 2 : n + 2, 2 : n + 2]
+        - padded[4 : n + 4, 2 : n + 2, 2 : n + 2]
+    ) / (12.0 * h)
+    grad_y = (
+        padded[2 : n + 2, 0:n, 2 : n + 2]
+        - 8.0 * padded[2 : n + 2, 1 : n + 1, 2 : n + 2]
+        + 8.0 * padded[2 : n + 2, 3 : n + 3, 2 : n + 2]
+        - padded[2 : n + 2, 4 : n + 4, 2 : n + 2]
+    ) / (12.0 * h)
+    grad_z = (
+        padded[2 : n + 2, 2 : n + 2, 0:n]
+        - 8.0 * padded[2 : n + 2, 2 : n + 2, 1 : n + 1]
+        + 8.0 * padded[2 : n + 2, 2 : n + 2, 3 : n + 3]
+        - padded[2 : n + 2, 2 : n + 2, 4 : n + 4]
+    ) / (12.0 * h)
+    return tf.reshape(tf.stack([grad_x, grad_y, grad_z], axis=-1), (-1, 3))
+
+
+def richardson_laplacian_3d(grid_values: tf.Tensor, n_axis: int, h: float) -> tf.Tensor:
+    """Compute an O(h^4) 3D Laplacian with symmetric boundary extension."""
+    vol = tf.reshape(grid_values, (n_axis, n_axis, n_axis))
+    padded = tf.pad(vol, [[2, 2], [2, 2], [2, 2]], mode="SYMMETRIC")
+    n = n_axis
+    center = padded[2 : n + 2, 2 : n + 2, 2 : n + 2]
+
+    def second_derivative(axis: int) -> tf.Tensor:
+        slices = [slice(2, n + 2), slice(2, n + 2), slice(2, n + 2)]
+        values = []
+        for offset in (0, 1, 3, 4):
+            shifted = list(slices)
+            shifted[axis] = slice(offset, offset + n)
+            values.append(padded[tuple(shifted)])
+        return (-values[0] + 16.0 * values[1] - 30.0 * center + 16.0 * values[2] - values[3]) / (
+            12.0 * h * h
+        )
+
+    lap = second_derivative(0) + second_derivative(1) + second_derivative(2)
+    return tf.reshape(lap, (-1, 1))
+
+
+def true_field_derivatives(
+    system: SystemRecord,
+    field_name: str,
+    values: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return finite-difference gradient and Laplacian for a stored oracle field."""
+    key = (id(system), field_name)
+    cached = _TRUE_FIELD_DERIVATIVE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    n_axis = len(system.axis)
+    volume = np.asarray(values, dtype=np.float32).reshape(n_axis, n_axis, n_axis)
+    edge_order = 2 if n_axis >= 3 else 1
+    grad_components = np.gradient(volume, system.step, edge_order=edge_order)
+    grad = np.stack(grad_components, axis=-1).reshape(-1, 3).astype(np.float32)
+    lap = sum(
+        np.gradient(component, system.step, axis=axis, edge_order=edge_order)
+        for axis, component in enumerate(grad_components)
+    ).reshape(-1, 1).astype(np.float32)
+    result = (grad, lap)
+    _TRUE_FIELD_DERIVATIVE_CACHE[key] = result
+    return result
+
+
+def signed_log_scaled(values: np.ndarray, clip: float) -> np.ndarray:
+    clip = max(float(clip), 1.0)
+    clipped = np.clip(values, -clip, clip)
+    return (np.sign(clipped) * np.log1p(np.abs(clipped)) / math.log1p(clip)).astype(np.float32)
+
+
+def oracle_field_pair_features(
+    system: SystemRecord,
+    field_name: str,
+    values: np.ndarray,
+    left_idx: np.ndarray,
+    right_idx: np.ndarray,
+    config: V2Config,
+) -> np.ndarray:
+    """Build endpoint value, gradient-norm, and Laplacian descriptors for one field."""
+    values = np.asarray(values, dtype=np.float32).reshape(-1, 1)
+    grad, lap = true_field_derivatives(system, field_name, values)
+    scale = max(float(np.mean(np.abs(values))), float(config.pair_rho_eps), 1e-30)
+    value_clip = max(float(config.pair_rho_scaled_clip), 1.0)
+    lap_clip = max(float(config.pair_rho_laplacian_clip), 1.0)
+
+    scaled_values = signed_log_scaled(values / scale, value_clip)
+    scaled_grad_norm = np.log1p(
+        np.clip(np.linalg.norm(grad, axis=1, keepdims=True) * system.step / scale, 0.0, value_clip)
+    ) / math.log1p(value_clip)
+    scaled_lap = signed_log_scaled(lap * (system.step**2) / scale, lap_clip)
+    return np.concatenate(
+        [
+            scaled_values[left_idx],
+            scaled_values[right_idx],
+            scaled_grad_norm[left_idx],
+            scaled_grad_norm[right_idx],
+            scaled_lap[left_idx],
+            scaled_lap[right_idx],
+        ],
+        axis=1,
+    ).astype(np.float32)
+
+
+def oracle_rho_fields(system: SystemRecord, config: V2Config) -> list[tuple[str, np.ndarray]]:
+    """Select stored true-density or Fukui fields for a pair-model oracle ablation."""
+    mode = config.pair_rho_oracle_mode.strip().lower()
+    if mode == "off":
+        return []
+    neutral = system.rho_diag
+    if mode == "neutral-derivatives":
+        return [("rho_neutral", neutral)]
+    if system.rho_cation is None or system.rho_anion is None:
+        raise ValueError(
+            f"System {system.system_id} has no charged density oracle channels. "
+            "Rebuild NPZ files with --include-charged-density-oracles."
+        )
+    if mode == "three-density":
+        return [
+            ("rho_neutral", neutral),
+            ("rho_cation", system.rho_cation),
+            ("rho_anion", system.rho_anion),
+        ]
+    if mode == "fukui":
+        return [
+            ("rho_neutral", neutral),
+            ("fukui_plus", system.rho_anion - neutral),
+            ("fukui_minus", neutral - system.rho_cation),
+        ]
+    raise AssertionError(f"Unhandled oracle mode: {mode}")
 
 
 def true_rho_pair_features(
@@ -300,12 +473,16 @@ def true_rho_pair_features(
             raise ValueError("pair_rho_product_transform must be one of: log1p, linear.")
         features.append(scaled.reshape(-1, 1))
 
+    for field_name, values in oracle_rho_fields(system, config):
+        features.append(oracle_field_pair_features(system, field_name, values, left_idx, right_idx, config))
+
     if not features:
         return np.empty((len(left_idx), 0), dtype=np.float32)
     return np.concatenate(features, axis=1).astype(np.float32)
 
 
 def predicted_rho_pair_features(
+    system: SystemRecord,
     rho_values: tf.Tensor,
     left_idx: np.ndarray | tf.Tensor,
     right_idx: np.ndarray | tf.Tensor,
@@ -347,6 +524,50 @@ def predicted_rho_pair_features(
             raise ValueError("pair_rho_product_transform must be one of: log1p, linear.")
         features.append(scaled)
 
+    if needs_rho_derivatives(config):
+        grad_all = richardson_gradient_3d(rho_values, len(system.axis), system.step)
+        lap_all = richardson_laplacian_3d(rho_values, len(system.axis), system.step)
+
+        if config.pair_rho_grad_norm:
+            # reduced gradient |grad| / (rho + eps)
+            grad_left = gather(grad_all, left_idx)
+            grad_right = gather(grad_all, right_idx)
+            norm_left = tf.norm(grad_left, axis=1, keepdims=True) / (rho_left + eps)
+            norm_right = tf.norm(grad_right, axis=1, keepdims=True) / (rho_right + eps)
+            # Clip and log to keep it friendly for MLPs
+            norm_left = tf.math.log1p(tf.clip_by_value(norm_left, 0.0, 100.0))
+            norm_right = tf.math.log1p(tf.clip_by_value(norm_right, 0.0, 100.0))
+            features.extend([norm_left, norm_right])
+
+        if config.pair_rho_laplacian:
+            lap_left = gather(lap_all, left_idx) / (rho_left + eps)
+            lap_right = gather(lap_all, right_idx) / (rho_right + eps)
+            clip = float(config.pair_rho_laplacian_clip)
+            lap_left = tf.clip_by_value(lap_left, -clip, clip) / clip
+            lap_right = tf.clip_by_value(lap_right, -clip, clip) / clip
+            features.extend([lap_left, lap_right])
+
+        if config.pair_rho_directional_grad:
+            # grad_i . (r_j - r_i) / |r_j - r_i|
+            points = system_tensor(system, "points", system.points)
+            r_left = gather(points, left_idx)
+            r_right = gather(points, right_idx)
+            diff = r_right - r_left
+            dist = tf.norm(diff, axis=1, keepdims=True)
+            unit_diff = diff / (dist + 1e-8)
+
+            grad_left = gather(grad_all, left_idx)
+            grad_right = gather(grad_all, right_idx)
+
+            # dot products
+            dg_left = tf.reduce_sum(grad_left * unit_diff, axis=1, keepdims=True) / (rho_left + eps)
+            dg_right = tf.reduce_sum(grad_right * (-unit_diff), axis=1, keepdims=True) / (rho_right + eps)
+
+            # clip
+            dg_left = tf.clip_by_value(dg_left, -10.0, 10.0)
+            dg_right = tf.clip_by_value(dg_right, -10.0, 10.0)
+            features.extend([dg_left, dg_right])
+
     if not features:
         return tf.zeros((tf.shape(index_tensor(left_idx))[0], 0), dtype=tf.float32)
     return tf.concat(features, axis=1)
@@ -368,7 +589,17 @@ def build_v2_pair_features(
 def v2_pair_feature_dim(system: SystemRecord, config: V2Config) -> int:
     sample_idx = np.array([0], dtype=np.int64)
     base_dim = build_pair_features(system, sample_idx, sample_idx).shape[1]
-    return base_dim + len(active_pair_rho_feature_names(config))
+    rho_dim = 0
+    if pair_rho_source(config) == "true":
+        rho_dim = true_rho_pair_features(system, sample_idx, sample_idx, config).shape[1]
+    elif pair_rho_source(config) == "pred":
+        rho_dim += int(config.pair_rho_log_mean)
+        rho_dim += int(config.pair_rho_log_diff)
+        rho_dim += int(config.pair_rho_scaled_product)
+        rho_dim += 2 * int(config.pair_rho_grad_norm)
+        rho_dim += 2 * int(config.pair_rho_laplacian)
+        rho_dim += 2 * int(config.pair_rho_directional_grad)
+    return base_dim + rho_dim
 
 
 def build_v2_models(point_dim: int, pair_dim: int, global_dim: int, config: V2Config) -> V2Models:
@@ -420,6 +651,12 @@ def build_v2_models(point_dim: int, pair_dim: int, global_dim: int, config: V2Co
         )
 
     models = V2Models(point=point_model, pair=pair_model, context=context_model)
+
+    if config.pretrained_point_weights and models.point is not None:
+        models.point.load_weights(config.pretrained_point_weights)
+        models.point.trainable = False
+        print(f"Loaded pretrained point weights and frozen point model: {config.pretrained_point_weights}")
+
     print_block(
         "V2 model",
         [
@@ -429,11 +666,23 @@ def build_v2_models(point_dim: int, pair_dim: int, global_dim: int, config: V2Co
             ("global dim", global_dim),
             ("rank", config.rank if uses_residual(config.experiment) else 0),
             ("kernel base alpha", config.kernel_base_alpha if pair_model is not None else "off"),
+            ("pretrained point weights", config.pretrained_point_weights or "off"),
             ("pair rho features", ", ".join(pair_rho_names) if pair_rho_names else "off"),
             ("pair rho source", rho_source if pair_rho_names else "off"),
             ("pair rho stop-gradient", config.pair_rho_stop_gradient if rho_source == "pred" else "n/a"),
+            (
+                "rho derivatives",
+                "predicted rho, O(h^4) symmetric-boundary stencil"
+                if needs_rho_derivatives(config)
+                else (
+                    f"true oracle: {config.pair_rho_oracle_mode}"
+                    if config.pair_rho_oracle_mode != "off"
+                    else "off"
+                ),
+            ),
             ("context RFF", config.context_rff if context_model is not None else "off"),
             ("point params", point_model.count_params() if point_model is not None else 0),
+            ("point trainable", point_model.trainable if point_model is not None else "n/a"),
             ("pair params", pair_model.count_params() if pair_model is not None else 0),
             ("context params", context_model.count_params() if context_model is not None else 0),
         ],
@@ -567,9 +816,10 @@ def predict_kernel(
             raise RuntimeError("Predicted-rho pair features require rho_pred.")
         rho_feature_values = tf.stop_gradient(rho_pred) if config.pair_rho_stop_gradient else rho_pred
         pair_feat = tf.concat(
-            [pair_feat, predicted_rho_pair_features(rho_feature_values, left_idx, right_idx, config)],
+            [pair_feat, predicted_rho_pair_features(system, rho_feature_values, batch["left"], batch["right"], config)],
             axis=1,
         )
+
     global_tiled = tile_global(global_context_tensor(system), tf.shape(pair_feat)[0])
     pair_input = tf.concat([pair_feat, global_tiled], axis=1)
     delta_pair = models.pair(pair_input)
@@ -656,6 +906,8 @@ def eval_batch_cache_key(system: SystemRecord, config: V2Config) -> tuple[object
         config.pair_rho_log_clip,
         config.pair_rho_scaled_clip,
         config.pair_rho_product_transform,
+        config.pair_rho_laplacian_clip,
+        config.pair_rho_oracle_mode,
         config.pair_features_on_device,
     )
 
@@ -892,7 +1144,7 @@ def evaluate_system(
             else:
                 rho_left = gather(rho_pred, batch_indices(batch, "left"))
                 rho_right = gather(rho_pred, batch_indices(batch, "right"))
-            kernel_pred = predict_kernel(system, batch, models, config, modes_all, rho_pred)
+            kernel_pred = predict_kernel(system, batch, models, config, modes_all, rho_pred=rho_pred)
             gamma_pred = gamma_from_rho_kernel(rho_left, rho_right, kernel_pred)
             gamma_pred_np = gamma_pred.numpy().astype(np.float32)
             kernel_pred_np = kernel_pred.numpy().astype(np.float32)
@@ -1052,6 +1304,7 @@ def train_v2(config: V2Config, split: DatasetSplit, point_dim: int, pair_dim: in
         return summary
 
     models = build_v2_models(point_dim, pair_dim, global_dim, config)
+
     try:
         optimizer = tf.keras.optimizers.AdamW(learning_rate=config.learning_rate, weight_decay=config.weight_decay)
     except AttributeError:

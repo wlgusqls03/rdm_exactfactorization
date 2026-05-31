@@ -159,6 +159,8 @@ class SystemRecord:
     gamma_matrix: np.ndarray
     gamma_pairs: np.ndarray
     rho_diag: np.ndarray
+    rho_cation: np.ndarray | None
+    rho_anion: np.ndarray | None
 
     pair_left: np.ndarray
     pair_right: np.ndarray
@@ -590,6 +592,8 @@ def finalize_system_record(
     kinetic_potential: np.ndarray | None = None,
     kinetic_potential_centered: np.ndarray | None = None,
     rho_diag_override: np.ndarray | None = None,
+    rho_cation: np.ndarray | None = None,
+    rho_anion: np.ndarray | None = None,
 ) -> SystemRecord:
     """raw system data를 학습용 record로 정리."""
     n_points = len(points)
@@ -675,6 +679,16 @@ def finalize_system_record(
         gamma_matrix=gamma_matrix.astype(np.float32) if keep_gamma_matrix else np.empty((0, 0), dtype=np.float32),
         gamma_pairs=np.empty((0, 1), dtype=np.float32),
         rho_diag=rho_diag,
+        rho_cation=(
+            np.asarray(rho_cation, dtype=np.float32).reshape(n_points, 1)
+            if rho_cation is not None
+            else None
+        ),
+        rho_anion=(
+            np.asarray(rho_anion, dtype=np.float32).reshape(n_points, 1)
+            if rho_anion is not None
+            else None
+        ),
         pair_left=np.empty((0,), dtype=np.int64),
         pair_right=np.empty((0,), dtype=np.int64),
         pair_distance=np.empty((0,), dtype=np.float32),
@@ -841,6 +855,8 @@ def load_npz_system(path: str | Path, config: ExperimentConfig) -> SystemRecord:
         tau_true_grid = np.asarray(payload["tau_true_ao"], dtype=np.float32) if "tau_true_ao" in payload else None
         electron_count_from_payload = float(payload["electron_count"]) if "electron_count" in payload else None
         rho_diag_override = np.asarray(payload["rho_diag"], dtype=np.float32) if "rho_diag" in payload else None
+        rho_cation = np.asarray(payload["rho_cation"], dtype=np.float32) if "rho_cation" in payload else None
+        rho_anion = np.asarray(payload["rho_anion"], dtype=np.float32) if "rho_anion" in payload else None
         light_cache = None if rho_diag_override is not None else read_npz_light_cache(path)
         if rho_diag_override is None and light_cache is not None:
             rho_diag_override = np.asarray(light_cache["rho_diag"], dtype=np.float32)
@@ -884,6 +900,7 @@ def load_npz_system(path: str | Path, config: ExperimentConfig) -> SystemRecord:
             "kinetic_potential_center": float(scalar_payload(payload, "kinetic_potential_center", np.nan)),
             "kinetic_potential_reference": scalar_payload(payload, "kinetic_potential_reference", "not_computed"),
             "tau_reference": "ao_gradient" if tau_true_grid is not None else f"finite_difference_{config.tau_stencil}",
+            "charged_density_oracles": rho_cation is not None and rho_anion is not None,
         }
 
     return finalize_system_record(
@@ -910,6 +927,8 @@ def load_npz_system(path: str | Path, config: ExperimentConfig) -> SystemRecord:
         kinetic_potential=kinetic_potential,
         kinetic_potential_centered=kinetic_potential_centered,
         rho_diag_override=rho_diag_override,
+        rho_cation=rho_cation,
+        rho_anion=rho_anion,
     )
 
 

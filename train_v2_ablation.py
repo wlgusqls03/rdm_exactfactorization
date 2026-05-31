@@ -86,6 +86,8 @@ def apply_cli_inferences(args: argparse.Namespace, parser: argparse.ArgumentPars
         inferred = infer_experiment_from_text(args.run_name) or infer_experiment_from_text(args.output_dir)
         if inferred is not None:
             args.experiment = inferred
+    if args.pair_rho_oracle_mode != "off" and args.pair_rho_source == "auto":
+        args.pair_rho_source = "true"
 
     pair_rho_requested = (
         args.pair_rho_source == "pred"
@@ -93,6 +95,10 @@ def apply_cli_inferences(args: argparse.Namespace, parser: argparse.ArgumentPars
         or args.pair_rho_log_mean
         or args.pair_rho_log_diff
         or args.pair_rho_scaled_product
+        or args.pair_rho_grad_norm
+        or args.pair_rho_laplacian
+        or args.pair_rho_directional_grad
+        or args.pair_rho_oracle_mode != "off"
     )
     if pair_rho_requested and args.experiment in {"baseline", "rho-only"}:
         parser.error(
@@ -210,6 +216,47 @@ def parse_args() -> argparse.Namespace:
         help="Restore the best validation checkpoint before final train/val/test evaluation.",
     )
     parser.add_argument("--no-restore-best-weights", dest="restore_best_weights", action="store_false")
+
+    parser.add_argument(
+        "--pretrained-point-weights",
+        type=str,
+        default=os.environ.get("RDM_V2_PRETRAINED_POINT_WEIGHTS", None),
+        help="Path to pretrained point model weights. Freezes point model if provided.",
+    )
+    parser.add_argument(
+        "--pair-rho-grad-norm",
+        action="store_true",
+        default=env_flag("RDM_V2_PAIR_RHO_GRAD_NORM", False),
+        help="Append Richardson-extrapolated |grad rho| / (rho + eps) to pair features.",
+    )
+    parser.add_argument(
+        "--pair-rho-laplacian",
+        action="store_true",
+        default=env_flag("RDM_V2_PAIR_RHO_LAPLACIAN", False),
+        help="Append Richardson-extrapolated (lap rho) / (rho + eps) to pair features.",
+    )
+    parser.add_argument(
+        "--pair-rho-directional-grad",
+        action="store_true",
+        default=env_flag("RDM_V2_PAIR_RHO_DIRECTIONAL_GRAD", False),
+        help="Append Richardson-extrapolated (grad rho . unit_ij) / (rho + eps) to pair features.",
+    )
+    parser.add_argument(
+        "--pair-rho-laplacian-clip",
+        type=float,
+        default=env_float("RDM_V2_PAIR_RHO_LAPLACIAN_CLIP", 50.0),
+        help="Clipping threshold for normalized laplacian feature.",
+    )
+    parser.add_argument(
+        "--pair-rho-oracle-mode",
+        choices=["off", "neutral-derivatives", "three-density", "fukui"],
+        default=os.environ.get("RDM_V2_PAIR_RHO_ORACLE_MODE", "off"),
+        help=(
+            "Append true-density oracle descriptors to the current pair model. "
+            "Each selected field contributes endpoint value, |grad|, and Laplacian features."
+        ),
+    )
+
     parser.add_argument("--eval-pair-count", type=int, default=env_int("RDM_V2_EVAL_PAIR_COUNT", 8192))
     parser.add_argument(
         "--cache-eval-batches",
@@ -404,6 +451,12 @@ def make_v2_config(args: argparse.Namespace) -> V2Config:
         early_stopping_patience=max(int(args.early_stopping_patience), 0),
         early_stopping_min_delta=max(float(args.early_stopping_min_delta), 0.0),
         restore_best_weights=args.restore_best_weights,
+        pretrained_point_weights=args.pretrained_point_weights,
+        pair_rho_grad_norm=args.pair_rho_grad_norm,
+        pair_rho_laplacian=args.pair_rho_laplacian,
+        pair_rho_directional_grad=args.pair_rho_directional_grad,
+        pair_rho_laplacian_clip=args.pair_rho_laplacian_clip,
+        pair_rho_oracle_mode=args.pair_rho_oracle_mode,
         eval_pair_count=args.eval_pair_count,
         cache_eval_batches=args.cache_eval_batches,
         steps_per_system=max(int(args.steps_per_system), 1),
