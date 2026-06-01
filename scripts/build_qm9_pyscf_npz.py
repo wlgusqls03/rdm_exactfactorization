@@ -316,6 +316,7 @@ def run_dft(
     retry_scf: bool = False,
     retry_damp: float = 0.2,
     retry_level_shift: float = 0.3,
+    compute_sad_guess: bool = False,
 ) -> tuple[gto.Mole, dft.rks.RKS | dft.uks.UKS, np.ndarray, np.ndarray | None]:
     atom_spec = [
         (symbol, tuple(coord.tolist()))
@@ -351,13 +352,13 @@ def run_dft(
         mf.damp = damp
         mf.level_shift = level_shift
 
-        # Capture SAD guess from the first RKS/UKS object before possible Newton transformation
-        if sad_dm is None:
+        # Capture a fast MINAO atomic-density guess only when it will be stored
+        # as an input feature. Charged-oracle SCF runs do not need this extra work.
+        if compute_sad_guess and sad_dm is None:
             try:
-                sad_dm = mf.get_init_guess(key="atom")
-            except Exception:
-                # Fallback to default guess if atom-SAD fails
                 sad_dm = mf.get_init_guess(key="minao")
+            except Exception:
+                sad_dm = mf.get_init_guess(key="1e")
 
         if use_newton:
             mf = mf.newton()
@@ -369,7 +370,12 @@ def run_dft(
             )
         last_energy = mf.kernel(dm0=guess)
         if mf.converged:
-            return mol, mf, mf.make_rdm1().astype(np.float64), sad_dm.astype(np.float64)
+            return (
+                mol,
+                mf,
+                mf.make_rdm1().astype(np.float64),
+                sad_dm.astype(np.float64) if sad_dm is not None else None,
+            )
         try:
             guess = mf.make_rdm1()
         except Exception:
@@ -578,6 +584,7 @@ def write_npz(record: Qm9Record, args: argparse.Namespace, output_path: Path) ->
         xc=args.xc,
         grid_level=args.grid_level,
         max_cycle=args.scf_max_cycle,
+        compute_sad_guess=args.include_sad_and_vector_features,
     )
     kinetic_energy = kinetic_energy_from_dm(mol, dm)
     coords_bohr = record.coords_angstrom * ANGSTROM_TO_BOHR
@@ -708,6 +715,11 @@ def write_npz(record: Qm9Record, args: argparse.Namespace, output_path: Path) ->
         ),
         kinetic_potential_reference=np.asarray(
             str(kp_payload.get("kinetic_potential_reference", "not_computed"))
+        ),
+        basis=np.asarray(args.basis),
+        xc=np.asarray(args.xc),
+        local_feature_schema=np.asarray(
+            "sad_vectors_v1" if args.include_sad_and_vector_features else "legacy_v1"
         ),
         **charged_payload,
     )
@@ -851,7 +863,11 @@ def write_readable_indices(output_dir: Path, manifest: list[dict[str, object]]) 
 def read_records_from_npz(pattern: str) -> list[Qm9Record]:
     """Recover QM9Record info from existing NPZ files."""
     records: list[Qm9Record] = []
-    paths = sorted(glob.glob(pattern))
+    paths = [
+        path
+        for path in sorted(glob.glob(pattern))
+        if not path.endswith(".tmp.npz")
+    ]
     if not paths:
         return []
     print(f"Reading records from {len(paths)} NPZ files...")

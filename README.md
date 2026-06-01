@@ -235,6 +235,18 @@ The charged-oracle NPZ files are needed to pretrain Fukui mode. Once those NPZ
 files exist, changing among the three training modes does not require rebuilding
 the dataset.
 
+Existing NPZ files can be upgraded with the MINAO atomic-density input feature
+and directional atom descriptors without rerunning DFT:
+
+```bash
+python scripts/patch_npz_features.py \
+  --npz-glob 'qmugs_npz/qm9_pyscf_ldavwn_b631plusgd_atoms10_500_charged_oracle/*.npz'
+```
+
+The patcher writes a temporary archive and atomically replaces the original only
+after compression completes. It also recovers complete `*.npz.tmp.npz` archives
+left by older versions of the script.
+
 For a controlled comparison, keep all other options fixed and run:
 
 ```bash

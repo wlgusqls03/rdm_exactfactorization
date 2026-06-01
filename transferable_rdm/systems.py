@@ -955,6 +955,15 @@ def build_system_corpus(config: ExperimentConfig) -> list[SystemRecord]:
 
     axis_counts = [len(system.axis) for system in systems]
     point_counts = [len(system.points) for system in systems]
+    local_feature_dims = sorted({system.local_features.shape[1] for system in systems})
+    global_context_dims = sorted({len(system.global_context) for system in systems})
+    if len(local_feature_dims) != 1:
+        raise ValueError(
+            f"Inconsistent local_feature dimensions across the corpus: {local_feature_dims}. "
+            "Finish patching every NPZ file before training."
+        )
+    if len(global_context_dims) != 1:
+        raise ValueError(f"Inconsistent global_context dimensions across the corpus: {global_context_dims}.")
     tau_references = sorted({str(system.metadata.get("tau_reference", f"finite_difference_{config.tau_stencil}")) for system in systems})
     print_block(
         "System corpus",
@@ -963,8 +972,8 @@ def build_system_corpus(config: ExperimentConfig) -> list[SystemRecord]:
             ("num_systems", len(systems)),
             ("axis_points", f"{min(axis_counts)}..{max(axis_counts)}"),
             ("n_points/system", f"{min(point_counts)}..{max(point_counts)}"),
-            ("local_feature_dim", systems[0].local_features.shape[1]),
-            ("global_context_dim", len(systems[0].global_context)),
+            ("local_feature_dim", local_feature_dims[0]),
+            ("global_context_dim", global_context_dims[0]),
             ("tau_stencil", config.tau_stencil),
             ("tau_reference", tau_references),
         ],

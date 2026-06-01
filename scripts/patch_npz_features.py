@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import glob
 import os
-import shutil
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +15,8 @@ from build_qm9_pyscf_npz import (
     build_local_features,
     normalized_density_on_grid,
 )
+
+LOCAL_FEATURE_SCHEMA = "sad_vectors_v1"
 
 
 def get_sad_density(symbols: list[str], coords_bohr: np.ndarray, basis: str, absolute_grid_bohr: np.ndarray, cell_volume: float) -> np.ndarray:
@@ -40,14 +42,40 @@ def get_sad_density(symbols: list[str], coords_bohr: np.ndarray, basis: str, abs
     return rho_sad
 
 
-def patch_npz_file(path_str: str) -> None:
-    path = Path(path_str)
+def is_patched_archive(path: Path) -> bool:
     try:
         with np.load(path, allow_pickle=True) as payload:
             local_features = payload["local_features"]
-            if local_features.shape[1] >= 31:
+            if "local_feature_schema" in payload.files:
+                return str(payload["local_feature_schema"]) == LOCAL_FEATURE_SCHEMA
+            return local_features.shape[1] == 31
+    except Exception:
+        return False
+
+
+def recover_legacy_temp_file(path: Path) -> bool:
+    """Promote a complete temp archive left by the old NumPy suffix bug."""
+    legacy_temp_path = Path(str(path) + ".tmp.npz")
+    if not legacy_temp_path.exists():
+        return False
+    if not is_patched_archive(legacy_temp_path):
+        legacy_temp_path.unlink()
+        return False
+    print(f"Recovering completed temp archive for {path.name} ...")
+    os.replace(legacy_temp_path, path)
+    return True
+
+
+def patch_npz_file(path_str: str) -> bool:
+    path = Path(path_str)
+    try:
+        if recover_legacy_temp_file(path):
+            return True
+        with np.load(path, allow_pickle=True) as payload:
+            local_features = payload["local_features"]
+            if is_patched_archive(path):
                 # Already patched
-                return
+                return True
             
             print(f"Patching {path.name} ...")
             
@@ -94,16 +122,22 @@ def patch_npz_file(path_str: str) -> None:
             # Copy all data to a new dictionary
             new_data = {k: payload[k] for k in payload.files}
             new_data["local_features"] = new_local_features
+            new_data["local_feature_schema"] = np.asarray(LOCAL_FEATURE_SCHEMA)
             
         # Save to a temporary file first, then replace to avoid corruption
         temp_path = Path(str(path) + ".tmp")
-        np.savez_compressed(temp_path, **new_data)
-        shutil.move(temp_path, path)
+        with temp_path.open("wb") as handle:
+            np.savez_compressed(handle, **new_data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        return True
         
     except Exception as e:
         import traceback
         traceback.print_exc()
         print(f"Error processing {path.name}: {e}")
+        return False
 
 
 def main():
@@ -111,17 +145,28 @@ def main():
     parser.add_argument("--npz-glob", required=True, help="Glob pattern for NPZ files to patch.")
     args = parser.parse_args()
     
-    paths = sorted(glob.glob(args.npz_glob))
+    paths = [
+        path
+        for path in sorted(glob.glob(args.npz_glob))
+        if not path.endswith(".tmp.npz")
+    ]
     if not paths:
         print(f"No files found matching {args.npz_glob}")
         return
         
     print(f"Found {len(paths)} NPZ files. Checking and patching...")
+    failed = []
     for i, path in enumerate(paths):
-        patch_npz_file(path)
+        if not patch_npz_file(path):
+            failed.append(path)
         if (i + 1) % 50 == 0:
             print(f"Processed {i + 1}/{len(paths)} files...")
-    print("Done!")
+    print(f"Done: succeeded={len(paths) - len(failed)} failed={len(failed)}")
+    if failed:
+        print("Failed files:")
+        for path in failed:
+            print(f"  {path}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
