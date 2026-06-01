@@ -81,7 +81,7 @@ class ExperimentConfig:
     steps_per_epoch: int = int(os.environ.get("RDM_STEPS_PER_EPOCH", 80))
     epochs: int = int(os.environ.get("RDM_EPOCHS", 400))
     val_every: int = int(os.environ.get("RDM_VAL_EVERY", 5))
-    log_every: int = int(os.environ.get("RDM_LOG_EVERY", 10))
+    log_every: int = int(os.environ.get("RDM_LOG_EVERY", 1))
     early_stopping_patience: int = int(os.environ.get("RDM_PATIENCE", 40))
 
     initial_lr: float = env_float_any(("RDM_LEARNING_RATE", "RDM_INITIAL_LR", "RDM_LR"), 3e-4)

@@ -42,7 +42,7 @@ configure_tensorflow_environment_preimport()
 
 from transferable_rdm.config import ExperimentConfig
 from transferable_rdm.data import build_pair_features, split_systems
-from transferable_rdm.density_features import PAIR_DENSITY_FEATURE_MODES, pair_density_feature_dim
+from transferable_rdm.density_features import PAIR_DENSITY_FEATURE_MODES, pair_density_feature_dim, pair_density_feature_mode
 from transferable_rdm.model import build_models, initialize_point_model_density_bias
 from transferable_rdm.plotting import plot_point_pretrain_summary, plot_training_summary
 from transferable_rdm.systems import build_system_corpus
@@ -114,6 +114,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rank", type=int, default=None)
     parser.add_argument("--steps-per-epoch", type=int, default=None)
     parser.add_argument("--val-every", type=int, default=None)
+    parser.add_argument("--log-every", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=None)
     parser.add_argument("--point-pretrain-epochs", type=int, default=None)
     parser.add_argument("--point-pretrain-steps-per-epoch", type=int, default=None)
@@ -178,6 +179,7 @@ def apply_overrides(config: ExperimentConfig, args: argparse.Namespace) -> Exper
         ("learned_rank", "rank"),
         ("steps_per_epoch", "steps_per_epoch"),
         ("val_every", "val_every"),
+        ("log_every", "log_every"),
         ("initial_lr", "learning_rate"),
         ("point_pretrain_epochs", "point_pretrain_epochs"),
         ("point_pretrain_steps_per_epoch", "point_pretrain_steps_per_epoch"),
@@ -453,6 +455,24 @@ def main() -> None:
             ("mode", config.pair_density_feature_mode),
             ("base pair dim", base_pair_dim),
             ("density descriptor dim", pair_density_feature_dim(config)),
+        ],
+    )
+    density_cache_floats_per_point = {
+        "off": 1,
+        "rho-derivatives": 4,
+        "fukui": 12,
+    }[pair_density_feature_mode(config)]
+    gamma_cache_gib = float(os.environ.get("RDM_GAMMA_CACHE_GB", "1.0"))
+    expanded_gamma_gib = sum(len(system.points) ** 2 * 4 for system in systems) / (1024**3)
+    frozen_density_cache_mib = (
+        sum(len(system.points) for system in systems) * density_cache_floats_per_point * 4 / (1024**2)
+    )
+    print_block(
+        "Runtime cache estimate",
+        [
+            ("gamma LRU limit (CPU RAM)", f"{gamma_cache_gib:.2f} GiB"),
+            ("full corpus gamma expanded", f"{expanded_gamma_gib:.2f} GiB"),
+            ("frozen density cache (GPU, approx)", f"{frozen_density_cache_mib:.1f} MiB"),
         ],
     )
     models = build_models(config, point_dim, pair_dim, global_dim)

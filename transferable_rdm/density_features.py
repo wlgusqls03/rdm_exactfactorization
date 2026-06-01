@@ -136,7 +136,7 @@ def build_density_feature_state(
     anion = None
     fields: list[tuple[str, tf.Tensor, tf.Tensor, tf.Tensor]] = []
     if mode != "off":
-        fields.append(descriptor_field(system, "rho_neutral", neutral))
+        fields.append(normalized_descriptor_field(system, "rho_neutral", neutral, config))
     if mode == "fukui":
         cation = normalized_density_head(
             system, point_out[:, 1:2], max(system.electron_count - 1.0, 1e-6), normalize=config.normalize_rho
@@ -144,8 +144,8 @@ def build_density_feature_state(
         anion = normalized_density_head(
             system, point_out[:, 2:3], system.electron_count + 1.0, normalize=config.normalize_rho
         )
-        fields.append(descriptor_field(system, "fukui_plus", anion - neutral))
-        fields.append(descriptor_field(system, "fukui_minus", neutral - cation))
+        fields.append(normalized_descriptor_field(system, "fukui_plus", anion - neutral, config))
+        fields.append(normalized_descriptor_field(system, "fukui_minus", neutral - cation, config))
     if config.freeze_point_after_pretrain:
         neutral = tf.stop_gradient(neutral)
         cation = tf.stop_gradient(cation) if cation is not None else None
@@ -158,6 +158,27 @@ def signed_log_scaled(values: tf.Tensor, clip: float) -> tf.Tensor:
     clip = max(float(clip), 1.0)
     clipped = tf.clip_by_value(values, -clip, clip)
     return tf.sign(clipped) * tf.math.log1p(tf.abs(clipped)) / tf.math.log1p(tf.constant(clip, tf.float32))
+
+
+def normalized_descriptor_field(
+    system: SystemRecord,
+    name: str,
+    values: tf.Tensor,
+    config: ExperimentConfig,
+) -> tuple[str, tf.Tensor, tf.Tensor, tf.Tensor]:
+    """Precompute normalized endpoint descriptors once per frozen density state."""
+    _, values, grad, lap = descriptor_field(system, name, values)
+    scale = tf.maximum(tf.reduce_mean(tf.abs(values)), max(config.pair_density_eps, 1e-30))
+    scaled_values = signed_log_scaled(values / scale, config.pair_density_value_clip)
+    scaled_grad = tf.math.log1p(
+        tf.clip_by_value(
+            tf.norm(grad, axis=1, keepdims=True) * system.step / scale,
+            0.0,
+            config.pair_density_value_clip,
+        )
+    ) / tf.math.log1p(tf.constant(max(config.pair_density_value_clip, 1.0), tf.float32))
+    scaled_lap = signed_log_scaled(lap * (system.step**2) / scale, config.pair_density_laplacian_clip)
+    return name, scaled_values, scaled_grad, scaled_lap
 
 
 def pair_density_features(
@@ -173,13 +194,7 @@ def pair_density_features(
     left_idx = tf.convert_to_tensor(left_idx, dtype=tf.int64)
     right_idx = tf.convert_to_tensor(right_idx, dtype=tf.int64)
     features = []
-    for _, values, grad, lap in state.descriptor_fields:
-        scale = tf.maximum(tf.reduce_mean(tf.abs(values)), max(config.pair_density_eps, 1e-30))
-        scaled_values = signed_log_scaled(values / scale, config.pair_density_value_clip)
-        scaled_grad = tf.math.log1p(
-            tf.clip_by_value(tf.norm(grad, axis=1, keepdims=True) * system.step / scale, 0.0, config.pair_density_value_clip)
-        ) / tf.math.log1p(tf.constant(max(config.pair_density_value_clip, 1.0), tf.float32))
-        scaled_lap = signed_log_scaled(lap * (system.step**2) / scale, config.pair_density_laplacian_clip)
+    for _, scaled_values, scaled_grad, scaled_lap in state.descriptor_fields:
         features.extend(
             [
                 tf.gather(scaled_values, left_idx),

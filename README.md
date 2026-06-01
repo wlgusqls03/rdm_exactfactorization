@@ -220,6 +220,11 @@ python train_transferable_1rdm.py \
   --auto-run-dir
 ```
 
+`RDM_GAMMA_CACHE_GB` limits the process-local CPU RAM LRU for expanded neutral
+`gamma_matrix` arrays. It does not allocate GPU memory, and charged density
+oracles do not increase this limit. The runtime prints both the expanded corpus
+estimate and the approximate frozen density GPU-cache size.
+
 Use `--pair-density-feature-mode off` for the original pair input, or
 `--pair-density-feature-mode rho-derivatives` to add predicted `rho_N`, gradient
 norm, and Laplacian descriptors without predicting charged densities. Fukui mode
