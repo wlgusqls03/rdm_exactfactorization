@@ -60,7 +60,11 @@ Output:
 With `--pair-density-feature-mode fukui`, the point model instead emits three
 density logits for `rho_N`, `rho_(N+1)`, and `rho_(N-1)`. Each density is obtained
 with `softplus` and rescaled to its required electron count. The point model is
-pretrained and frozen before 1-RDM training.
+pretrained and frozen before 1-RDM training. Fukui-mode pretraining is staged:
+`rho_N` starts first, charged densities enter at epoch 30, and direct Fukui
+losses enter as a small auxiliary term at epoch 60. The defaults can be adjusted
+with `--point-charged-weight`, `--point-fukui-weight`,
+`--point-charged-start-epoch`, and `--point-fukui-start-epoch`.
 
 ### 2. Mode Model
 
@@ -208,7 +212,7 @@ python train_transferable_1rdm.py \
   --val-system-count 50 \
   --test-system-count 50 \
   --pair-density-feature-mode fukui \
-  --point-pretrain-epochs 120 \
+  --point-pretrain-epochs 200 \
   --point-pretrain-steps-per-epoch 80 \
   --epochs 700 \
   --batch-size 1024 \

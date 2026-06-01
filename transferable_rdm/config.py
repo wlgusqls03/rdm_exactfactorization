@@ -95,7 +95,14 @@ class ExperimentConfig:
     point_pretrain_lr: float = float(os.environ.get("RDM_POINT_PRETRAIN_LR", 3e-4))
     point_pretrain_patience: int = int(os.environ.get("RDM_POINT_PRETRAIN_PATIENCE", 30))
     point_pretrain_val_every: int = int(os.environ.get("RDM_POINT_PRETRAIN_VAL_EVERY", 5))
-    point_fukui_weight: float = float(os.environ.get("RDM_POINT_FUKUI_WEIGHT", 1.0))
+    point_charged_weight: float = float(os.environ.get("RDM_POINT_CHARGED_WEIGHT", 0.25))
+    point_fukui_weight: float = float(os.environ.get("RDM_POINT_FUKUI_WEIGHT", 0.05))
+    point_charged_start_epoch: int = int(os.environ.get("RDM_POINT_CHARGED_START_EPOCH", 30))
+    point_fukui_start_epoch: int = int(os.environ.get("RDM_POINT_FUKUI_START_EPOCH", 60))
+    point_density_scale_floor: float = float(os.environ.get("RDM_POINT_DENSITY_SCALE_FLOOR", 1e-3))
+    point_pretrain_lr_decay: float = float(os.environ.get("RDM_POINT_PRETRAIN_LR_DECAY", 0.5))
+    point_pretrain_lr_patience: int = int(os.environ.get("RDM_POINT_PRETRAIN_LR_PATIENCE", 15))
+    point_pretrain_min_lr: float = float(os.environ.get("RDM_POINT_PRETRAIN_MIN_LR", 1e-5))
     freeze_point_after_pretrain: bool = env_flag("RDM_FREEZE_POINT_AFTER_PRETRAIN", True)
 
     # ------------------------------------------------------------------

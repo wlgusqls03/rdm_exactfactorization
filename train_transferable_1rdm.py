@@ -118,6 +118,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--point-pretrain-epochs", type=int, default=None)
     parser.add_argument("--point-pretrain-steps-per-epoch", type=int, default=None)
     parser.add_argument("--point-pretrain-lr", type=float, default=None)
+    parser.add_argument("--point-charged-weight", type=float, default=None)
+    parser.add_argument("--point-fukui-weight", type=float, default=None)
+    parser.add_argument("--point-charged-start-epoch", type=int, default=None)
+    parser.add_argument("--point-fukui-start-epoch", type=int, default=None)
+    parser.add_argument("--point-density-scale-floor", type=float, default=None)
     parser.add_argument("--pair-density-feature-mode", choices=PAIR_DENSITY_FEATURE_MODES, default=None)
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
@@ -177,6 +182,11 @@ def apply_overrides(config: ExperimentConfig, args: argparse.Namespace) -> Exper
         ("point_pretrain_epochs", "point_pretrain_epochs"),
         ("point_pretrain_steps_per_epoch", "point_pretrain_steps_per_epoch"),
         ("point_pretrain_lr", "point_pretrain_lr"),
+        ("point_charged_weight", "point_charged_weight"),
+        ("point_fukui_weight", "point_fukui_weight"),
+        ("point_charged_start_epoch", "point_charged_start_epoch"),
+        ("point_fukui_start_epoch", "point_fukui_start_epoch"),
+        ("point_density_scale_floor", "point_density_scale_floor"),
         ("pair_density_feature_mode", "pair_density_feature_mode"),
         ("run_name", "run_name"),
         ("output_dir", "output_dir"),

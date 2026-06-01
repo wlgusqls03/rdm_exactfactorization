@@ -167,22 +167,43 @@ def point_density_predictions(
     return predictions
 
 
-def scaled_field_mse(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
-    scale = tf.maximum(tf.reduce_mean(tf.abs(y_true)), 1e-5)
+def scaled_field_mse(y_true: tf.Tensor, y_pred: tf.Tensor, scale_floor: float) -> tf.Tensor:
+    scale = tf.maximum(tf.sqrt(tf.reduce_mean(tf.square(y_true))), scale_floor)
     return tf.reduce_mean(tf.square((y_pred - y_true) / scale))
 
 
-def point_pretrain_loss(system: SystemRecord, models: ModelBundle, config: ExperimentConfig) -> tf.Tensor:
+def point_pretrain_losses(
+    system: SystemRecord,
+    models: ModelBundle,
+    config: ExperimentConfig,
+    epoch: int,
+) -> dict[str, tf.Tensor]:
     pred = point_density_predictions(system, models, config)
-    loss = scaled_field_mse(to_tensor(system.rho_diag), pred["rho_neutral"])
+    zero = tf.constant(0.0, dtype=tf.float32)
+    neutral_loss = scaled_field_mse(to_tensor(system.rho_diag), pred["rho_neutral"], config.point_density_scale_floor)
+    charged_loss = zero
+    fukui_loss = zero
     if pair_density_feature_mode(config) == "fukui":
         true_cation = to_tensor(system.rho_cation)
         true_anion = to_tensor(system.rho_anion)
-        loss += 0.5 * scaled_field_mse(true_cation, pred["rho_cation"])
-        loss += 0.5 * scaled_field_mse(true_anion, pred["rho_anion"])
-        loss += config.point_fukui_weight * 0.5 * scaled_field_mse(true_anion - to_tensor(system.rho_diag), pred["fukui_plus"])
-        loss += config.point_fukui_weight * 0.5 * scaled_field_mse(to_tensor(system.rho_diag) - true_cation, pred["fukui_minus"])
-    return loss
+        if epoch >= config.point_charged_start_epoch:
+            charged_loss = 0.5 * (
+                scaled_field_mse(true_cation, pred["rho_cation"], config.point_density_scale_floor)
+                + scaled_field_mse(true_anion, pred["rho_anion"], config.point_density_scale_floor)
+            )
+        if epoch >= config.point_fukui_start_epoch:
+            rho_neutral = to_tensor(system.rho_diag)
+            fukui_loss = 0.5 * (
+                scaled_field_mse(true_anion - rho_neutral, pred["fukui_plus"], config.point_density_scale_floor)
+                + scaled_field_mse(rho_neutral - true_cation, pred["fukui_minus"], config.point_density_scale_floor)
+            )
+    total = neutral_loss + config.point_charged_weight * charged_loss + config.point_fukui_weight * fukui_loss
+    return {
+        "total": total,
+        "neutral": neutral_loss,
+        "charged": charged_loss,
+        "fukui": fukui_loss,
+    }
 
 
 def evaluate_point_model(
@@ -198,6 +219,11 @@ def evaluate_point_model(
         entry: dict[str, object] = {
             "system_id": system.system_id,
             "rho_neutral_mae": float(np.mean(np.abs(pred["rho_neutral"].numpy() - system.rho_diag))),
+            "rho_neutral_rel_l1": float(
+                np.sum(np.abs(pred["rho_neutral"].numpy() - system.rho_diag))
+                * system.cell_volume
+                / max(system.electron_count, 1e-12)
+            ),
         }
         if pair_density_feature_mode(config) == "fukui":
             fukui_plus_true = system.rho_anion - system.rho_diag
@@ -219,7 +245,10 @@ def evaluate_point_model(
                 entry["fukui_minus_true"] = system.rho_diag - system.rho_cation
                 entry["fukui_minus_pred"] = pred["fukui_minus"].numpy()
         per_system.append(entry)
-    scalar_keys = [key for key in per_system[0] if key.endswith("_mae")]
+    scalar_keys = [
+        key for key in per_system[0]
+        if key.endswith("_mae") or key.endswith("_rel_l1")
+    ]
     summary = {key: float(np.mean([entry[key] for entry in per_system])) for key in scalar_keys}
     summary["per_system"] = per_system
     return summary
@@ -235,33 +264,64 @@ def pretrain_point_model(
     history = PointPretrainHistory()
     rng = np.random.default_rng(config.seed + 71)
     best_val = np.inf
+    best_val_for_lr = np.inf
     best_weights = None
     stale_epochs = 0
+    stale_lr_epochs = 0
+    previous_stage = None
     print_block(
         "Point density pretrain",
         [
             ("pair density feature mode", pair_density_feature_mode(config)),
             ("epochs", config.point_pretrain_epochs),
             ("steps/epoch", config.point_pretrain_steps_per_epoch),
+            ("charged weight/start", f"{config.point_charged_weight:g} / {config.point_charged_start_epoch}"),
+            ("Fukui weight/start", f"{config.point_fukui_weight:g} / {config.point_fukui_start_epoch}"),
+            ("density scale floor", f"{config.point_density_scale_floor:g}"),
+            (
+                "lr decay",
+                f"factor={config.point_pretrain_lr_decay:g}, "
+                f"patience={config.point_pretrain_lr_patience}, min={config.point_pretrain_min_lr:g}",
+            ),
             ("freeze after pretrain", config.freeze_point_after_pretrain),
         ],
     )
     for epoch in range(config.point_pretrain_epochs):
+        uses_fukui = pair_density_feature_mode(config) == "fukui"
+        stage = (
+            uses_fukui and epoch >= config.point_charged_start_epoch,
+            uses_fukui and epoch >= config.point_fukui_start_epoch,
+        )
+        if previous_stage is not None and stage != previous_stage:
+            best_val = np.inf
+            best_val_for_lr = np.inf
+            best_weights = None
+            stale_epochs = 0
+            stale_lr_epochs = 0
+            print(f"Point pretrain stage transition at epoch {epoch}: charged={stage[0]} fukui={stage[1]}")
+        previous_stage = stage
         running = 0.0
+        running_components = {"neutral": 0.0, "charged": 0.0, "fukui": 0.0}
         for _ in range(config.point_pretrain_steps_per_epoch):
             system = choose_system(split.train_systems, rng)
             with tf.GradientTape() as tape:
-                loss = point_pretrain_loss(system, models, config)
+                losses = point_pretrain_losses(system, models, config, epoch)
+                loss = losses["total"]
             grads = tape.gradient(loss, models.point_model.trainable_variables)
             grads_and_vars = [(grad, var) for grad, var in zip(grads, models.point_model.trainable_variables) if grad is not None]
             optimizer.apply_gradients(grads_and_vars)
             running += float(loss.numpy())
+            for key in running_components:
+                running_components[key] += float(losses[key].numpy())
         train_loss = running / max(config.point_pretrain_steps_per_epoch, 1)
         history.train_loss.append(train_loss)
         history.learning_rate.append(float(optimizer.learning_rate.numpy()))
         validation_ran = epoch % max(config.point_pretrain_val_every, 1) == 0 or epoch == config.point_pretrain_epochs - 1
         if validation_ran:
-            val_losses = [float(point_pretrain_loss(system, models, config).numpy()) for system in split.val_systems]
+            val_losses = [
+                float(point_pretrain_losses(system, models, config, epoch)["total"].numpy())
+                for system in split.val_systems
+            ]
             val_loss = float(np.mean(val_losses))
             if val_loss < best_val - 1e-9:
                 best_val = val_loss
@@ -269,11 +329,30 @@ def pretrain_point_model(
                 stale_epochs = 0
             else:
                 stale_epochs += max(config.point_pretrain_val_every, 1)
+            if val_loss < best_val_for_lr - 1e-9:
+                best_val_for_lr = val_loss
+                stale_lr_epochs = 0
+            else:
+                stale_lr_epochs += max(config.point_pretrain_val_every, 1)
+            if stale_lr_epochs >= config.point_pretrain_lr_patience:
+                old_lr = float(optimizer.learning_rate.numpy())
+                new_lr = max(old_lr * config.point_pretrain_lr_decay, config.point_pretrain_min_lr)
+                if new_lr < old_lr:
+                    optimizer.learning_rate.assign(new_lr)
+                    print(f"Point pretrain reduce lr {old_lr:.3e} -> {new_lr:.3e}")
+                stale_lr_epochs = 0
         else:
             val_loss = history.val_loss[-1] if history.val_loss else float("nan")
         history.val_loss.append(val_loss)
         if epoch % max(config.log_every, 1) == 0 or epoch == config.point_pretrain_epochs - 1:
-            print(f"Point epoch {epoch:4d} | train={train_loss:.6e} val={val_loss:.6e}")
+            denom = max(config.point_pretrain_steps_per_epoch, 1)
+            print(
+                f"Point epoch {epoch:4d} | train={train_loss:.6e} val={val_loss:.6e} "
+                f"rho_N={running_components['neutral'] / denom:.3e} "
+                f"charged={running_components['charged'] / denom:.3e} "
+                f"fukui={running_components['fukui'] / denom:.3e} "
+                f"lr={float(optimizer.learning_rate.numpy()):.3e}"
+            )
         if stale_epochs >= config.point_pretrain_patience:
             print(f"Point pretrain early stopping at epoch {epoch}.")
             break
@@ -291,6 +370,7 @@ def pretrain_point_model(
         "Point density pretrain summary",
         [
             ("val rho_N MAE", f"{summary['val']['rho_neutral_mae']:.6e}"),
+            ("val rho_N relative L1", f"{summary['val']['rho_neutral_rel_l1']:.6e}"),
             ("val Fukui+ MAE", f"{summary['val'].get('fukui_plus_mae', float('nan')):.6e}"),
             ("val Fukui- MAE", f"{summary['val'].get('fukui_minus_mae', float('nan')):.6e}"),
             ("point trainable in pair stage", models.point_model.trainable),
