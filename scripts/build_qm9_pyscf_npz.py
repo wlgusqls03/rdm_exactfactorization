@@ -855,13 +855,20 @@ def read_records_from_npz(pattern: str) -> list[Qm9Record]:
     if not paths:
         return []
     print(f"Reading records from {len(paths)} NPZ files...")
-    for path in paths:
+    for path_str in paths:
+        path = Path(path_str)
         with np.load(path, allow_pickle=True) as payload:
             symbols = [str(s) for s in payload["atom_symbols"]]
             coords_ang = np.asarray(payload["atom_coords_bohr"], dtype=np.float64) / ANGSTROM_TO_BOHR
+            
+            # The filename format is typically {index:04d}_{qm9_id}.npz
+            # Extract qm9_id by splitting on the first underscore
+            stem = path.stem
+            qm9_id = stem.split("_", 1)[1] if "_" in stem else stem
+
             records.append(
                 Qm9Record(
-                    qm9_id=str(payload["qm9_id"]),
+                    qm9_id=qm9_id,
                     symbols=symbols,
                     coords_angstrom=coords_ang,
                     smiles_gdb=str(payload.get("smiles_gdb", "")),
