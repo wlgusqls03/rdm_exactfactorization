@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import glob
 import json
 import tarfile
 from dataclasses import dataclass
@@ -80,6 +81,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--selection", choices=["random", "smallest"], default="random")
+    parser.add_argument(
+        "--npz-glob",
+        type=str,
+        default=None,
+        help="Optional glob pattern for existing NPZ files to use as source instead of raw tarball.",
+    )
     return parser.parse_args()
 
 
@@ -841,9 +848,37 @@ def write_readable_indices(output_dir: Path, manifest: list[dict[str, object]]) 
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def read_records_from_npz(pattern: str) -> list[Qm9Record]:
+    """Recover QM9Record info from existing NPZ files."""
+    records: list[Qm9Record] = []
+    paths = sorted(glob.glob(pattern))
+    if not paths:
+        return []
+    print(f"Reading records from {len(paths)} NPZ files...")
+    for path in paths:
+        with np.load(path, allow_pickle=True) as payload:
+            symbols = [str(s) for s in payload["atom_symbols"]]
+            coords_ang = np.asarray(payload["atom_coords_bohr"], dtype=np.float64) / ANGSTROM_TO_BOHR
+            records.append(
+                Qm9Record(
+                    qm9_id=str(payload["qm9_id"]),
+                    symbols=symbols,
+                    coords_angstrom=coords_ang,
+                    smiles_gdb=str(payload.get("smiles_gdb", "")),
+                    smiles_relaxed=str(payload.get("smiles_relaxed", "")),
+                    inchi_gdb=str(payload.get("inchi_gdb", "")),
+                    inchi_relaxed=str(payload.get("inchi_relaxed", "")),
+                )
+            )
+    return records
+
+
 def main() -> None:
     args = parse_args()
-    records = read_qm9_records(args.qm9_tar, args.max_atoms)
+    if args.npz_glob:
+        records = read_records_from_npz(args.npz_glob)
+    else:
+        records = read_qm9_records(args.qm9_tar, args.max_atoms)
     if args.selection == "smallest":
         records = sorted(
             records,
