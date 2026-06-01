@@ -111,6 +111,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--axis-points", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--width", type=int, default=None)
+    parser.add_argument("--point-model-depth", type=int, default=None)
     parser.add_argument("--rank", type=int, default=None)
     parser.add_argument("--steps-per-epoch", type=int, default=None)
     parser.add_argument("--val-every", type=int, default=None)
@@ -176,6 +177,7 @@ def apply_overrides(config: ExperimentConfig, args: argparse.Namespace) -> Exper
         ("axis_points", "axis_points"),
         ("batch_size", "batch_size"),
         ("model_width", "width"),
+        ("point_model_depth", "point_model_depth"),
         ("learned_rank", "rank"),
         ("steps_per_epoch", "steps_per_epoch"),
         ("val_every", "val_every"),

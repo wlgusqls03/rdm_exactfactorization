@@ -45,7 +45,7 @@ class ExperimentConfig:
     # 시스템 / grid 설정
     # ------------------------------------------------------------------
     seed: int = int(os.environ.get("RDM_SEED", 0))
-    num_systems: int = int(os.environ.get("RDM_NUM_SYSTEMS", 18))
+    num_systems: int = int(os.environ.get("RDM_NUM_SYSTEMS", 500))
     train_system_fraction: float = float(os.environ.get("RDM_TRAIN_SYSTEM_FRACTION", 0.75))
     train_system_count: int = int(os.environ.get("RDM_TRAIN_SYSTEM_COUNT", 0))
     val_system_count: int = int(os.environ.get("RDM_VAL_SYSTEM_COUNT", 0))
@@ -63,6 +63,7 @@ class ExperimentConfig:
     # 모델 설정
     # ------------------------------------------------------------------
     model_width: int = int(os.environ.get("RDM_MODEL_WIDTH", 192))
+    point_model_depth: int = int(os.environ.get("RDM_POINT_MODEL_DEPTH", 3))
     learned_rank: int = int(os.environ.get("RDM_LEARNED_RANK", 8))
     rff_features: int = int(os.environ.get("RDM_RFF_FEATURES", 32))
     rff_scale: float = float(os.environ.get("RDM_RFF_SCALE", 2.0))
