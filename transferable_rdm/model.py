@@ -6,6 +6,7 @@ import numpy as np
 import tensorflow as tf
 
 from .config import ExperimentConfig
+from .density_features import density_head_count, pair_density_feature_dim, pair_density_feature_mode
 from .utils import print_block
 
 
@@ -14,6 +15,7 @@ class ModelBundle:
     """전체 1-RDM surrogate를 구성하는 서브모델 묶음."""
 
     point_model: tf.keras.Model
+    mode_model: tf.keras.Model
     pair_model: tf.keras.Model
     context_model: tf.keras.Model
 
@@ -82,7 +84,10 @@ def build_models(config: ExperimentConfig, point_feat_dim: int, pair_feat_dim: i
     """모델 구성.
 
     point_model
-        local point feature + global context -> rho logit + KP head + raw mode amplitudes
+        local point feature + global context -> density logits
+
+    mode_model
+        local point feature + global context -> raw residual mode amplitudes
 
     pair_model
         pair feature + global context -> baseline width(alpha) + baseline/residual gate
@@ -90,17 +95,28 @@ def build_models(config: ExperimentConfig, point_feat_dim: int, pair_feat_dim: i
     context_model
         global context -> system-specific mode scales
     """
+    n_density_heads = density_head_count(config)
+    density_feature_dim = pair_density_feature_dim(config)
     point_model = build_mlp(
         input_dim=point_feat_dim + global_dim,
-        output_dim=2 + config.learned_rank,
+        output_dim=n_density_heads,
         width=config.model_width,
         depth=3,
         seed=config.seed + 11,
         rff_features=config.rff_features,
         rff_scale=config.rff_scale,
     )
+    mode_model = build_mlp(
+        input_dim=point_feat_dim + global_dim,
+        output_dim=config.learned_rank,
+        width=config.model_width,
+        depth=3,
+        seed=config.seed + 17,
+        rff_features=config.rff_features,
+        rff_scale=config.rff_scale,
+    )
     pair_model = build_mlp(
-        input_dim=pair_feat_dim + global_dim,
+        input_dim=pair_feat_dim + density_feature_dim + global_dim,
         output_dim=2,
         width=config.model_width,
         depth=2,
@@ -119,9 +135,10 @@ def build_models(config: ExperimentConfig, point_feat_dim: int, pair_feat_dim: i
     )
 
     dummy_point = tf.zeros((2, point_feat_dim + global_dim), dtype=tf.float32)
-    dummy_pair = tf.zeros((2, pair_feat_dim + global_dim), dtype=tf.float32)
+    dummy_pair = tf.zeros((2, pair_feat_dim + density_feature_dim + global_dim), dtype=tf.float32)
     dummy_context = tf.zeros((1, global_dim), dtype=tf.float32)
     _ = point_model(dummy_point)
+    _ = mode_model(dummy_point)
     _ = pair_model(dummy_pair)
     _ = context_model(dummy_context)
 
@@ -129,17 +146,22 @@ def build_models(config: ExperimentConfig, point_feat_dim: int, pair_feat_dim: i
         "Model dimensions",
         [
             ("point input dim", point_feat_dim + global_dim),
-            ("pair input dim", pair_feat_dim + global_dim),
+            ("pair input dim", pair_feat_dim + density_feature_dim + global_dim),
             ("global dim", global_dim),
-            ("point output dim", 2 + config.learned_rank),
+            ("point density heads", n_density_heads),
+            ("pair density features", pair_density_feature_mode(config)),
+            ("pair density feature dim", density_feature_dim),
+            ("point output dim", n_density_heads),
             ("learned_rank", config.learned_rank),
             ("point params", point_model.count_params()),
+            ("mode params", mode_model.count_params()),
             ("pair params", pair_model.count_params()),
             ("context params", context_model.count_params()),
         ],
     )
     return ModelBundle(
         point_model=point_model,
+        mode_model=mode_model,
         pair_model=pair_model,
         context_model=context_model,
     )
@@ -152,7 +174,7 @@ def initialize_point_model_density_bias(point_model: tf.keras.Model, rho_mean: f
 
     weights = point_model.get_weights()
     last_bias = weights[-1].copy()
-    last_bias[0] = bias_value
+    last_bias[:] = bias_value
     weights[-1] = last_bias
     point_model.set_weights(weights)
 
@@ -179,6 +201,7 @@ def predict_from_features(
     eps: float = 1e-8,
     rho_r_override: tf.Tensor | None = None,
     rho_rp_override: tf.Tensor | None = None,
+    pair_density_feat_t: tf.Tensor | None = None,
 ) -> dict[str, tf.Tensor]:
     """feature array로부터 gamma / rho / kernel / diagnostics 계산.
 
@@ -194,20 +217,20 @@ def predict_from_features(
 
     point_input_r = tf.concat([point_feat_r_t, tiled_global], axis=1)             # (batch, d_point+d_global)
     point_input_rp = tf.concat([point_feat_rp_t, tiled_global], axis=1)           # (batch, d_point+d_global)
+    if pair_density_feat_t is not None:
+        pair_feat_t = tf.concat([pair_feat_t, pair_density_feat_t], axis=1)
     pair_input = tf.concat([pair_feat_t, tiled_global], axis=1)                   # (batch, d_pair+d_global)
 
-    point_out_r = models.point_model(point_input_r)                               # (batch, 2+rank)
-    point_out_rp = models.point_model(point_input_rp)                             # (batch, 2+rank)
+    point_out_r = models.point_model(point_input_r)                               # (batch, density heads)
+    point_out_rp = models.point_model(point_input_rp)                             # (batch, density heads)
+    raw_modes_r = models.mode_model(point_input_r)                                # (batch, rank)
+    raw_modes_rp = models.mode_model(point_input_rp)                              # (batch, rank)
     pair_out = models.pair_model(pair_input)                                      # (batch, 2)
 
     rho_raw_r = tf.nn.softplus(point_out_r[:, :1]) + 1e-6                         # (batch, 1)
     rho_raw_rp = tf.nn.softplus(point_out_rp[:, :1]) + 1e-6                       # (batch, 1)
     rho_r = rho_raw_r if rho_r_override is None else rho_r_override
     rho_rp = rho_raw_rp if rho_rp_override is None else rho_rp_override
-    kinetic_potential_r = point_out_r[:, 1:2]                                     # (batch, 1)
-    kinetic_potential_rp = point_out_rp[:, 1:2]                                   # (batch, 1)
-    raw_modes_r = point_out_r[:, 2:]                                              # (batch, rank)
-    raw_modes_rp = point_out_rp[:, 2:]                                            # (batch, rank)
 
     feat_r = tf.concat([tf.ones((batch_size, 1), dtype=tf.float32), raw_modes_r], axis=1)       # (batch, rank_total)
     feat_rp = tf.concat([tf.ones((batch_size, 1), dtype=tf.float32), raw_modes_rp], axis=1)     # (batch, rank_total)
@@ -236,8 +259,6 @@ def predict_from_features(
         "rho_rp": rho_rp,
         "rho_raw_r": rho_raw_r,
         "rho_raw_rp": rho_raw_rp,
-        "kinetic_potential_r": kinetic_potential_r,
-        "kinetic_potential_rp": kinetic_potential_rp,
         "kernel": kernel,
         "baseline_kernel": baseline_kernel,
         "residual_kernel": residual_kernel,

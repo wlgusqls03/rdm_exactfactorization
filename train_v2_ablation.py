@@ -562,6 +562,27 @@ def main() -> None:
             ("test pair loss", f"{summary.get('test', {}).get('pair_loss', float('nan')):.6e}"),
             ("val rho MAE", f"{summary.get('val', {}).get('rho_mae', float('nan')):.6e}"),
             ("val K loss", f"{summary.get('val', {}).get('kernel_loss', float('nan')):.6e}"),
+            ("val tau MAE", f"{summary.get('val', {}).get('tau_mae', float('nan')):.6e}"),
+            (
+                "val Ts stencil pred",
+                f"{summary.get('val', {}).get('kinetic_stencil_pred', float('nan')):.6e}",
+            ),
+            (
+                "val Ts stencil true",
+                f"{summary.get('val', {}).get('kinetic_stencil_true', float('nan')):.6e}",
+            ),
+            (
+                "val Ts stencil abs error",
+                f"{summary.get('val', {}).get('kinetic_stencil_abs_error', float('nan')):.6e}",
+            ),
+            (
+                "val Ts stencil rel error",
+                f"{summary.get('val', {}).get('kinetic_stencil_rel_error', float('nan')):.6e}",
+            ),
+            (
+                "test Ts stencil rel error",
+                f"{summary.get('test', {}).get('kinetic_stencil_rel_error', float('nan')):.6e}",
+            ),
             ("best epoch", summary.get("best", {}).get("epoch", "n/a")),
             (
                 "best val pair",

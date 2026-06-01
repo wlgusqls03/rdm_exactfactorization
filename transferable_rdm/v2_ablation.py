@@ -18,7 +18,7 @@ from .data import (
     sample_pair_indices,
 )
 from .model import RandomFourierFeatures
-from .systems import SystemRecord
+from .systems import SystemRecord, mixed_derivative_from_stencil
 from .utils import print_block
 
 
@@ -1118,10 +1118,13 @@ def evaluate_system(
     config: V2Config,
     rng: np.random.Generator,
     alpha: float | None = None,
+    include_stencil_kinetic: bool = False,
 ) -> dict[str, float]:
     batch = make_eval_batch(system, config, rng)
 
     rho_pred_np: np.ndarray
+    rho_pred = rho_diag_tensor(system)
+    modes_all: tf.Tensor | None = None
     gamma_pred_np: np.ndarray | None = None
     kernel_pred_np: np.ndarray | None = None
 
@@ -1184,6 +1187,104 @@ def evaluate_system(
         if gamma_pred_np is not None:
             metrics.update(highrho_kernel_metrics_np(batch, gamma_pred_np, config))
 
+    if include_stencil_kinetic:
+        metrics.update(stencil_kinetic_metrics(system, models, config, rho_pred, modes_all, alpha))
+    return metrics
+
+
+def predict_gamma_pairs(
+    system: SystemRecord,
+    models: V2Models,
+    config: V2Config,
+    left_idx: np.ndarray,
+    right_idx: np.ndarray,
+    rho_pred: tf.Tensor,
+    modes_all: tf.Tensor | None,
+    alpha: float | None,
+) -> np.ndarray | None:
+    if config.experiment == "rho-only":
+        return None
+    if config.experiment == "baseline":
+        return baseline_gamma(
+            system,
+            left_idx,
+            right_idx,
+            alpha=0.0 if alpha is None else alpha,
+            density_power=config.baseline_density_power,
+        )
+
+    batch: dict[str, object] = {
+        "left": left_idx.astype(np.int64),
+        "right": right_idx.astype(np.int64),
+    }
+    if not config.pair_features_on_device or pair_rho_source(config) == "true":
+        batch["pair_feat"] = build_v2_pair_features(system, left_idx, right_idx, config)
+    kernel = predict_kernel(system, batch, models, config, modes_all, rho_pred=rho_pred)
+    if config.experiment == "k-only":
+        rho_left = gather(rho_diag_tensor(system), left_idx)
+        rho_right = gather(rho_diag_tensor(system), right_idx)
+    else:
+        rho_left = gather(rho_pred, left_idx)
+        rho_right = gather(rho_pred, right_idx)
+    return gamma_from_rho_kernel(rho_left, rho_right, kernel).numpy().astype(np.float32)
+
+
+def stencil_kinetic_metrics(
+    system: SystemRecord,
+    models: V2Models,
+    config: V2Config,
+    rho_pred: tf.Tensor,
+    modes_all: tf.Tensor | None,
+    alpha: float | None,
+) -> dict[str, float]:
+    """Recover tau and its interior-grid integral from predicted near-diagonal gamma."""
+    nan = float("nan")
+    metrics = {
+        "tau_loss": nan,
+        "tau_mae": nan,
+        "kinetic_stencil_pred": nan,
+        "kinetic_stencil_true": nan,
+        "kinetic_stencil_abs_error": nan,
+        "kinetic_stencil_rel_error": nan,
+        "kinetic_energy_ref": float(system.metadata.get("kinetic_energy_hartree", nan)),
+        "kinetic_stencil_coverage": float(len(system.interior_idx) / max(len(system.points), 1)),
+    }
+    if config.experiment == "rho-only" or not len(system.interior_idx):
+        return metrics
+
+    stencil_shape = system.stencil_left.shape
+    left_idx = system.stencil_left.reshape(-1)
+    right_idx = system.stencil_right.reshape(-1)
+    gamma_pred = predict_gamma_pairs(system, models, config, left_idx, right_idx, rho_pred, modes_all, alpha)
+    if gamma_pred is None:
+        return metrics
+
+    gamma_stencil = gamma_pred.reshape(stencil_shape)
+    stencil_order = int(stencil_shape[2])
+    derivative_pred = np.stack(
+        [
+            mixed_derivative_from_stencil(gamma_stencil[:, dim, :], system.step, stencil_order)
+            for dim in range(3)
+        ],
+        axis=1,
+    )
+    tau_pred = 0.5 * np.sum(derivative_pred, axis=1, keepdims=True)
+    tau_true = np.asarray(system.tau_true, dtype=np.float32)
+    tau_err = tau_pred - tau_true
+    kinetic_pred = float(np.sum(tau_pred) * system.cell_volume)
+    kinetic_true = float(np.sum(tau_true) * system.cell_volume)
+    metrics.update(
+        {
+            "tau_loss": float(np.mean(tau_err**2)),
+            "tau_mae": float(np.mean(np.abs(tau_err))),
+            "kinetic_stencil_pred": kinetic_pred,
+            "kinetic_stencil_true": kinetic_true,
+            "kinetic_stencil_abs_error": float(abs(kinetic_pred - kinetic_true)),
+            "kinetic_stencil_rel_error": float(
+                abs(kinetic_pred - kinetic_true) / max(abs(kinetic_true), 1e-12)
+            ),
+        }
+    )
     return metrics
 
 
@@ -1205,12 +1306,20 @@ def evaluate_split(
     config: V2Config,
     alpha: float | None,
     seed_offset: int,
+    include_stencil_kinetic: bool = False,
 ) -> tuple[dict[str, float], list[dict[str, object]]]:
     rng = np.random.default_rng(config.seed + seed_offset)
     rows: list[dict[str, object]] = []
     metric_rows: list[dict[str, float]] = []
     for system in systems:
-        metrics = evaluate_system(system, models, config, rng, alpha=alpha)
+        metrics = evaluate_system(
+            system,
+            models,
+            config,
+            rng,
+            alpha=alpha,
+            include_stencil_kinetic=include_stencil_kinetic,
+        )
         metric_rows.append(metrics)
         rows.append(
             {
@@ -1289,9 +1398,15 @@ def train_v2(config: V2Config, split: DatasetSplit, point_dim: int, pair_dim: in
     if config.experiment == "baseline":
         alpha = fit_baseline_alpha(split, config)
         models = V2Models()
-        val_avg, val_rows = evaluate_split(split.val_systems, "val", models, config, alpha, seed_offset=701)
-        test_avg, test_rows = evaluate_split(split.test_systems, "test", models, config, alpha, seed_offset=801)
-        train_avg, train_rows = evaluate_split(split.train_systems, "train", models, config, alpha, seed_offset=601)
+        val_avg, val_rows = evaluate_split(
+            split.val_systems, "val", models, config, alpha, seed_offset=701, include_stencil_kinetic=True
+        )
+        test_avg, test_rows = evaluate_split(
+            split.test_systems, "test", models, config, alpha, seed_offset=801, include_stencil_kinetic=True
+        )
+        train_avg, train_rows = evaluate_split(
+            split.train_systems, "train", models, config, alpha, seed_offset=601, include_stencil_kinetic=True
+        )
         summary = {
             "config": asdict(config),
             "baseline_alpha": alpha,
@@ -1508,9 +1623,15 @@ def train_v2(config: V2Config, split: DatasetSplit, point_dim: int, pair_dim: in
         models.set_weights(best_weights)
         print(f"Restored best weights from epoch {best_summary.get('epoch', 'n/a')}.", flush=True)
 
-    train_avg, train_rows = evaluate_split(split.train_systems, "train", models, config, None, seed_offset=1001)
-    val_avg, val_rows = evaluate_split(split.val_systems, "val", models, config, None, seed_offset=1101)
-    test_avg, test_rows = evaluate_split(split.test_systems, "test", models, config, None, seed_offset=1201)
+    train_avg, train_rows = evaluate_split(
+        split.train_systems, "train", models, config, None, seed_offset=1001, include_stencil_kinetic=True
+    )
+    val_avg, val_rows = evaluate_split(
+        split.val_systems, "val", models, config, None, seed_offset=1101, include_stencil_kinetic=True
+    )
+    test_avg, test_rows = evaluate_split(
+        split.test_systems, "test", models, config, None, seed_offset=1201, include_stencil_kinetic=True
+    )
     summary = {
         "config": asdict(config),
         "best": best_summary,

@@ -6,6 +6,13 @@ import numpy as np
 import tensorflow as tf
 
 from .config import ExperimentConfig
+from .density_features import (
+    DensityFeatureState,
+    build_density_feature_state,
+    normalized_density_head,
+    pair_density_features,
+    pair_density_feature_mode,
+)
 from .data import (
     DatasetSplit,
     PairBatch,
@@ -21,7 +28,7 @@ from .systems import SystemRecord
 from .utils import print_block, topk_descending
 
 
-LOSS_NAMES = ("gamma", "rho", "kernel", "deriv", "tau", "trace", "occ", "mode", "kinetic", "kp")
+LOSS_NAMES = ("gamma", "rho", "kernel", "deriv", "tau", "trace", "occ", "mode", "kinetic")
 TRAIN_HISTORY_KEYS = (
     "pair_loss",
     "rho_loss",
@@ -32,7 +39,6 @@ TRAIN_HISTORY_KEYS = (
     "occ_penalty",
     "mode_reg",
     "kinetic_loss",
-    "kp_loss",
 )
 VAL_HISTORY_KEYS = (
     "pair_loss",
@@ -47,8 +53,6 @@ VAL_HISTORY_KEYS = (
     "tau_mae",
     "kinetic_loss",
     "kinetic_abs_error",
-    "kp_loss",
-    "kp_mae",
     "trace_loss",
     "trace_abs_rel_error",
     "occ_penalty",
@@ -66,7 +70,6 @@ TRAIN_OBJECTIVE_TERMS = (
     ("occ", "occ_penalty"),
     ("mode", "mode_reg"),
     ("kinetic", "kinetic_loss"),
-    ("kp", "kp_loss"),
 )
 EVAL_OBJECTIVE_TERMS = (
     ("gamma", "pair_loss"),
@@ -77,7 +80,6 @@ EVAL_OBJECTIVE_TERMS = (
     ("trace", "trace_loss"),
     ("occ", "occ_penalty"),
     ("kinetic", "kinetic_loss"),
-    ("kp", "kp_loss"),
 )
 
 
@@ -87,7 +89,6 @@ class TrainingHistory:
     val_objective: list[float] = field(default_factory=list)
     learning_rate: list[float] = field(default_factory=list)
     kinetic_weight: list[float] = field(default_factory=list)
-    kp_weight: list[float] = field(default_factory=list)
     validation_ran: list[int] = field(default_factory=list)
     loss_weights: dict[str, list[float]] = field(default_factory=lambda: {key: [] for key in LOSS_NAMES})
     train_components: dict[str, list[float]] = field(
@@ -96,6 +97,13 @@ class TrainingHistory:
     val_components: dict[str, list[float]] = field(
         default_factory=lambda: {key: [] for key in VAL_HISTORY_KEYS}
     )
+
+
+@dataclass
+class PointPretrainHistory:
+    train_loss: list[float] = field(default_factory=list)
+    val_loss: list[float] = field(default_factory=list)
+    learning_rate: list[float] = field(default_factory=list)
 
 
 def weighted_mse(y_true: tf.Tensor, y_pred: tf.Tensor, weights: tf.Tensor) -> tf.Tensor:
@@ -114,27 +122,170 @@ def point_model_outputs(system: SystemRecord, models: ModelBundle) -> tf.Tensor:
     return models.point_model(point_input)
 
 
-def density_from_point_output(system: SystemRecord, point_out: tf.Tensor, config: ExperimentConfig) -> tf.Tensor:
-    """Predict rho on the full grid, optionally enforcing integral rho = N."""
-    rho_raw = tf.nn.softplus(point_out[:, :1]) + 1e-6
-    if not config.normalize_rho:
-        return rho_raw
-    normalizer = tf.reduce_sum(rho_raw) * system.cell_volume
-    scale = system.electron_count / tf.maximum(normalizer, 1e-12)
-    return rho_raw * scale
-
-
-def point_output_and_density(
+def point_output_and_state(
     system: SystemRecord,
     models: ModelBundle,
     config: ExperimentConfig,
-) -> tuple[tf.Tensor, tf.Tensor]:
+) -> tuple[tf.Tensor, DensityFeatureState]:
     point_out = point_model_outputs(system, models)
-    return point_out, density_from_point_output(system, point_out, config)
+    return point_out, build_density_feature_state(system, point_out, config)
+def point_density_predictions(
+    system: SystemRecord,
+    models: ModelBundle,
+    config: ExperimentConfig,
+) -> dict[str, tf.Tensor]:
+    point_out = point_model_outputs(system, models)
+    predictions = {
+        "rho_neutral": normalized_density_head(
+            system, point_out[:, 0:1], system.electron_count, normalize=config.normalize_rho
+        ),
+    }
+    if pair_density_feature_mode(config) == "fukui":
+        if system.rho_cation is None or system.rho_anion is None:
+            raise ValueError(
+                f"System {system.system_id} has no charged density oracle channels. "
+                "Rebuild NPZ files with --include-charged-density-oracles."
+            )
+        predictions["rho_cation"] = normalized_density_head(
+            system, point_out[:, 1:2], max(system.electron_count - 1.0, 1e-6), normalize=config.normalize_rho
+        )
+        predictions["rho_anion"] = normalized_density_head(
+            system, point_out[:, 2:3], system.electron_count + 1.0, normalize=config.normalize_rho
+        )
+        predictions["fukui_plus"] = predictions["rho_anion"] - predictions["rho_neutral"]
+        predictions["fukui_minus"] = predictions["rho_neutral"] - predictions["rho_cation"]
+    return predictions
 
 
-def normalized_density(system: SystemRecord, models: ModelBundle, config: ExperimentConfig) -> tf.Tensor:
-    return point_output_and_density(system, models, config)[1]
+def scaled_field_mse(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
+    scale = tf.maximum(tf.reduce_mean(tf.abs(y_true)), 1e-8)
+    return tf.reduce_mean(tf.square((y_pred - y_true) / scale))
+
+
+def point_pretrain_loss(system: SystemRecord, models: ModelBundle, config: ExperimentConfig) -> tf.Tensor:
+    pred = point_density_predictions(system, models, config)
+    loss = scaled_field_mse(to_tensor(system.rho_diag), pred["rho_neutral"])
+    if pair_density_feature_mode(config) == "fukui":
+        true_cation = to_tensor(system.rho_cation)
+        true_anion = to_tensor(system.rho_anion)
+        loss += 0.5 * scaled_field_mse(true_cation, pred["rho_cation"])
+        loss += 0.5 * scaled_field_mse(true_anion, pred["rho_anion"])
+        loss += config.point_fukui_weight * 0.5 * scaled_field_mse(true_anion - to_tensor(system.rho_diag), pred["fukui_plus"])
+        loss += config.point_fukui_weight * 0.5 * scaled_field_mse(to_tensor(system.rho_diag) - true_cation, pred["fukui_minus"])
+    return loss
+
+
+def evaluate_point_model(
+    systems: list[SystemRecord],
+    models: ModelBundle,
+    config: ExperimentConfig,
+    *,
+    keep_arrays: bool = False,
+) -> dict[str, object]:
+    per_system = []
+    for idx, system in enumerate(systems):
+        pred = point_density_predictions(system, models, config)
+        entry: dict[str, object] = {
+            "system_id": system.system_id,
+            "rho_neutral_mae": float(np.mean(np.abs(pred["rho_neutral"].numpy() - system.rho_diag))),
+        }
+        if pair_density_feature_mode(config) == "fukui":
+            fukui_plus_true = system.rho_anion - system.rho_diag
+            fukui_minus_true = system.rho_diag - system.rho_cation
+            entry.update(
+                {
+                    "rho_cation_mae": float(np.mean(np.abs(pred["rho_cation"].numpy() - system.rho_cation))),
+                    "rho_anion_mae": float(np.mean(np.abs(pred["rho_anion"].numpy() - system.rho_anion))),
+                    "fukui_plus_mae": float(np.mean(np.abs(pred["fukui_plus"].numpy() - fukui_plus_true))),
+                    "fukui_minus_mae": float(np.mean(np.abs(pred["fukui_minus"].numpy() - fukui_minus_true))),
+                }
+            )
+        if keep_arrays and idx == 0:
+            entry["rho_neutral_true"] = system.rho_diag
+            entry["rho_neutral_pred"] = pred["rho_neutral"].numpy()
+            if pair_density_feature_mode(config) == "fukui":
+                entry["fukui_plus_true"] = system.rho_anion - system.rho_diag
+                entry["fukui_plus_pred"] = pred["fukui_plus"].numpy()
+                entry["fukui_minus_true"] = system.rho_diag - system.rho_cation
+                entry["fukui_minus_pred"] = pred["fukui_minus"].numpy()
+        per_system.append(entry)
+    scalar_keys = [key for key in per_system[0] if key.endswith("_mae")]
+    summary = {key: float(np.mean([entry[key] for entry in per_system])) for key in scalar_keys}
+    summary["per_system"] = per_system
+    return summary
+
+
+def pretrain_point_model(
+    config: ExperimentConfig,
+    split: DatasetSplit,
+    models: ModelBundle,
+) -> tuple[PointPretrainHistory, dict[str, object]]:
+    """Fit density heads first, restore the best validation weights, then freeze them."""
+    optimizer = tf.keras.optimizers.Adam(learning_rate=config.point_pretrain_lr)
+    history = PointPretrainHistory()
+    rng = np.random.default_rng(config.seed + 71)
+    best_val = np.inf
+    best_weights = None
+    stale_epochs = 0
+    print_block(
+        "Point density pretrain",
+        [
+            ("pair density feature mode", pair_density_feature_mode(config)),
+            ("epochs", config.point_pretrain_epochs),
+            ("steps/epoch", config.point_pretrain_steps_per_epoch),
+            ("freeze after pretrain", config.freeze_point_after_pretrain),
+        ],
+    )
+    for epoch in range(config.point_pretrain_epochs):
+        running = 0.0
+        for _ in range(config.point_pretrain_steps_per_epoch):
+            system = choose_system(split.train_systems, rng)
+            with tf.GradientTape() as tape:
+                loss = point_pretrain_loss(system, models, config)
+            grads = tape.gradient(loss, models.point_model.trainable_variables)
+            grads_and_vars = [(grad, var) for grad, var in zip(grads, models.point_model.trainable_variables) if grad is not None]
+            optimizer.apply_gradients(grads_and_vars)
+            running += float(loss.numpy())
+        train_loss = running / max(config.point_pretrain_steps_per_epoch, 1)
+        history.train_loss.append(train_loss)
+        history.learning_rate.append(float(optimizer.learning_rate.numpy()))
+        validation_ran = epoch % max(config.point_pretrain_val_every, 1) == 0 or epoch == config.point_pretrain_epochs - 1
+        if validation_ran:
+            val_losses = [float(point_pretrain_loss(system, models, config).numpy()) for system in split.val_systems]
+            val_loss = float(np.mean(val_losses))
+            if val_loss < best_val - 1e-9:
+                best_val = val_loss
+                best_weights = models.point_model.get_weights()
+                stale_epochs = 0
+            else:
+                stale_epochs += max(config.point_pretrain_val_every, 1)
+        else:
+            val_loss = history.val_loss[-1] if history.val_loss else float("nan")
+        history.val_loss.append(val_loss)
+        if epoch % max(config.log_every, 1) == 0 or epoch == config.point_pretrain_epochs - 1:
+            print(f"Point epoch {epoch:4d} | train={train_loss:.6e} val={val_loss:.6e}")
+        if stale_epochs >= config.point_pretrain_patience:
+            print(f"Point pretrain early stopping at epoch {epoch}.")
+            break
+    if best_weights is not None:
+        models.point_model.set_weights(best_weights)
+    models.point_model.trainable = not config.freeze_point_after_pretrain
+    summary = {
+        "train": evaluate_point_model(split.train_systems, models, config),
+        "val": evaluate_point_model(split.val_systems, models, config, keep_arrays=True),
+    }
+    if split.test_systems:
+        summary["test"] = evaluate_point_model(split.test_systems, models, config)
+    print_block(
+        "Point density pretrain summary",
+        [
+            ("val rho_N MAE", f"{summary['val']['rho_neutral_mae']:.6e}"),
+            ("val Fukui+ MAE", f"{summary['val'].get('fukui_plus_mae', float('nan')):.6e}"),
+            ("val Fukui- MAE", f"{summary['val'].get('fukui_minus_mae', float('nan')):.6e}"),
+            ("point trainable in pair stage", models.point_model.trainable),
+        ],
+    )
+    return history, summary
 
 
 def kinetic_energy_reference(system: SystemRecord) -> float:
@@ -152,67 +303,6 @@ def kinetic_energy_loss_from_tau(system: SystemRecord, tau_pred: tf.Tensor) -> t
     return loss, kinetic_pred, kinetic_ref
 
 
-def kinetic_potential_loss(
-    system: SystemRecord,
-    models: ModelBundle,
-    rho_all: tf.Tensor | None = None,
-    point_out: tf.Tensor | None = None,
-) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
-    """Density-weighted MSE for centered kinetic potential head."""
-    target_np = np.asarray(system.kinetic_potential_centered, dtype=np.float32)
-    finite_mask_np = np.isfinite(target_np).astype(np.float32)
-    if not np.any(finite_mask_np):
-        zero = tf.constant(0.0, dtype=tf.float32)
-        return zero, zero, zero
-
-    if point_out is None:
-        point_out = point_model_outputs(system, models)
-    if rho_all is None:
-        # KP loss should not decide the normalization path; rho only supplies weights.
-        rho_all = tf.nn.softplus(point_out[:, :1]) + 1e-6
-    kp_pred = point_out[:, 1:2]
-    target = to_tensor(target_np)
-    mask = to_tensor(finite_mask_np)
-
-    rho_weight = tf.stop_gradient(tf.maximum(rho_all, 0.0)) * mask
-    norm = tf.reduce_sum(rho_weight) * system.cell_volume
-    norm = tf.maximum(norm, 1e-12)
-
-    pred_center = kp_pred - tf.reduce_sum(rho_weight * kp_pred) * system.cell_volume / norm
-    target_center = target - tf.reduce_sum(rho_weight * target) * system.cell_volume / norm
-    diff = pred_center - target_center
-    target_rms = tf.sqrt(tf.reduce_sum(rho_weight * tf.square(target_center)) * system.cell_volume / norm)
-    scale = tf.maximum(target_rms, 1e-3)
-    mse = tf.reduce_sum(rho_weight * tf.square(diff)) * system.cell_volume / norm
-    mae = tf.reduce_sum(rho_weight * tf.abs(diff)) * system.cell_volume / norm
-    return mse / tf.square(scale), mae, scale
-
-
-def kinetic_potential_centered_arrays(
-    system: SystemRecord,
-    models: ModelBundle,
-    rho_all: tf.Tensor | None = None,
-    point_out: tf.Tensor | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    target_np = np.asarray(system.kinetic_potential_centered, dtype=np.float32)
-    finite_mask_np = np.isfinite(target_np).astype(np.float32)
-    if not np.any(finite_mask_np):
-        nan_values = np.full((len(system.points), 1), np.nan, dtype=np.float32)
-        return nan_values, nan_values
-    if point_out is None:
-        point_out = point_model_outputs(system, models)
-    if rho_all is None:
-        rho_all = tf.nn.softplus(point_out[:, :1]) + 1e-6
-    kp_pred = point_out[:, 1:2]
-    target = to_tensor(target_np)
-    mask = to_tensor(finite_mask_np)
-    rho_weight = tf.stop_gradient(tf.maximum(rho_all, 0.0)) * mask
-    norm = tf.maximum(tf.reduce_sum(rho_weight) * system.cell_volume, 1e-12)
-    pred_center = kp_pred - tf.reduce_sum(rho_weight * kp_pred) * system.cell_volume / norm
-    target_center = target - tf.reduce_sum(rho_weight * target) * system.cell_volume / norm
-    return target_center.numpy().astype(np.float32), pred_center.numpy().astype(np.float32)
-
-
 def gather_density(rho_all: tf.Tensor, indices: np.ndarray) -> tf.Tensor:
     return tf.gather(rho_all, tf.convert_to_tensor(indices, dtype=tf.int64))
 
@@ -222,10 +312,13 @@ def diagonal_predictions(
     models: ModelBundle,
     config: ExperimentConfig,
     rho_all: tf.Tensor | None = None,
+    density_state: DensityFeatureState | None = None,
 ) -> dict[str, tf.Tensor]:
     """r = r' diagonal prediction."""
+    if density_state is None:
+        _, density_state = point_output_and_state(system, models, config)
     if rho_all is None:
-        rho_all = normalized_density(system, models, config)
+        rho_all = density_state.rho_neutral
     diag_idx = np.arange(len(system.points), dtype=np.int64)
     pair_feat = build_pair_features(system, diag_idx, diag_idx)
     rho_diag = gather_density(rho_all, diag_idx)
@@ -237,6 +330,7 @@ def diagonal_predictions(
         models,
         rho_r_override=rho_diag,
         rho_rp_override=rho_diag,
+        pair_density_feat_t=pair_density_features(system, density_state, diag_idx, diag_idx, config),
     )
     return outputs
 
@@ -246,6 +340,7 @@ def stencil_predictions(
     models: ModelBundle,
     config: ExperimentConfig,
     rho_all: tf.Tensor | None = None,
+    density_state: DensityFeatureState | None = None,
 ) -> tuple[tf.Tensor, tf.Tensor]:
     """explicit near-diagonal mixed derivative prediction.
 
@@ -254,8 +349,10 @@ def stencil_predictions(
     derivative_pred : (n_interior, 3)
     tau_pred        : (n_interior, 1)
     """
+    if density_state is None:
+        _, density_state = point_output_and_state(system, models, config)
     if rho_all is None:
-        rho_all = normalized_density(system, models, config)
+        rho_all = density_state.rho_neutral
     per_dim = []
     stencil_order = int(system.stencil_left.shape[2])
     for dim in range(3):
@@ -274,6 +371,7 @@ def stencil_predictions(
                 models,
                 rho_r_override=gather_density(rho_all, left_idx),
                 rho_rp_override=gather_density(rho_all, right_idx),
+                pair_density_feat_t=pair_density_features(system, density_state, left_idx, right_idx, config),
             )
             gamma_terms.append(outputs["gamma"])
 
@@ -299,10 +397,13 @@ def spectral_occupation_penalty(
     models: ModelBundle,
     config: ExperimentConfig,
     rho_all: tf.Tensor | None = None,
+    density_state: DensityFeatureState | None = None,
 ) -> tuple[tf.Tensor, tf.Tensor]:
     """coarse operator spectrum이 물리 범위를 벗어나지 않게 벌점."""
+    if density_state is None:
+        _, density_state = point_output_and_state(system, models, config)
     if rho_all is None:
-        rho_all = normalized_density(system, models, config)
+        rho_all = density_state.rho_neutral
     subset = system.spectral_subset
     left = np.repeat(subset, len(subset))
     right = np.tile(subset, len(subset))
@@ -314,6 +415,7 @@ def spectral_occupation_penalty(
         models,
         rho_r_override=gather_density(rho_all, left),
         rho_rp_override=gather_density(rho_all, right),
+        pair_density_feat_t=pair_density_features(system, density_state, left, right, config),
     )
     n_spec = len(subset)
     gamma_sub = tf.reshape(outputs["gamma"], (n_spec, n_spec))
@@ -337,6 +439,7 @@ def optimizer_from_config(config: ExperimentConfig) -> tf.keras.optimizers.Optim
 def trainable_variables(models: ModelBundle) -> list[tf.Variable]:
     return (
         models.point_model.trainable_variables
+        + models.mode_model.trainable_variables
         + models.pair_model.trainable_variables
         + models.context_model.trainable_variables
     )
@@ -347,7 +450,7 @@ def loss_enabled(config: ExperimentConfig, name: str) -> bool:
     if preset in {"core5", "simple5"}:
         return name in {"gamma", "rho", "kernel", "trace", "mode"}
     if preset in {"core7", "kerdf7"}:
-        return name in {"gamma", "rho", "kernel", "trace", "mode", "kinetic", "kp"}
+        return name in {"gamma", "rho", "kernel", "trace", "mode", "kinetic"}
     if preset in {"all", "custom", "none"}:
         return bool(getattr(config, f"use_{name}_loss"))
     raise ValueError(f"Unknown RDM_LOSS_PRESET: {config.loss_preset}")
@@ -361,10 +464,7 @@ def loss_weight(config: ExperimentConfig, name: str) -> float:
 
 def loss_schedule_multiplier(config: ExperimentConfig, name: str, epoch: int) -> float:
     """Epoch-dependent multiplier for staged loss terms."""
-    if name == "kp":
-        start_epoch = max(int(config.kp_start_epoch), 0)
-        ramp_epochs = max(int(config.kp_ramp_epochs), 0)
-    elif name == "kinetic":
+    if name == "kinetic":
         start_epoch = max(int(config.kinetic_start_epoch), 0)
         ramp_epochs = max(int(config.kinetic_ramp_epochs), 0)
     else:
@@ -390,7 +490,6 @@ def loss_weight_rows(config: ExperimentConfig, epoch: int | None = None) -> list
 
 def loss_schedule_rows(config: ExperimentConfig) -> list[tuple[str, str]]:
     return [
-        ("kp start/ramp epochs", f"{config.kp_start_epoch}/{config.kp_ramp_epochs}"),
         ("kinetic start/ramp epochs", f"{config.kinetic_start_epoch}/{config.kinetic_ramp_epochs}"),
     ]
 
@@ -404,7 +503,7 @@ def loss_stage_value(config: ExperimentConfig, name: str, epoch: int) -> int:
     """0: inactive, 1: scheduled ramp, 2: fully active."""
     if scheduled_loss_weight(config, name, epoch) == 0.0:
         return 0
-    if name in {"kinetic", "kp"} and loss_schedule_multiplier(config, name, epoch) < 1.0:
+    if name == "kinetic" and loss_schedule_multiplier(config, name, epoch) < 1.0:
         return 1
     return 2
 
@@ -428,7 +527,8 @@ def predict_full_gamma_matrix(
 ) -> np.ndarray:
     """full grid gamma matrix prediction."""
     pieces = []
-    point_out_all, rho_all = point_output_and_density(system, models, config)
+    _, density_state = point_output_and_state(system, models, config)
+    rho_all = density_state.rho_neutral
     for left, right in full_pair_chunks(system, chunk_size):
         outputs = predict_from_features(
             to_tensor(system.local_features[left]),
@@ -438,6 +538,7 @@ def predict_full_gamma_matrix(
             models,
             rho_r_override=gather_density(rho_all, left),
             rho_rp_override=gather_density(rho_all, right),
+            pair_density_feat_t=pair_density_features(system, density_state, left, right, config),
         )
         pieces.append(outputs["gamma"].numpy())
     gamma_pairs = np.concatenate(pieces, axis=0).astype(np.float32)
@@ -457,9 +558,12 @@ def predict_pair_values(
     left: np.ndarray,
     right: np.ndarray,
     rho_all: tf.Tensor | None = None,
+    density_state: DensityFeatureState | None = None,
 ) -> np.ndarray:
+    if density_state is None:
+        _, density_state = point_output_and_state(system, models, config)
     if rho_all is None:
-        rho_all = normalized_density(system, models, config)
+        rho_all = density_state.rho_neutral
     outputs = predict_from_features(
         to_tensor(system.local_features[left]),
         to_tensor(system.local_features[right]),
@@ -468,6 +572,7 @@ def predict_pair_values(
         models,
         rho_r_override=gather_density(rho_all, left),
         rho_rp_override=gather_density(rho_all, right),
+        pair_density_feat_t=pair_density_features(system, density_state, left, right, config),
     )
     return outputs["gamma"].numpy().astype(np.float32)
 
@@ -496,22 +601,28 @@ def evaluate_system(
         rng=rng,
     )
     gamma_true_pairs = system.gamma_values(left, right)
-    point_out_all, rho_all = point_output_and_density(system, models, config)
-    gamma_pred_pairs = predict_pair_values(system, models, config, left, right, rho_all=rho_all)
+    _, density_state = point_output_and_state(system, models, config)
+    rho_all = density_state.rho_neutral
+    gamma_pred_pairs = predict_pair_values(
+        system, models, config, left, right, rho_all=rho_all, density_state=density_state
+    )
     pair_weights = pair_weights_from_categories(categories)
 
     pair_loss = float(np.sum(pair_weights * (gamma_pred_pairs - gamma_true_pairs) ** 2) / np.sum(pair_weights))
     pair_mae = float(np.mean(np.abs(gamma_pred_pairs - gamma_true_pairs)))
 
-    diag_outputs = diagonal_predictions(system, models, config, rho_all=rho_all)
+    diag_outputs = diagonal_predictions(system, models, config, rho_all=rho_all, density_state=density_state)
     gamma_diag = diag_outputs["gamma"].numpy()
     kernel_diag = diag_outputs["kernel"].numpy()
     rho_loss = float(np.mean((gamma_diag - system.rho_diag) ** 2))
     density_mae = float(np.mean(np.abs(gamma_diag - system.rho_diag)))
+    rho_point_mae = float(np.mean(np.abs(rho_all.numpy() - system.rho_diag)))
     kernel_loss = float(np.mean((kernel_diag - 1.0) ** 2))
     kernel_diag_error = float(np.mean(np.abs(kernel_diag - 1.0)))
 
-    derivative_pred_t, tau_pred_t = stencil_predictions(system, models, config, rho_all=rho_all)
+    derivative_pred_t, tau_pred_t = stencil_predictions(
+        system, models, config, rho_all=rho_all, density_state=density_state
+    )
     derivative_pred = derivative_pred_t.numpy()
     tau_pred = tau_pred_t.numpy()
     deriv_loss = float(np.mean((derivative_pred - system.derivative_true) ** 2))
@@ -524,22 +635,6 @@ def evaluate_system(
     kinetic_ref_error = float(kinetic_pred - kinetic_ref)
     kinetic_energy_ref = float(system.metadata.get("kinetic_energy_hartree", np.nan))
     kinetic_energy_ref_error = float(kinetic_pred - kinetic_energy_ref) if np.isfinite(kinetic_energy_ref) else float("nan")
-    kp_loss_t, kp_mae_t, kp_scale_t = kinetic_potential_loss(
-        system,
-        models,
-        rho_all=rho_all,
-        point_out=point_out_all,
-    )
-    kp_loss = float(kp_loss_t.numpy())
-    kp_mae = float(kp_mae_t.numpy())
-    kp_scale = float(kp_scale_t.numpy())
-    kp_true_centered, kp_pred_centered = kinetic_potential_centered_arrays(
-        system,
-        models,
-        rho_all=rho_all,
-        point_out=point_out_all,
-    )
-
     trace_pred = float(np.sum(gamma_diag) * system.cell_volume)
     trace_true = float(system.electron_count)
     trace_scale = max(trace_true, 1.0)
@@ -551,13 +646,17 @@ def evaluate_system(
     near_diag_mae = float(np.mean(np.abs(gamma_pred_pairs[near_mask] - gamma_true_pairs[near_mask]))) if np.any(near_mask) else float("nan")
     far_offdiag_mae = float(np.mean(np.abs(gamma_pred_pairs[far_mask] - gamma_true_pairs[far_mask]))) if np.any(far_mask) else float("nan")
 
-    gamma_pred_reverse = predict_pair_values(system, models, config, right, left, rho_all=rho_all)
+    gamma_pred_reverse = predict_pair_values(
+        system, models, config, right, left, rho_all=rho_all, density_state=density_state
+    )
     symmetry_mae = float(np.mean(np.abs(gamma_pred_pairs - gamma_pred_reverse)))
 
     subset = system.spectral_subset
     gamma_true_sub = system.gamma_submatrix(subset)
     subset_eigs_true = natural_occupation_spectrum(gamma_true_sub, system.cell_volume)
-    occ_penalty_t, occ_eigs_t = spectral_occupation_penalty(system, models, config, rho_all=rho_all)
+    occ_penalty_t, occ_eigs_t = spectral_occupation_penalty(
+        system, models, config, rho_all=rho_all, density_state=density_state
+    )
     occ_penalty = float(occ_penalty_t.numpy())
     subset_eigs_pred = np.sort(occ_eigs_t.numpy())[::-1]
     min_eig_pred = float(np.min(occ_eigs_t.numpy()))
@@ -576,6 +675,7 @@ def evaluate_system(
         "pair_mae": pair_mae,
         "rho_loss": rho_loss,
         "density_mae": density_mae,
+        "rho_point_mae": rho_point_mae,
         "kernel_loss": kernel_loss,
         "kernel_diag_error": kernel_diag_error,
         "deriv_loss": deriv_loss,
@@ -587,9 +687,6 @@ def evaluate_system(
         "kinetic_training_ref": kinetic_ref,
         "kinetic_ref_error": kinetic_ref_error,
         "kinetic_abs_error": abs(kinetic_ref_error),
-        "kp_loss": kp_loss,
-        "kp_mae": kp_mae,
-        "kp_scale": kp_scale,
         "trace_loss": trace_loss,
         "trace_rel_error": trace_rel_error,
         "trace_abs_rel_error": abs(trace_rel_error),
@@ -617,17 +714,23 @@ def evaluate_system(
         "ked_pred_integral": tau_pred_integral,
         "kinetic_energy_ref": kinetic_energy_ref,
         "kinetic_energy_ref_error": kinetic_energy_ref_error,
-        "kinetic_potential_reference": str(system.metadata.get("kinetic_potential_reference", "")),
         "rho_true_diag": system.rho_diag,
-        "rho_pred_diag": gamma_diag,
+        "rho_pred_diag": rho_all.numpy(),
         "tau_true": system.tau_true,
         "tau_pred": tau_pred,
-        "kp_true_centered": kp_true_centered,
-        "kp_pred_centered": kp_pred_centered,
         "gamma_true_sample": gamma_true_pairs,
         "gamma_pred_sample": gamma_pred_pairs,
         "occ_eigs_subset": occ_eigs_t.numpy(),
     }
+    if density_state.rho_cation is not None and density_state.rho_anion is not None:
+        metrics["rho_cation_mae"] = float(np.mean(np.abs(density_state.rho_cation.numpy() - system.rho_cation)))
+        metrics["rho_anion_mae"] = float(np.mean(np.abs(density_state.rho_anion.numpy() - system.rho_anion)))
+        metrics["fukui_plus_mae"] = float(
+            np.mean(np.abs((density_state.rho_anion - density_state.rho_neutral).numpy() - (system.rho_anion - system.rho_diag)))
+        )
+        metrics["fukui_minus_mae"] = float(
+            np.mean(np.abs((density_state.rho_neutral - density_state.rho_cation).numpy() - (system.rho_diag - system.rho_cation)))
+        )
     if keep_arrays and len(system.points) <= config.full_eval_max_points:
         gamma_pred_matrix = predict_full_gamma_matrix(system, models, config)
         metrics["gamma_pred_matrix"] = gamma_pred_matrix
@@ -655,6 +758,7 @@ def evaluate_systems(
         "pair_mae",
         "rho_loss",
         "density_mae",
+        "rho_point_mae",
         "kernel_loss",
         "kernel_diag_error",
         "deriv_loss",
@@ -666,9 +770,6 @@ def evaluate_systems(
         "kinetic_training_ref",
         "kinetic_ref_error",
         "kinetic_abs_error",
-        "kp_loss",
-        "kp_mae",
-        "kp_scale",
         "trace_loss",
         "trace_rel_error",
         "trace_abs_rel_error",
@@ -683,6 +784,11 @@ def evaluate_systems(
         "near_diag_mae",
         "far_offdiag_mae",
     ]
+    scalar_keys.extend(
+        key
+        for key in ("rho_cation_mae", "rho_anion_mae", "fukui_plus_mae", "fukui_minus_mae")
+        if key in per_system[0]
+    )
     averages = {}
     for key in scalar_keys:
         values = np.asarray([entry[key] for entry in per_system], dtype=np.float64)
@@ -710,7 +816,8 @@ def compute_training_losses(
     weights: dict[str, float],
 ) -> dict[str, tf.Tensor]:
     """Compute all train-step losses, skipping expensive inactive terms."""
-    point_out_all, rho_all = point_output_and_density(system, models, config)
+    _, density_state = point_output_and_state(system, models, config)
+    rho_all = density_state.rho_neutral
     pair_outputs = predict_from_features(
         to_tensor(batch.point_feat_r),
         to_tensor(batch.point_feat_rp),
@@ -719,17 +826,20 @@ def compute_training_losses(
         models,
         rho_r_override=gather_density(rho_all, batch.left_idx),
         rho_rp_override=gather_density(rho_all, batch.right_idx),
+        pair_density_feat_t=pair_density_features(system, density_state, batch.left_idx, batch.right_idx, config),
     )
     pair_loss = weighted_mse(to_tensor(batch.gamma_true), pair_outputs["gamma"], to_tensor(batch.weights))
 
-    diag_outputs = diagonal_predictions(system, models, config, rho_all=rho_all)
+    diag_outputs = diagonal_predictions(system, models, config, rho_all=rho_all, density_state=density_state)
     gamma_diag = diag_outputs["gamma"]
     rho_loss = tf.reduce_mean(tf.square(gamma_diag - to_tensor(system.rho_diag)))
     kernel_loss = tf.reduce_mean(tf.square(diag_outputs["kernel"] - 1.0))
 
     zero = tf.constant(0.0, dtype=tf.float32)
     if weights["deriv"] != 0.0 or weights["tau"] != 0.0 or weights["kinetic"] != 0.0:
-        derivative_pred, tau_pred = stencil_predictions(system, models, config, rho_all=rho_all)
+        derivative_pred, tau_pred = stencil_predictions(
+            system, models, config, rho_all=rho_all, density_state=density_state
+        )
         deriv_loss = tf.reduce_mean(tf.square(derivative_pred - to_tensor(system.derivative_true)))
         tau_loss = tf.reduce_mean(tf.square(tau_pred - to_tensor(system.tau_true)))
         kinetic_loss, _, _ = kinetic_energy_loss_from_tau(system, tau_pred)
@@ -743,16 +853,12 @@ def compute_training_losses(
     trace_loss = tf.square((trace_pred - system.electron_count) / trace_scale)
 
     if weights["occ"] != 0.0:
-        occ_penalty, _ = spectral_occupation_penalty(system, models, config, rho_all=rho_all)
+        occ_penalty, _ = spectral_occupation_penalty(
+            system, models, config, rho_all=rho_all, density_state=density_state
+        )
     else:
         occ_penalty = zero
     mode_reg = tf.reduce_mean(pair_outputs["mode_weights"]) if weights["mode"] != 0.0 else zero
-    kp_loss = (
-        kinetic_potential_loss(system, models, rho_all=rho_all, point_out=point_out_all)[0]
-        if weights["kp"] != 0.0
-        else zero
-    )
-
     return {
         "pair_loss": pair_loss,
         "rho_loss": rho_loss,
@@ -763,7 +869,6 @@ def compute_training_losses(
         "occ_penalty": occ_penalty,
         "mode_reg": mode_reg,
         "kinetic_loss": kinetic_loss,
-        "kp_loss": kp_loss,
     }
 
 
@@ -824,7 +929,6 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
         history.train_objective.append(train_objective)
         history.learning_rate.append(float(optimizer.learning_rate.numpy()))
         history.kinetic_weight.append(weights["kinetic"])
-        history.kp_weight.append(weights["kp"])
         history.validation_ran.append(0)
         for key in LOSS_NAMES:
             history.loss_weights[key].append(weights[key])
@@ -851,6 +955,7 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
                 best_val_objective = val_objective
                 best_weights = {
                     "point": models.point_model.get_weights(),
+                    "mode": models.mode_model.get_weights(),
                     "pair": models.pair_model.get_weights(),
                     "context": models.context_model.get_weights(),
                 }
@@ -879,8 +984,7 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
                 f"train obj = {train_objective:.6e} | "
                 f"val obj = {val_objective:.6e} | "
                 f"lr = {float(optimizer.learning_rate.numpy()):.3e} | "
-                f"w(T)={weights['kinetic']:.3g} "
-                f"w(KP)={weights['kp']:.3g}"
+                f"w(T)={weights['kinetic']:.3g}"
             )
             if val_metrics:
                 print(
@@ -895,7 +999,6 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
                     + f"held-out loss pair={val_metrics['pair_loss']:.3e} "
                     + f"rho={val_metrics['rho_loss']:.3e} "
                     + f"T={val_metrics['kinetic_loss']:.3e} "
-                    + f"KP={val_metrics['kp_loss']:.3e} "
                     + f"deriv={val_metrics['deriv_loss']:.3e} "
                     + f"tau={val_metrics['tau_loss']:.3e} "
                     + f"trace_rel={val_metrics['trace_abs_rel_error']:.3e} "
@@ -908,6 +1011,7 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
 
     if best_weights is not None:
         models.point_model.set_weights(best_weights["point"])
+        models.mode_model.set_weights(best_weights["mode"])
         models.pair_model.set_weights(best_weights["pair"])
         models.context_model.set_weights(best_weights["context"])
 
@@ -924,8 +1028,6 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
         ("held-out density MAE", f"{final_val['density_mae']:.6e}"),
         ("held-out kinetic loss", f"{final_val['kinetic_loss']:.6e}"),
         ("held-out kinetic abs err", f"{final_val['kinetic_abs_error']:.6e}"),
-        ("held-out KP loss", f"{final_val['kp_loss']:.6e}"),
-        ("held-out KP MAE", f"{final_val['kp_mae']:.6e}"),
         ("held-out trace rel err", f"{final_val['trace_abs_rel_error']:.6e}"),
         ("held-out tau MAE", f"{final_val['tau_mae']:.6e}"),
         ("held-out symmetry MAE", f"{final_val['symmetry_mae']:.6e}"),
@@ -940,7 +1042,6 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
                 ("test density MAE", f"{final_test['density_mae']:.6e}"),
                 ("test kinetic loss", f"{final_test['kinetic_loss']:.6e}"),
                 ("test kinetic abs err", f"{final_test['kinetic_abs_error']:.6e}"),
-                ("test KP loss", f"{final_test['kp_loss']:.6e}"),
                 ("test tau MAE", f"{final_test['tau_mae']:.6e}"),
             ]
         )

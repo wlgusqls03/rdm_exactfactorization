@@ -122,8 +122,6 @@ def build_metrics_text(summary: dict[str, object], representative: dict[str, obj
         f"tau MAE     : {val_avg['tau_mae']:.3e}",
         f"T loss      : {val_avg.get('kinetic_loss', np.nan):.3e}",
         f"T abs err   : {val_avg.get('kinetic_abs_error', np.nan):.3e}",
-        f"KP loss     : {val_avg.get('kp_loss', np.nan):.3e}",
-        f"KP MAE      : {val_avg.get('kp_mae', np.nan):.3e}",
         f"trace loss  : {val_avg['trace_loss']:.3e}",
         f"occ penalty : {val_avg['occ_penalty']:.3e}",
         f"symmetry    : {val_avg['symmetry_mae']:.3e}",
@@ -273,46 +271,13 @@ def plot_training_summary(
 
         axes[2, 0].axis("off")
 
-    kp_true = np.asarray(representative.get("kp_true_centered", np.array([])), dtype=np.float32)
-    kp_pred = np.asarray(representative.get("kp_pred_centered", np.array([])), dtype=np.float32)
-    if kp_true.size and kp_pred.size and np.any(np.isfinite(kp_true)) and np.any(np.isfinite(kp_pred)):
-        kp_true_slice = reshape_center_slice(kp_true, representative_axis_points)
-        kp_pred_slice = reshape_center_slice(kp_pred, representative_axis_points)
-        kp_vmin, kp_vmax = shared_limits(kp_true_slice, kp_pred_slice, symmetric=True)
-        add_imshow(
-            axes[2, 1],
-            kp_true_slice,
-            r"True $v_T$ Slice",
-            vmin=kp_vmin,
-            vmax=kp_vmax,
-        )
-        add_imshow(
-            axes[2, 2],
-            kp_pred_slice,
-            r"Pred $v_T$ Slice",
-            vmin=kp_vmin,
-            vmax=kp_vmax,
-        )
-        kp_err_vmin, kp_err_vmax = shared_limits(np.abs(kp_pred_slice - kp_true_slice), include_zero=True)
-        add_imshow(
-            axes[2, 3],
-            np.abs(kp_pred_slice - kp_true_slice),
-            r"$|\Delta v_T|$ Slice",
-            vmin=kp_err_vmin,
-            vmax=kp_err_vmax,
-            cmap="Reds",
-        )
-    else:
-        for ax in axes[2, 1:4]:
-            ax.axis("off")
-        axes[2, 1].text(
-            0.0,
-            0.5,
-            "Kinetic potential target unavailable\n(rebuild NPZ with KP fields)",
-            va="center",
-            ha="left",
-            family="monospace",
-        )
+    rho_err_slice = np.abs(rho_pred_slice - rho_true_slice)
+    rho_err_vmin, rho_err_vmax = shared_limits(rho_err_slice, include_zero=True)
+    add_imshow(axes[2, 1], rho_err_slice, r"$|\Delta\rho|$ Slice", vmin=rho_err_vmin, vmax=rho_err_vmax, cmap="Reds")
+    tau_err_slice = np.abs(tau_pred_slice - tau_true_slice)
+    tau_err_vmin, tau_err_vmax = shared_limits(tau_err_slice, include_zero=True)
+    add_imshow(axes[2, 2], tau_err_slice, r"$|\Delta\tau|$ Slice", vmin=tau_err_vmin, vmax=tau_err_vmax, cmap="Reds")
+    axes[2, 3].axis("off")
 
     add_integral_ratio_plot(axes[3, 0], representative)
 
@@ -348,3 +313,26 @@ def plot_training_summary(
         plt.show()
     else:
         plt.close(fig)
+
+
+def plot_point_pretrain_summary(summary: dict[str, object], output_png: Path) -> None:
+    """Save held-out density-head diagnostics before pair/context training."""
+    representative = summary["val"]["per_system"][0]
+    rows = [("rho_neutral", r"$\rho_N$")]
+    if "fukui_plus_true" in representative:
+        rows.extend([("fukui_plus", r"$f^+$"), ("fukui_minus", r"$f^-$")])
+    axis_points = infer_axis_points(representative[f"{rows[0][0]}_true"])
+    fig, axes = plt.subplots(len(rows), 3, figsize=(14, 4.2 * len(rows)), squeeze=False)
+    for row_idx, (name, label) in enumerate(rows):
+        true_slice = reshape_center_slice(representative[f"{name}_true"], axis_points)
+        pred_slice = reshape_center_slice(representative[f"{name}_pred"], axis_points)
+        vmin, vmax = shared_limits(true_slice, pred_slice, symmetric=name.startswith("fukui"), include_zero=True)
+        add_imshow(axes[row_idx, 0], true_slice, f"True {label}", vmin=vmin, vmax=vmax)
+        add_imshow(axes[row_idx, 1], pred_slice, f"Pred {label}", vmin=vmin, vmax=vmax)
+        err = np.abs(pred_slice - true_slice)
+        err_vmin, err_vmax = shared_limits(err, include_zero=True)
+        add_imshow(axes[row_idx, 2], err, f"Absolute error: {label}", vmin=err_vmin, vmax=err_vmax, cmap="Reds")
+    fig.tight_layout()
+    fig.savefig(output_png, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved point pretrain figure to: {output_png}")

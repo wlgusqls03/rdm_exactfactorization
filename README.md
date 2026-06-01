@@ -24,8 +24,8 @@ with an optional density normalization constraint:
 int rho_theta(r) dr = N_e
 ```
 
-It also supports auxiliary learning targets for the kinetic potential and kinetic
-energy diagnostics.
+It also reports kinetic-density and kinetic-energy diagnostics derived from the
+predicted 1-RDM. The V1 point model does not directly predict kinetic potential.
 
 ## Current Scope
 
@@ -33,7 +33,7 @@ energy diagnostics.
 - Train a transferable 1-RDM model across many molecules.
 - Split systems at the molecule level into train, validation, and test sets.
 - Evaluate held-out molecules with gamma, density, kinetic-density, kinetic-energy,
-  and kinetic-potential diagnostics.
+  and kinetic-energy diagnostics.
 - Save summary figures, JSON, CSV metrics, and model weights.
 
 This is not a production-ready quantum chemistry package. It is a research codebase
@@ -41,7 +41,7 @@ for testing 1-RDM model structure, loss schedules, and data-generation choices.
 
 ## Model Summary
 
-The surrogate is built from three neural networks.
+The surrogate is built from four neural networks.
 
 ### 1. Point Model
 
@@ -54,18 +54,37 @@ Input:
 Output:
 
 ```text
-[density logit, kinetic-potential head, latent mode amplitudes]
+[rho_N logit]
 ```
 
-The density is obtained with `softplus`; if density normalization is enabled, it is
-rescaled so that the grid integral equals the electron count.
+With `--pair-density-feature-mode fukui`, the point model instead emits three
+density logits for `rho_N`, `rho_(N+1)`, and `rho_(N-1)`. Each density is obtained
+with `softplus` and rescaled to its required electron count. The point model is
+pretrained and frozen before 1-RDM training.
 
-### 2. Pair Model
+### 2. Mode Model
 
 Input:
 
 ```text
-[pair features for (r, r'), global molecular context]
+[local point features, global molecular context]
+```
+
+Output:
+
+```text
+latent residual-mode amplitudes
+```
+
+This encoder remains trainable during 1-RDM training so that freezing the density
+model does not freeze residual-kernel expressivity.
+
+### 3. Pair Model
+
+Input:
+
+```text
+[pair features for (r, r'), optional predicted-density descriptors, global molecular context]
 ```
 
 Output:
@@ -77,7 +96,7 @@ Output:
 It controls the baseline Gaussian-like kernel and the mixing between baseline and
 learned residual kernel.
 
-### 3. Context Model
+### 4. Context Model
 
 Input:
 
@@ -93,7 +112,7 @@ system-level latent mode weights
 
 These weights condition the low-rank residual kernel on the molecule.
 
-All three models are RFF-enhanced MLPs using SiLU activations.
+All four models are RFF-enhanced MLPs using SiLU activations.
 
 ## Data Generation
 
@@ -152,7 +171,8 @@ The main training entry point is:
 train_transferable_1rdm.py
 ```
 
-Recommended training command for an existing 500-molecule NPZ dataset:
+Recommended Fukui-feature training command for an existing 500-molecule charged
+oracle NPZ dataset:
 
 ```bash
 MPLCONFIGDIR=/tmp/mplconfig \
@@ -166,10 +186,7 @@ RDM_LR_DECAY=0.5 \
 RDM_LAMBDA_GAMMA=12.0 \
 RDM_LAMBDA_RHO=1.0 \
 RDM_LAMBDA_KERNEL=1.0 \
-RDM_LAMBDA_KP=0.25 \
 RDM_LAMBDA_KINETIC=0.02 \
-RDM_KP_START_EPOCH=160 \
-RDM_KP_RAMP_EPOCHS=160 \
 RDM_KINETIC_START_EPOCH=460 \
 RDM_KINETIC_RAMP_EPOCHS=180 \
 RDM_OCC_MAX=2.0 \
@@ -186,14 +203,40 @@ RDM_GAMMA_CACHE_GB=1.0 \
 RDM_FULL_EVAL_MAX_POINTS=2500 \
 python train_transferable_1rdm.py \
   --dataset-mode npz \
-  --npz-glob 'qmugs_npz/qm9_pyscf_ldavwn_b631gd_atoms10_400_50_50_spacing1p5_kp/*.npz' \
+  --npz-glob 'qmugs_npz/qm9_pyscf_ldavwn_b61plusgd_atoms10_500_charged_oracle/*.npz' \
   --train-system-count 400 \
   --val-system-count 50 \
   --test-system-count 50 \
+  --pair-density-feature-mode fukui \
+  --point-pretrain-epochs 120 \
+  --point-pretrain-steps-per-epoch 80 \
   --epochs 700 \
   --batch-size 1024 \
-  --run-name qm9_ldavwn_b631gd_atoms10_400_50_50_spacing1p5_gamma12_kp025_Tlate_lr2e4_w192_r16 \
+  --run-name qm9_ldavwn_b61plusgd_fukui_v1 \
   --auto-run-dir
+```
+
+Use `--pair-density-feature-mode off` for the original pair input, or
+`--pair-density-feature-mode rho-derivatives` to add predicted `rho_N`, gradient
+norm, and Laplacian descriptors without predicting charged densities. Fukui mode
+adds the same descriptors for `rho_N`, `f+ = rho_(N+1) - rho_N`, and
+`f- = rho_N - rho_(N-1)`.
+
+The charged-oracle NPZ files are needed to pretrain Fukui mode. Once those NPZ
+files exist, changing among the three training modes does not require rebuilding
+the dataset.
+
+For a controlled comparison, keep all other options fixed and run:
+
+```bash
+# Predicted rho_N only; no density descriptor enters the pair model.
+python train_transferable_1rdm.py ... --pair-density-feature-mode off --run-name v1_off
+
+# Predicted rho_N plus its gradient norm and Laplacian.
+python train_transferable_1rdm.py ... --pair-density-feature-mode rho-derivatives --run-name v1_rho_derivatives
+
+# Predicted rho_N, f+, f- plus their gradient norms and Laplacians.
+python train_transferable_1rdm.py ... --pair-density-feature-mode fukui --run-name v1_fukui
 ```
 
 Learning rate can be set with any of these equivalent variables:
@@ -226,7 +269,7 @@ warning and the run falls back to CPU.
 ## V2 Ablation Runner
 
 The full prototype can become hard to diagnose because density, kernel, residual
-modes, context conditioning, tau, KP, and kinetic energy are all coupled. The V2
+modes, context conditioning, tau, and kinetic energy are coupled. The V2
 runner keeps the same NPZ data and system-level splits, but resets the model and
 loss structure into small ablation experiments.
 
@@ -406,19 +449,19 @@ transferable_rdm/data.py
     category-balanced pair sampling.
 
 transferable_rdm/model.py
-    Point, pair, and context model definitions. Implements RFF-enhanced MLPs and
+    Point, mode, pair, and context model definitions. Implements RFF-enhanced MLPs and
     the gamma_theta prediction formula.
 
 transferable_rdm/training.py
-    Training loop, scheduled loss weights, evaluation metrics, kinetic-potential
-    loss, kinetic-energy diagnostics, and early stopping.
+    Point-density pretraining, frozen-density 1-RDM training, scheduled loss
+    weights, evaluation metrics, kinetic-energy diagnostics, and early stopping.
 
 transferable_rdm/v2_ablation.py
     V2 ablation model classes, losses, baseline fitting, metrics, CSV/JSON output,
     and training loop.
 
 transferable_rdm/plotting.py
-    Summary plots for objectives, gamma parity, density slices, tau, KP, and
+    Summary plots for objectives, gamma parity, density slices, tau, and
     kinetic-energy ratios.
 
 transferable_rdm/utils.py
@@ -471,6 +514,6 @@ repository or with a dedicated large-file workflow.
 - Pair batches are sampled stochastically; training objectives can fluctuate from
   epoch to epoch.
 - Lower validation objective alone is not enough. Inspect component metrics such as
-  pair loss, density MAE, KP loss, and kinetic-energy error.
+  pair loss, density MAE, tau MAE, and kinetic-energy error.
 - The code is intended for method development. Reported accuracy should be tied to
   a fixed dataset, split seed, basis, functional, grid spacing, and loss schedule.

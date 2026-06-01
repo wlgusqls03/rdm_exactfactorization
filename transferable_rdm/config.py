@@ -69,6 +69,10 @@ class ExperimentConfig:
     occ_max: float = float(os.environ.get("RDM_OCC_MAX", 1.0))
     normalize_rho: bool = env_flag("RDM_NORMALIZE_RHO", True)
     tau_stencil: str = os.environ.get("RDM_TAU_STENCIL", "richardson")
+    pair_density_feature_mode: str = os.environ.get("RDM_PAIR_DENSITY_FEATURE_MODE", "off")
+    pair_density_eps: float = float(os.environ.get("RDM_PAIR_DENSITY_EPS", 1e-14))
+    pair_density_value_clip: float = float(os.environ.get("RDM_PAIR_DENSITY_VALUE_CLIP", 8.0))
+    pair_density_laplacian_clip: float = float(os.environ.get("RDM_PAIR_DENSITY_LAPLACIAN_CLIP", 8.0))
 
     # ------------------------------------------------------------------
     # 학습 설정
@@ -86,6 +90,13 @@ class ExperimentConfig:
     lr_patience: int = int(os.environ.get("RDM_LR_PATIENCE", 12))
     lr_min_improvement: float = float(os.environ.get("RDM_LR_MIN_IMPROVEMENT", 1e-5))
     weight_decay: float = float(os.environ.get("RDM_WEIGHT_DECAY", 1e-6))
+    point_pretrain_epochs: int = int(os.environ.get("RDM_POINT_PRETRAIN_EPOCHS", 120))
+    point_pretrain_steps_per_epoch: int = int(os.environ.get("RDM_POINT_PRETRAIN_STEPS_PER_EPOCH", 80))
+    point_pretrain_lr: float = float(os.environ.get("RDM_POINT_PRETRAIN_LR", 3e-4))
+    point_pretrain_patience: int = int(os.environ.get("RDM_POINT_PRETRAIN_PATIENCE", 30))
+    point_pretrain_val_every: int = int(os.environ.get("RDM_POINT_PRETRAIN_VAL_EVERY", 5))
+    point_fukui_weight: float = float(os.environ.get("RDM_POINT_FUKUI_WEIGHT", 1.0))
+    freeze_point_after_pretrain: bool = env_flag("RDM_FREEZE_POINT_AFTER_PRETRAIN", True)
 
     # ------------------------------------------------------------------
     # loss weight
@@ -103,7 +114,6 @@ class ExperimentConfig:
     use_occ_loss: bool = env_flag("RDM_USE_OCC_LOSS", True)
     use_mode_loss: bool = env_flag("RDM_USE_MODE_LOSS", True)
     use_kinetic_loss: bool = env_flag("RDM_USE_KINETIC_LOSS", False)
-    use_kp_loss: bool = env_flag("RDM_USE_KP_LOSS", False)
 
     lambda_gamma: float = float(os.environ.get("RDM_LAMBDA_GAMMA", 1.0))
     lambda_rho: float = float(os.environ.get("RDM_LAMBDA_RHO", 8.0))
@@ -114,15 +124,12 @@ class ExperimentConfig:
     lambda_occ: float = float(os.environ.get("RDM_LAMBDA_OCC", 0.25))
     lambda_mode: float = float(os.environ.get("RDM_LAMBDA_MODE", 1e-4))
     lambda_kinetic: float = float(os.environ.get("RDM_LAMBDA_KINETIC", 1.0))
-    lambda_kp: float = float(os.environ.get("RDM_LAMBDA_KP", 0.25))
 
     # ------------------------------------------------------------------
     # loss schedule
     # ------------------------------------------------------------------
     # These keep the base loss definition intact, but allow expensive or
     # delicate targets to enter only after the density/gamma fit has stabilized.
-    kp_start_epoch: int = int(os.environ.get("RDM_KP_START_EPOCH", 0))
-    kp_ramp_epochs: int = int(os.environ.get("RDM_KP_RAMP_EPOCHS", 0))
     kinetic_start_epoch: int = int(os.environ.get("RDM_KINETIC_START_EPOCH", 0))
     kinetic_ramp_epochs: int = int(os.environ.get("RDM_KINETIC_RAMP_EPOCHS", 0))
 
