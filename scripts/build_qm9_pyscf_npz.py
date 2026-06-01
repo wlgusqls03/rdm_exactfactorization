@@ -73,6 +73,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Also run UKS calculations for the N-1 cation and N+1 anion and store their spin-summed densities.",
     )
+    parser.add_argument(
+        "--include-sad-and-vector-features",
+        action="store_true",
+        help="Compute and store PySCF's Superposition of Atomic Densities (SAD) and grid-to-atom directional vectors.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--selection", choices=["random", "smallest"], default="random")
     return parser.parse_args()
@@ -212,6 +217,8 @@ def build_local_features(
     potential: np.ndarray,
     grad: np.ndarray,
     electron_count: int,
+    rho_sad: np.ndarray | None = None,
+    include_vectors: bool = False,
 ) -> np.ndarray:
     radius = max(float(np.max(np.abs(points_bohr))), 1e-6)
     coords_norm = points_bohr / radius
@@ -221,14 +228,29 @@ def build_local_features(
     radial = np.linalg.norm(points_bohr, axis=1, keepdims=True) / radius
 
     gaussian_by_element = []
+    vector_by_element = []
     for symbol in ALLOWED_ELEMENTS:
         z = ELEMENT_Z[symbol]
         centers = coords_bohr_centered[atomic_numbers == z]
         if len(centers) == 0:
             gaussian_by_element.append(np.zeros((len(points_bohr), 1), dtype=np.float32))
+            if include_vectors:
+                vector_by_element.append(np.zeros((len(points_bohr), 3), dtype=np.float32))
             continue
-        dist2 = np.sum((points_bohr[:, None, :] - centers[None, :, :]) ** 2, axis=2)
-        gaussian_by_element.append(np.sum(np.exp(-0.45 * dist2), axis=1, keepdims=True).astype(np.float32))
+
+        # (n_points, n_centers, 3)
+        diff = points_bohr[:, None, :] - centers[None, :, :]
+        dist2 = np.sum(diff**2, axis=2)
+        weights = np.exp(-0.45 * dist2)  # (n_points, n_centers)
+
+        gaussian_by_element.append(np.sum(weights, axis=1, keepdims=True).astype(np.float32))
+
+        if include_vectors:
+            # Weighted average vector: sum_a (r_grid - r_a) * exp(-alpha r^2)
+            # (n_points, n_centers, 3) * (n_points, n_centers, 1) -> sum over n_centers
+            v_weighted = np.sum(diff * weights[:, :, None], axis=1)  # (n_points, 3)
+            # Normalize by radius to keep scale similar to coords_norm
+            vector_by_element.append((v_weighted / radius).astype(np.float32))
 
     nearest_z = np.zeros((len(points_bohr), 1), dtype=np.float32)
     if len(coords_bohr_centered):
@@ -237,10 +259,17 @@ def build_local_features(
         nearest_z[:, 0] = atomic_numbers[nearest] / 10.0
 
     electron_col = np.full((len(points_bohr), 1), electron_count / 30.0, dtype=np.float32)
-    return np.concatenate(
-        [coords_norm, pot_feat, grad_feat, radial] + gaussian_by_element + [nearest_z, electron_col],
-        axis=1,
-    ).astype(np.float32)
+
+    parts = [coords_norm, pot_feat, grad_feat, radial] + gaussian_by_element + [nearest_z, electron_col]
+
+    if rho_sad is not None:
+        # Use log1p for SAD density feature to handle wide dynamic range
+        parts.append(np.log1p(np.maximum(rho_sad, 0.0)).astype(np.float32))
+
+    if include_vectors:
+        parts.extend(vector_by_element)
+
+    return np.concatenate(parts, axis=1).astype(np.float32)
 
 
 def build_global_context(symbols: list[str], coords_bohr_centered: np.ndarray, electron_count: int) -> np.ndarray:
@@ -280,7 +309,7 @@ def run_dft(
     retry_scf: bool = False,
     retry_damp: float = 0.2,
     retry_level_shift: float = 0.3,
-) -> tuple[gto.Mole, dft.rks.RKS | dft.uks.UKS, np.ndarray]:
+) -> tuple[gto.Mole, dft.rks.RKS | dft.uks.UKS, np.ndarray, np.ndarray | None]:
     atom_spec = [
         (symbol, tuple(coord.tolist()))
         for symbol, coord in zip(record.symbols, record.coords_angstrom)
@@ -304,6 +333,7 @@ def run_dft(
         )
 
     guess = dm0
+    sad_dm = None
     last_energy = float("nan")
     for attempt_idx, (label, use_newton, damp, level_shift) in enumerate(attempts):
         mf = dft.RKS(mol) if spin == 0 else dft.UKS(mol)
@@ -313,6 +343,15 @@ def run_dft(
         mf.max_cycle = max_cycle
         mf.damp = damp
         mf.level_shift = level_shift
+
+        # Capture SAD guess from the first RKS/UKS object before possible Newton transformation
+        if sad_dm is None:
+            try:
+                sad_dm = mf.get_init_guess(key="atom")
+            except Exception:
+                # Fallback to default guess if atom-SAD fails
+                sad_dm = mf.get_init_guess(key="minao")
+
         if use_newton:
             mf = mf.newton()
             mf.max_cycle = max_cycle
@@ -323,7 +362,7 @@ def run_dft(
             )
         last_energy = mf.kernel(dm0=guess)
         if mf.converged:
-            return mol, mf, mf.make_rdm1().astype(np.float64)
+            return mol, mf, mf.make_rdm1().astype(np.float64), sad_dm.astype(np.float64)
         try:
             guess = mf.make_rdm1()
         except Exception:
@@ -387,7 +426,7 @@ def charged_density_oracles(
     payload: dict[str, np.ndarray] = {}
     for label, charge in (("cation", +1), ("anion", -1)):
         charged_electrons = neutral_electrons - charge
-        mol, _, dm = run_dft(
+        mol, _, dm, _ = run_dft(
             record,
             basis=args.basis,
             xc=args.xc,
@@ -526,7 +565,7 @@ def kinetic_potential_reference(
 
 
 def write_npz(record: Qm9Record, args: argparse.Namespace, output_path: Path) -> dict[str, object]:
-    mol, mf, dm = run_dft(
+    mol, mf, dm, sad_dm = run_dft(
         record,
         basis=args.basis,
         xc=args.xc,
@@ -553,6 +592,11 @@ def write_npz(record: Qm9Record, args: argparse.Namespace, output_path: Path) ->
     derivative_true_ao, tau_true_ao = kinetic_density_from_dm(mol, dm, absolute_grid_bohr)
 
     step = float(axis[1] - axis[0])
+
+    rho_sad = None
+    if args.include_sad_and_vector_features and sad_dm is not None:
+        rho_sad, _ = normalized_density_on_grid(mol, sad_dm, absolute_grid_bohr, step**3)
+
     trace_grid = float(np.trace(gamma_matrix) * step**3)
     gamma_trace_scale = 1.0
     if abs(trace_grid) > 1e-12:
@@ -591,6 +635,8 @@ def write_npz(record: Qm9Record, args: argparse.Namespace, output_path: Path) ->
         potential,
         grad,
         electron_count=mol.nelectron,
+        rho_sad=rho_sad,
+        include_vectors=args.include_sad_and_vector_features,
     )
     global_context = build_global_context(record.symbols, coords_bohr_centered, electron_count=mol.nelectron)
 
