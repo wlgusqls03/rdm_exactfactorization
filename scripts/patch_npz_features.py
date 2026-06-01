@@ -30,10 +30,11 @@ def get_sad_density(symbols: list[str], coords_bohr: np.ndarray, basis: str, abs
     
     mf = dft.RKS(mol)
     try:
-        sad_dm = mf.get_init_guess(key="atom")
-    except Exception:
-        print(f"  Fallback to minao for {symbols}")
+        # Use minao for speed. 'atom' runs actual HF for each atom, which is slow.
         sad_dm = mf.get_init_guess(key="minao")
+    except Exception:
+        print(f"  Fallback to 1e for {symbols}")
+        sad_dm = mf.get_init_guess(key="1e")
         
     rho_sad, _ = normalized_density_on_grid(mol, sad_dm, absolute_grid_bohr, cell_volume)
     return rho_sad
@@ -95,11 +96,13 @@ def patch_npz_file(path_str: str) -> None:
             new_data["local_features"] = new_local_features
             
         # Save to a temporary file first, then replace to avoid corruption
-        temp_path = path.with_suffix(".npz.tmp")
+        temp_path = Path(str(path) + ".tmp")
         np.savez_compressed(temp_path, **new_data)
         shutil.move(temp_path, path)
         
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         print(f"Error processing {path.name}: {e}")
 
 
