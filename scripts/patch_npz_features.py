@@ -58,8 +58,10 @@ def patch_npz_file(path_str: str) -> None:
             potential = payload["potential"]
             grad = payload["grad_potential"]
             electron_count = int(payload["electron_count"])
-            basis = str(payload["basis"])
-            step = float(payload["grid_spacing_bohr"])
+            
+            # Use fallback for basis and step if they are missing from older NPZ files
+            basis = str(payload["basis"]) if "basis" in payload else "6-31+g(d)"
+            step = float(payload["grid_spacing_bohr"]) if "grid_spacing_bohr" in payload else 1.5
             
             # Reconstruct absolute grid
             # In build_qm9_pyscf_npz: coords_bohr_centered = coords - mean
