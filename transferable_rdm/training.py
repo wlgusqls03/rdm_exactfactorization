@@ -9,6 +9,9 @@ from .config import ExperimentConfig
 from .density_features import (
     DensityFeatureState,
     build_density_feature_state,
+    cache_frozen_density_state,
+    cached_frozen_density_state,
+    clear_frozen_density_state_cache,
     normalized_density_head,
     pair_density_features,
     pair_density_feature_mode,
@@ -127,8 +130,15 @@ def point_output_and_state(
     models: ModelBundle,
     config: ExperimentConfig,
 ) -> tuple[tf.Tensor, DensityFeatureState]:
+    if config.freeze_point_after_pretrain:
+        cached = cached_frozen_density_state(system)
+        if cached is not None:
+            return tf.zeros((0, 0), dtype=tf.float32), cached
     point_out = point_model_outputs(system, models)
-    return point_out, build_density_feature_state(system, point_out, config)
+    state = build_density_feature_state(system, point_out, config)
+    if config.freeze_point_after_pretrain:
+        cache_frozen_density_state(system, state)
+    return point_out, state
 def point_density_predictions(
     system: SystemRecord,
     models: ModelBundle,
@@ -158,7 +168,7 @@ def point_density_predictions(
 
 
 def scaled_field_mse(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
-    scale = tf.maximum(tf.reduce_mean(tf.abs(y_true)), 1e-8)
+    scale = tf.maximum(tf.reduce_mean(tf.abs(y_true)), 1e-5)
     return tf.reduce_mean(tf.square((y_pred - y_true) / scale))
 
 
@@ -270,6 +280,7 @@ def pretrain_point_model(
     if best_weights is not None:
         models.point_model.set_weights(best_weights)
     models.point_model.trainable = not config.freeze_point_after_pretrain
+    clear_frozen_density_state_cache()
     summary = {
         "train": evaluate_point_model(split.train_systems, models, config),
         "val": evaluate_point_model(split.val_systems, models, config, keep_arrays=True),
@@ -353,41 +364,37 @@ def stencil_predictions(
         _, density_state = point_output_and_state(system, models, config)
     if rho_all is None:
         rho_all = density_state.rho_neutral
-    per_dim = []
     stencil_order = int(system.stencil_left.shape[2])
-    for dim in range(3):
-        left = system.stencil_left[:, dim, :]    # (n_interior, 4 or 8)
-        right = system.stencil_right[:, dim, :]  # (n_interior, 4 or 8)
-
-        gamma_terms = []
-        for variant in range(stencil_order):
-            left_idx = left[:, variant]
-            right_idx = right[:, variant]
-            outputs = predict_from_features(
-                to_tensor(system.local_features[left_idx]),
-                to_tensor(system.local_features[right_idx]),
-                to_tensor(build_pair_features(system, left_idx, right_idx)),
-                to_tensor(system.global_context),
-                models,
-                rho_r_override=gather_density(rho_all, left_idx),
-                rho_rp_override=gather_density(rho_all, right_idx),
-                pair_density_feat_t=pair_density_features(system, density_state, left_idx, right_idx, config),
-            )
-            gamma_terms.append(outputs["gamma"])
-
-        d_h = (gamma_terms[0] - gamma_terms[1] - gamma_terms[2] + gamma_terms[3]) / (
-            4.0 * system.step * system.step
-        )
-        if stencil_order >= 8:
-            d_2h = (gamma_terms[4] - gamma_terms[5] - gamma_terms[6] + gamma_terms[7]) / (
-                16.0 * system.step * system.step
-            )
-            deriv_dim = (4.0 * d_h - d_2h) / 3.0
-        else:
-            deriv_dim = d_h
-        per_dim.append(deriv_dim)
-
-    derivative_pred = tf.concat(per_dim, axis=1)              # (n_interior, 3)
+    stencil_shape = system.stencil_left.shape
+    left_idx = system.stencil_left.reshape(-1)
+    right_idx = system.stencil_right.reshape(-1)
+    outputs = predict_from_features(
+        to_tensor(system.local_features[left_idx]),
+        to_tensor(system.local_features[right_idx]),
+        to_tensor(build_pair_features(system, left_idx, right_idx)),
+        to_tensor(system.global_context),
+        models,
+        rho_r_override=gather_density(rho_all, left_idx),
+        rho_rp_override=gather_density(rho_all, right_idx),
+        pair_density_feat_t=pair_density_features(system, density_state, left_idx, right_idx, config),
+    )
+    gamma_stencil = tf.reshape(outputs["gamma"], stencil_shape)
+    d_h = (
+        gamma_stencil[:, :, 0]
+        - gamma_stencil[:, :, 1]
+        - gamma_stencil[:, :, 2]
+        + gamma_stencil[:, :, 3]
+    ) / (4.0 * system.step * system.step)
+    if stencil_order >= 8:
+        d_2h = (
+            gamma_stencil[:, :, 4]
+            - gamma_stencil[:, :, 5]
+            - gamma_stencil[:, :, 6]
+            + gamma_stencil[:, :, 7]
+        ) / (16.0 * system.step * system.step)
+        derivative_pred = (4.0 * d_h - d_2h) / 3.0
+    else:
+        derivative_pred = d_h
     tau_pred = 0.5 * tf.reduce_sum(derivative_pred, axis=1, keepdims=True)
     return derivative_pred, tau_pred
 
@@ -889,7 +896,13 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
     last_epoch = 0
     print_block("Base loss weights", loss_weight_rows(config))
     print_block("Loss schedule", loss_schedule_rows(config))
-    print_block("Density constraint", [("normalize_rho", config.normalize_rho)])
+    print_block(
+        "Density constraint",
+        [
+            ("normalize_rho", config.normalize_rho),
+            ("frozen density-state cache", config.freeze_point_after_pretrain),
+        ],
+    )
 
     for epoch in range(config.epochs):
         last_epoch = epoch

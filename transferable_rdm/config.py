@@ -101,7 +101,7 @@ class ExperimentConfig:
     # ------------------------------------------------------------------
     # loss weight
     # ------------------------------------------------------------------
-    loss_preset: str = os.environ.get("RDM_LOSS_PRESET", "all")
+    loss_preset: str = os.environ.get("RDM_LOSS_PRESET", "core5")
     # "all" / "custom" : individual RDM_USE_*_LOSS switches decide active terms
     # "core5"          : gamma + rho + kernel + trace + mode only
 

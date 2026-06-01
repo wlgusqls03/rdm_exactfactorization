@@ -9,6 +9,7 @@ from .systems import SystemRecord
 
 
 PAIR_DENSITY_FEATURE_MODES = ("off", "rho-derivatives", "fukui")
+_FROZEN_DENSITY_STATE_CACHE: dict[int, DensityFeatureState] = {}
 
 
 @dataclass
@@ -19,6 +20,18 @@ class DensityFeatureState:
     rho_cation: tf.Tensor | None
     rho_anion: tf.Tensor | None
     descriptor_fields: tuple[tuple[str, tf.Tensor, tf.Tensor, tf.Tensor], ...]
+
+
+def cached_frozen_density_state(system: SystemRecord) -> DensityFeatureState | None:
+    return _FROZEN_DENSITY_STATE_CACHE.get(id(system))
+
+
+def cache_frozen_density_state(system: SystemRecord, state: DensityFeatureState) -> None:
+    _FROZEN_DENSITY_STATE_CACHE[id(system)] = state
+
+
+def clear_frozen_density_state_cache() -> None:
+    _FROZEN_DENSITY_STATE_CACHE.clear()
 
 
 def pair_density_feature_mode(config: ExperimentConfig) -> str:
