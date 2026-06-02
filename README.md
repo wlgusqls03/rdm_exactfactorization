@@ -58,13 +58,29 @@ Output:
 ```
 
 With `--pair-density-feature-mode fukui`, the point model instead emits three
-density logits for `rho_N`, `rho_(N+1)`, and `rho_(N-1)`. Each density is obtained
-with `softplus` and rescaled to its required electron count. The point model is
+density logits for `rho_N`, `rho_(N+1)`, and `rho_(N-1)`. In the default
+`learned` mode, each density is obtained with `softplus` and rescaled to its
+required electron count. The optional SAD residual mode described below instead
+applies a positive multiplicative correction to an atomic-density baseline. The point model is
 pretrained and frozen before 1-RDM training. Fukui-mode pretraining is staged:
 `rho_N` starts first, charged densities enter at epoch 30, and direct Fukui
 losses enter as a small auxiliary term at epoch 60. The defaults can be adjusted
 with `--point-charged-weight`, `--point-fukui-weight`,
-`--point-charged-start-epoch`, and `--point-fukui-start-epoch`.
+`--point-charged-start-epoch`, `--point-fukui-start-epoch`, and
+`--point-fukui-ramp-epochs`. The ramp avoids abruptly perturbing the shared point
+trunk when the Fukui auxiliary objective becomes active.
+
+For NPZ archives patched with SAD features, the point model can predict a positive
+multiplicative correction to the normalized atomic-density baseline:
+
+```bash
+python train_transferable_1rdm.py ... \
+  --density-baseline-mode sad-multiplicative \
+  --point-fukui-ramp-epochs 40
+```
+
+The original direct density-head behavior remains available as
+`--density-baseline-mode learned`.
 
 ### 2. Mode Model
 

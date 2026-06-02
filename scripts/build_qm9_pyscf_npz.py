@@ -662,6 +662,10 @@ def write_npz(record: Qm9Record, args: argparse.Namespace, output_path: Path) ->
         derivative_true_ao=derivative_true_ao.astype(np.float32),
         tau_true_ao=tau_true_ao.astype(np.float32),
         local_features=local_features,
+        rho_sad=np.asarray(
+            rho_sad if rho_sad is not None else np.empty((0, 1)),
+            dtype=np.float32,
+        ),
         global_context=global_context,
         potential=potential,
         grad_potential=grad,

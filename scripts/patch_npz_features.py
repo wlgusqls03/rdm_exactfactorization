@@ -122,6 +122,7 @@ def patch_npz_file(path_str: str) -> bool:
             # Copy all data to a new dictionary
             new_data = {k: payload[k] for k in payload.files}
             new_data["local_features"] = new_local_features
+            new_data["rho_sad"] = np.asarray(rho_sad, dtype=np.float32)
             new_data["local_feature_schema"] = np.asarray(LOCAL_FEATURE_SCHEMA)
             
         # Save to a temporary file first, then replace to avoid corruption

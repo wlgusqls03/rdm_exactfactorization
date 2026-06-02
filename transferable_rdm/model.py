@@ -167,12 +167,23 @@ def build_models(config: ExperimentConfig, point_feat_dim: int, pair_feat_dim: i
     )
 
 
-def initialize_point_model_density_bias(point_model: tf.keras.Model, rho_mean: float) -> None:
+def initialize_point_model_density_bias(
+    point_model: tf.keras.Model,
+    rho_mean: float,
+    *,
+    residual_baseline: bool = False,
+) -> None:
     """density head bias를 mean rho 근처로 맞춰 초기 폭주를 줄인다."""
+    weights = point_model.get_weights()
+    if residual_baseline:
+        # delta=0 makes the first prediction exactly the normalized SAD density.
+        weights[-2] = np.zeros_like(weights[-2])
+        weights[-1] = np.zeros_like(weights[-1])
+        point_model.set_weights(weights)
+        return
+
     rho_mean = max(float(rho_mean), 1e-4)
     bias_value = np.log(np.expm1(rho_mean)).astype(np.float32)
-
-    weights = point_model.get_weights()
     last_bias = weights[-1].copy()
     last_bias[:] = bias_value
     weights[-1] = last_bias

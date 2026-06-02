@@ -42,7 +42,13 @@ configure_tensorflow_environment_preimport()
 
 from transferable_rdm.config import ExperimentConfig
 from transferable_rdm.data import build_pair_features, split_systems
-from transferable_rdm.density_features import PAIR_DENSITY_FEATURE_MODES, pair_density_feature_dim, pair_density_feature_mode
+from transferable_rdm.density_features import (
+    DENSITY_BASELINE_MODES,
+    PAIR_DENSITY_FEATURE_MODES,
+    density_baseline_mode,
+    pair_density_feature_dim,
+    pair_density_feature_mode,
+)
 from transferable_rdm.model import build_models, initialize_point_model_density_bias
 from transferable_rdm.plotting import plot_point_pretrain_summary, plot_training_summary
 from transferable_rdm.systems import build_system_corpus
@@ -124,8 +130,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--point-fukui-weight", type=float, default=None)
     parser.add_argument("--point-charged-start-epoch", type=int, default=None)
     parser.add_argument("--point-fukui-start-epoch", type=int, default=None)
+    parser.add_argument("--point-fukui-ramp-epochs", type=int, default=None)
     parser.add_argument("--point-density-scale-floor", type=float, default=None)
     parser.add_argument("--pair-density-feature-mode", choices=PAIR_DENSITY_FEATURE_MODES, default=None)
+    parser.add_argument("--density-baseline-mode", choices=DENSITY_BASELINE_MODES, default=None)
+    parser.add_argument("--sad-density-floor", type=float, default=None)
+    parser.add_argument("--sad-residual-clip", type=float, default=None)
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--npz-glob", type=str, default=None)
@@ -190,8 +200,12 @@ def apply_overrides(config: ExperimentConfig, args: argparse.Namespace) -> Exper
         ("point_fukui_weight", "point_fukui_weight"),
         ("point_charged_start_epoch", "point_charged_start_epoch"),
         ("point_fukui_start_epoch", "point_fukui_start_epoch"),
+        ("point_fukui_ramp_epochs", "point_fukui_ramp_epochs"),
         ("point_density_scale_floor", "point_density_scale_floor"),
         ("pair_density_feature_mode", "pair_density_feature_mode"),
+        ("density_baseline_mode", "density_baseline_mode"),
+        ("sad_density_floor", "sad_density_floor"),
+        ("sad_residual_clip", "sad_residual_clip"),
         ("run_name", "run_name"),
         ("output_dir", "output_dir"),
         ("npz_glob", "npz_glob"),
@@ -442,6 +456,14 @@ def main() -> None:
 
     systems = build_system_corpus(config)
     split = split_systems(systems, config)
+    if density_baseline_mode(config) == "sad-multiplicative":
+        missing_sad = [system.system_id for system in systems if system.rho_sad is None]
+        if missing_sad:
+            raise ValueError(
+                "density_baseline_mode='sad-multiplicative' requires SAD density for every system. "
+                f"Missing {len(missing_sad)} system(s), including {missing_sad[:3]}. "
+                "Patch NPZ files with scripts/patch_npz_features.py."
+            )
 
     point_dim = systems[0].local_features.shape[1]
     base_pair_dim = build_pair_features(
@@ -457,6 +479,8 @@ def main() -> None:
             ("mode", config.pair_density_feature_mode),
             ("base pair dim", base_pair_dim),
             ("density descriptor dim", pair_density_feature_dim(config)),
+            ("density baseline mode", density_baseline_mode(config)),
+            ("SAD floor/residual clip", f"{config.sad_density_floor:g} / {config.sad_residual_clip:g}"),
         ],
     )
     density_cache_floats_per_point = {
@@ -479,7 +503,11 @@ def main() -> None:
     )
     models = build_models(config, point_dim, pair_dim, global_dim)
     rho_mean = float(np.mean(np.concatenate([system.rho_diag for system in split.train_systems], axis=0)))
-    initialize_point_model_density_bias(models.point_model, rho_mean)
+    initialize_point_model_density_bias(
+        models.point_model,
+        rho_mean,
+        residual_baseline=density_baseline_mode(config) == "sad-multiplicative",
+    )
 
     point_history, point_summary = pretrain_point_model(config, split, models)
     history, summary = train_models(config, split, models)

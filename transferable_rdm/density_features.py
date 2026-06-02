@@ -9,6 +9,7 @@ from .systems import SystemRecord
 
 
 PAIR_DENSITY_FEATURE_MODES = ("off", "rho-derivatives", "fukui")
+DENSITY_BASELINE_MODES = ("learned", "sad-multiplicative")
 
 
 @dataclass
@@ -57,14 +58,37 @@ def pair_density_feature_dim(config: ExperimentConfig) -> int:
     return 18 if mode == "fukui" else 6
 
 
+def density_baseline_mode(config: ExperimentConfig) -> str:
+    mode = config.density_baseline_mode.strip().lower()
+    if mode not in DENSITY_BASELINE_MODES:
+        raise ValueError(
+            f"Unknown density baseline mode: {config.density_baseline_mode!r}. "
+            f"Choose one of: {', '.join(DENSITY_BASELINE_MODES)}."
+        )
+    return mode
+
+
 def normalized_density_head(
     system: SystemRecord,
     raw_head: tf.Tensor,
     electron_count: float,
     *,
+    config: ExperimentConfig,
     normalize: bool = True,
 ) -> tf.Tensor:
-    rho = tf.nn.softplus(raw_head) + 1e-6
+    mode = density_baseline_mode(config)
+    if mode == "sad-multiplicative":
+        if system.rho_sad is None:
+            raise ValueError(
+                f"System {system.system_id} has no SAD density baseline. "
+                "Patch NPZ files with scripts/patch_npz_features.py or use --density-baseline-mode learned."
+            )
+        sad = tf.convert_to_tensor(system.rho_sad, dtype=tf.float32)
+        floor = max(float(config.sad_density_floor), 1e-30)
+        clip = max(float(config.sad_residual_clip), 0.0)
+        rho = tf.maximum(sad, floor) * tf.exp(tf.clip_by_value(raw_head, -clip, clip))
+    else:
+        rho = tf.nn.softplus(raw_head) + 1e-6
     if not normalize:
         return rho
     normalizer = tf.reduce_sum(rho) * system.cell_volume
@@ -130,7 +154,9 @@ def build_density_feature_state(
     point_out: tf.Tensor,
     config: ExperimentConfig,
 ) -> DensityFeatureState:
-    neutral = normalized_density_head(system, point_out[:, 0:1], system.electron_count, normalize=config.normalize_rho)
+    neutral = normalized_density_head(
+        system, point_out[:, 0:1], system.electron_count, config=config, normalize=config.normalize_rho
+    )
     mode = pair_density_feature_mode(config)
     cation = None
     anion = None
@@ -139,10 +165,12 @@ def build_density_feature_state(
         fields.append(normalized_descriptor_field(system, "rho_neutral", neutral, config))
     if mode == "fukui":
         cation = normalized_density_head(
-            system, point_out[:, 1:2], max(system.electron_count - 1.0, 1e-6), normalize=config.normalize_rho
+            system, point_out[:, 1:2], max(system.electron_count - 1.0, 1e-6),
+            config=config, normalize=config.normalize_rho
         )
         anion = normalized_density_head(
-            system, point_out[:, 2:3], system.electron_count + 1.0, normalize=config.normalize_rho
+            system, point_out[:, 2:3], system.electron_count + 1.0,
+            config=config, normalize=config.normalize_rho
         )
         fields.append(normalized_descriptor_field(system, "fukui_plus", anion - neutral, config))
         fields.append(normalized_descriptor_field(system, "fukui_minus", neutral - cation, config))

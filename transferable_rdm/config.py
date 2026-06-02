@@ -74,6 +74,9 @@ class ExperimentConfig:
     pair_density_eps: float = float(os.environ.get("RDM_PAIR_DENSITY_EPS", 1e-14))
     pair_density_value_clip: float = float(os.environ.get("RDM_PAIR_DENSITY_VALUE_CLIP", 8.0))
     pair_density_laplacian_clip: float = float(os.environ.get("RDM_PAIR_DENSITY_LAPLACIAN_CLIP", 8.0))
+    density_baseline_mode: str = os.environ.get("RDM_DENSITY_BASELINE_MODE", "learned")
+    sad_density_floor: float = float(os.environ.get("RDM_SAD_DENSITY_FLOOR", 1e-8))
+    sad_residual_clip: float = float(os.environ.get("RDM_SAD_RESIDUAL_CLIP", 4.0))
 
     # ------------------------------------------------------------------
     # 학습 설정
@@ -100,6 +103,7 @@ class ExperimentConfig:
     point_fukui_weight: float = float(os.environ.get("RDM_POINT_FUKUI_WEIGHT", 0.05))
     point_charged_start_epoch: int = int(os.environ.get("RDM_POINT_CHARGED_START_EPOCH", 30))
     point_fukui_start_epoch: int = int(os.environ.get("RDM_POINT_FUKUI_START_EPOCH", 60))
+    point_fukui_ramp_epochs: int = int(os.environ.get("RDM_POINT_FUKUI_RAMP_EPOCHS", 40))
     point_density_scale_floor: float = float(os.environ.get("RDM_POINT_DENSITY_SCALE_FLOOR", 1e-3))
     point_pretrain_lr_decay: float = float(os.environ.get("RDM_POINT_PRETRAIN_LR_DECAY", 0.5))
     point_pretrain_lr_patience: int = int(os.environ.get("RDM_POINT_PRETRAIN_LR_PATIENCE", 15))

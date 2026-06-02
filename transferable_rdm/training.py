@@ -147,7 +147,7 @@ def point_density_predictions(
     point_out = point_model_outputs(system, models)
     predictions = {
         "rho_neutral": normalized_density_head(
-            system, point_out[:, 0:1], system.electron_count, normalize=config.normalize_rho
+            system, point_out[:, 0:1], system.electron_count, config=config, normalize=config.normalize_rho
         ),
     }
     if pair_density_feature_mode(config) == "fukui":
@@ -157,10 +157,12 @@ def point_density_predictions(
                 "Rebuild NPZ files with --include-charged-density-oracles."
             )
         predictions["rho_cation"] = normalized_density_head(
-            system, point_out[:, 1:2], max(system.electron_count - 1.0, 1e-6), normalize=config.normalize_rho
+            system, point_out[:, 1:2], max(system.electron_count - 1.0, 1e-6),
+            config=config, normalize=config.normalize_rho
         )
         predictions["rho_anion"] = normalized_density_head(
-            system, point_out[:, 2:3], system.electron_count + 1.0, normalize=config.normalize_rho
+            system, point_out[:, 2:3], system.electron_count + 1.0,
+            config=config, normalize=config.normalize_rho
         )
         predictions["fukui_plus"] = predictions["rho_anion"] - predictions["rho_neutral"]
         predictions["fukui_minus"] = predictions["rho_neutral"] - predictions["rho_cation"]
@@ -170,6 +172,26 @@ def point_density_predictions(
 def scaled_field_mse(y_true: tf.Tensor, y_pred: tf.Tensor, scale_floor: float) -> tf.Tensor:
     scale = tf.maximum(tf.sqrt(tf.reduce_mean(tf.square(y_true))), scale_floor)
     return tf.reduce_mean(tf.square((y_pred - y_true) / scale))
+
+
+def point_fukui_weight_at_epoch(config: ExperimentConfig, epoch: int) -> float:
+    if pair_density_feature_mode(config) != "fukui" or epoch < config.point_fukui_start_epoch:
+        return 0.0
+    ramp_epochs = max(int(config.point_fukui_ramp_epochs), 0)
+    if ramp_epochs == 0:
+        return float(config.point_fukui_weight)
+    progress = min((epoch - config.point_fukui_start_epoch + 1) / ramp_epochs, 1.0)
+    return float(config.point_fukui_weight) * progress
+
+
+def point_fukui_ramp_active(config: ExperimentConfig, epoch: int) -> bool:
+    ramp_epochs = max(int(config.point_fukui_ramp_epochs), 0)
+    return (
+        pair_density_feature_mode(config) == "fukui"
+        and ramp_epochs > 0
+        and epoch >= config.point_fukui_start_epoch
+        and epoch < config.point_fukui_start_epoch + ramp_epochs - 1
+    )
 
 
 def point_pretrain_losses(
@@ -197,12 +219,14 @@ def point_pretrain_losses(
                 scaled_field_mse(true_anion - rho_neutral, pred["fukui_plus"], config.point_density_scale_floor)
                 + scaled_field_mse(rho_neutral - true_cation, pred["fukui_minus"], config.point_density_scale_floor)
             )
-    total = neutral_loss + config.point_charged_weight * charged_loss + config.point_fukui_weight * fukui_loss
+    fukui_weight = point_fukui_weight_at_epoch(config, epoch)
+    total = neutral_loss + config.point_charged_weight * charged_loss + fukui_weight * fukui_loss
     return {
         "total": total,
         "neutral": neutral_loss,
         "charged": charged_loss,
         "fukui": fukui_loss,
+        "fukui_weight": tf.constant(fukui_weight, dtype=tf.float32),
     }
 
 
@@ -269,14 +293,19 @@ def pretrain_point_model(
     stale_epochs = 0
     stale_lr_epochs = 0
     previous_stage = None
+    previous_fukui_weight = 0.0
     print_block(
         "Point density pretrain",
         [
             ("pair density feature mode", pair_density_feature_mode(config)),
+            ("density baseline mode", config.density_baseline_mode),
             ("epochs", config.point_pretrain_epochs),
             ("steps/epoch", config.point_pretrain_steps_per_epoch),
             ("charged weight/start", f"{config.point_charged_weight:g} / {config.point_charged_start_epoch}"),
-            ("Fukui weight/start", f"{config.point_fukui_weight:g} / {config.point_fukui_start_epoch}"),
+            (
+                "Fukui weight/start/ramp",
+                f"{config.point_fukui_weight:g} / {config.point_fukui_start_epoch} / {config.point_fukui_ramp_epochs}",
+            ),
             ("density scale floor", f"{config.point_density_scale_floor:g}"),
             (
                 "lr decay",
@@ -300,6 +329,15 @@ def pretrain_point_model(
             stale_lr_epochs = 0
             print(f"Point pretrain stage transition at epoch {epoch}: charged={stage[0]} fukui={stage[1]}")
         previous_stage = stage
+        current_fukui_weight = point_fukui_weight_at_epoch(config, epoch)
+        if current_fukui_weight >= config.point_fukui_weight and previous_fukui_weight < config.point_fukui_weight:
+            best_val = np.inf
+            best_val_for_lr = np.inf
+            best_weights = None
+            stale_epochs = 0
+            stale_lr_epochs = 0
+            print(f"Point pretrain Fukui ramp completed at epoch {epoch}.")
+        previous_fukui_weight = current_fukui_weight
         running = 0.0
         running_components = {"neutral": 0.0, "charged": 0.0, "fukui": 0.0}
         for _ in range(config.point_pretrain_steps_per_epoch):
@@ -323,24 +361,32 @@ def pretrain_point_model(
                 for system in split.val_systems
             ]
             val_loss = float(np.mean(val_losses))
-            if val_loss < best_val - 1e-9:
+            ramp_active = point_fukui_ramp_active(config, epoch)
+            if ramp_active:
+                best_val = val_loss
+                best_val_for_lr = val_loss
+                best_weights = models.point_model.get_weights()
+                stale_epochs = 0
+                stale_lr_epochs = 0
+            elif val_loss < best_val - 1e-9:
                 best_val = val_loss
                 best_weights = models.point_model.get_weights()
                 stale_epochs = 0
             else:
                 stale_epochs += max(config.point_pretrain_val_every, 1)
-            if val_loss < best_val_for_lr - 1e-9:
-                best_val_for_lr = val_loss
-                stale_lr_epochs = 0
-            else:
-                stale_lr_epochs += max(config.point_pretrain_val_every, 1)
-            if stale_lr_epochs >= config.point_pretrain_lr_patience:
-                old_lr = float(optimizer.learning_rate.numpy())
-                new_lr = max(old_lr * config.point_pretrain_lr_decay, config.point_pretrain_min_lr)
-                if new_lr < old_lr:
-                    optimizer.learning_rate.assign(new_lr)
-                    print(f"Point pretrain reduce lr {old_lr:.3e} -> {new_lr:.3e}")
-                stale_lr_epochs = 0
+            if not ramp_active:
+                if val_loss < best_val_for_lr - 1e-9:
+                    best_val_for_lr = val_loss
+                    stale_lr_epochs = 0
+                else:
+                    stale_lr_epochs += max(config.point_pretrain_val_every, 1)
+                if stale_lr_epochs >= config.point_pretrain_lr_patience:
+                    old_lr = float(optimizer.learning_rate.numpy())
+                    new_lr = max(old_lr * config.point_pretrain_lr_decay, config.point_pretrain_min_lr)
+                    if new_lr < old_lr:
+                        optimizer.learning_rate.assign(new_lr)
+                        print(f"Point pretrain reduce lr {old_lr:.3e} -> {new_lr:.3e}")
+                    stale_lr_epochs = 0
         else:
             val_loss = history.val_loss[-1] if history.val_loss else float("nan")
         history.val_loss.append(val_loss)
@@ -351,6 +397,7 @@ def pretrain_point_model(
                 f"rho_N={running_components['neutral'] / denom:.3e} "
                 f"charged={running_components['charged'] / denom:.3e} "
                 f"fukui={running_components['fukui'] / denom:.3e} "
+                f"w(fukui)={point_fukui_weight_at_epoch(config, epoch):.3e} "
                 f"lr={float(optimizer.learning_rate.numpy()):.3e}"
             )
         if stale_epochs >= config.point_pretrain_patience:

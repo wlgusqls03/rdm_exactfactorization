@@ -131,6 +131,7 @@ class SystemRecord:
     gamma_matrix      : (n_points, n_points)
     gamma_pairs       : (n_points^2, 1)
     rho_diag          : (n_points, 1)
+    rho_sad           : (n_points, 1) or None
     pair_left/right   : (n_points^2,)
     pair_distance     : (n_points^2,)
     pair_weights      : (n_points^2, 1)
@@ -159,6 +160,7 @@ class SystemRecord:
     gamma_matrix: np.ndarray
     gamma_pairs: np.ndarray
     rho_diag: np.ndarray
+    rho_sad: np.ndarray | None
     rho_cation: np.ndarray | None
     rho_anion: np.ndarray | None
 
@@ -592,6 +594,7 @@ def finalize_system_record(
     kinetic_potential: np.ndarray | None = None,
     kinetic_potential_centered: np.ndarray | None = None,
     rho_diag_override: np.ndarray | None = None,
+    rho_sad: np.ndarray | None = None,
     rho_cation: np.ndarray | None = None,
     rho_anion: np.ndarray | None = None,
 ) -> SystemRecord:
@@ -679,6 +682,11 @@ def finalize_system_record(
         gamma_matrix=gamma_matrix.astype(np.float32) if keep_gamma_matrix else np.empty((0, 0), dtype=np.float32),
         gamma_pairs=np.empty((0, 1), dtype=np.float32),
         rho_diag=rho_diag,
+        rho_sad=(
+            np.asarray(rho_sad, dtype=np.float32).reshape(n_points, 1)
+            if rho_sad is not None
+            else None
+        ),
         rho_cation=(
             np.asarray(rho_cation, dtype=np.float32).reshape(n_points, 1)
             if rho_cation is not None
@@ -855,6 +863,14 @@ def load_npz_system(path: str | Path, config: ExperimentConfig) -> SystemRecord:
         tau_true_grid = np.asarray(payload["tau_true_ao"], dtype=np.float32) if "tau_true_ao" in payload else None
         electron_count_from_payload = float(payload["electron_count"]) if "electron_count" in payload else None
         rho_diag_override = np.asarray(payload["rho_diag"], dtype=np.float32) if "rho_diag" in payload else None
+        rho_sad = np.asarray(payload["rho_sad"], dtype=np.float32) if "rho_sad" in payload else None
+        if rho_sad is not None and rho_sad.size == 0:
+            rho_sad = None
+        local_feature_schema = str(scalar_payload(payload, "local_feature_schema", ""))
+        if rho_sad is None and local_features.shape[1] >= 16 and local_feature_schema in {"", "sad_vectors_v1"}:
+            # Patched legacy archives stored log1p(rho_sad) as feature column 15
+            # before rho_sad became an explicit NPZ channel.
+            rho_sad = np.expm1(local_features[:, 15:16]).astype(np.float32)
         rho_cation = np.asarray(payload["rho_cation"], dtype=np.float32) if "rho_cation" in payload else None
         rho_anion = np.asarray(payload["rho_anion"], dtype=np.float32) if "rho_anion" in payload else None
         light_cache = None if rho_diag_override is not None else read_npz_light_cache(path)
@@ -901,6 +917,7 @@ def load_npz_system(path: str | Path, config: ExperimentConfig) -> SystemRecord:
             "kinetic_potential_reference": scalar_payload(payload, "kinetic_potential_reference", "not_computed"),
             "tau_reference": "ao_gradient" if tau_true_grid is not None else f"finite_difference_{config.tau_stencil}",
             "charged_density_oracles": rho_cation is not None and rho_anion is not None,
+            "local_feature_schema": local_feature_schema,
         }
 
     return finalize_system_record(
@@ -927,6 +944,7 @@ def load_npz_system(path: str | Path, config: ExperimentConfig) -> SystemRecord:
         kinetic_potential=kinetic_potential,
         kinetic_potential_centered=kinetic_potential_centered,
         rho_diag_override=rho_diag_override,
+        rho_sad=rho_sad,
         rho_cation=rho_cation,
         rho_anion=rho_anion,
     )
