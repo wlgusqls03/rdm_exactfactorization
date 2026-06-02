@@ -117,7 +117,7 @@ def build_metrics_text(summary: dict[str, object], representative: dict[str, obj
     val_avg = summary["val"]
     lines = [
         "Held-out Average",
-        f"pair loss   : {val_avg['pair_loss']:.3e}",
+        f"gamma_pair loss: {val_avg['pair_loss']:.3e}",
         f"density MAE : {val_avg['density_mae']:.3e}",
         f"tau MAE     : {val_avg['tau_mae']:.3e}",
         f"T loss      : {val_avg.get('kinetic_loss', np.nan):.3e}",

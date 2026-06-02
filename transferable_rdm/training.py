@@ -1213,14 +1213,14 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
             if val_metrics:
                 print(
                     " " * 14
-                    + f"held-out mae pair={val_metrics['pair_mae']:.3e} "
+                    + f"held-out mae gamma_pair={val_metrics['pair_mae']:.3e} "
                     + f"rho={val_metrics['density_mae']:.3e} "
                     + f"deriv={val_metrics['deriv_mae']:.3e} "
                     + f"tau={val_metrics['tau_mae']:.3e}"
                 )
                 print(
                     " " * 14
-                    + f"held-out loss pair={val_metrics['pair_loss']:.3e} "
+                    + f"held-out loss gamma_pair={val_metrics['pair_loss']:.3e} "
                     + f"rho={val_metrics['rho_loss']:.3e} "
                     + f"T={val_metrics['kinetic_loss']:.3e} "
                     + f"deriv={val_metrics['deriv_loss']:.3e} "
@@ -1248,7 +1248,7 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
     rows = [
         ("train objective", f"{final_train['objective']:.6e}"),
         ("val objective", f"{final_val['objective']:.6e}"),
-        ("held-out pair loss", f"{final_val['pair_loss']:.6e}"),
+        ("held-out gamma_pair loss", f"{final_val['pair_loss']:.6e}"),
         ("held-out density MAE", f"{final_val['density_mae']:.6e}"),
         ("held-out kinetic loss", f"{final_val['kinetic_loss']:.6e}"),
         ("held-out kinetic abs err", f"{final_val['kinetic_abs_error']:.6e}"),
@@ -1262,7 +1262,7 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
         rows.extend(
             [
                 ("test objective", f"{final_test['objective']:.6e}"),
-                ("test pair loss", f"{final_test['pair_loss']:.6e}"),
+                ("test gamma_pair loss", f"{final_test['pair_loss']:.6e}"),
                 ("test density MAE", f"{final_test['density_mae']:.6e}"),
                 ("test kinetic loss", f"{final_test['kinetic_loss']:.6e}"),
                 ("test kinetic abs err", f"{final_test['kinetic_abs_error']:.6e}"),
