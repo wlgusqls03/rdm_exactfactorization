@@ -87,6 +87,8 @@ class ExperimentConfig:
     val_every: int = int(os.environ.get("RDM_VAL_EVERY", 5))
     log_every: int = int(os.environ.get("RDM_LOG_EVERY", 1))
     early_stopping_patience: int = int(os.environ.get("RDM_PATIENCE", 40))
+    gradient_diagnostics: bool = env_flag("RDM_GRADIENT_DIAGNOSTICS", False)
+    gradient_diagnostics_every: int = int(os.environ.get("RDM_GRADIENT_DIAGNOSTICS_EVERY", 5))
 
     initial_lr: float = env_float_any(("RDM_LEARNING_RATE", "RDM_INITIAL_LR", "RDM_LR"), 3e-4)
     min_lr: float = float(os.environ.get("RDM_MIN_LR", 1e-5))

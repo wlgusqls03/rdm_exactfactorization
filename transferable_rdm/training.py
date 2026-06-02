@@ -1216,6 +1216,98 @@ def compute_training_losses(
     }
 
 
+def gradient_global_norm(grads: list[tf.Tensor | None]) -> float:
+    non_null = [grad for grad in grads if grad is not None]
+    if not non_null:
+        return 0.0
+    return float(tf.linalg.global_norm(non_null).numpy())
+
+
+def tensor_rms(value: tf.Tensor) -> float:
+    return float(tf.sqrt(tf.reduce_mean(tf.square(value))).numpy())
+
+
+def print_gradient_diagnostics(
+    system: SystemRecord,
+    batch: PairBatch,
+    models: ModelBundle,
+    config: ExperimentConfig,
+    weights: dict[str, float],
+) -> None:
+    """Print loss-specific gradient paths on one fixed train-system batch."""
+    variable_groups = {
+        "point": models.point_model.trainable_variables,
+        "mode": models.mode_model.trainable_variables,
+        "pair": models.pair_model.trainable_variables,
+        "context": models.context_model.trainable_variables,
+    }
+    all_vars = [var for variables in variable_groups.values() for var in variables]
+    diagnostic_weights = dict(weights)
+    diagnostic_weights["deriv"] = 1.0
+    diagnostic_weights["tau"] = 1.0
+    diagnostic_weights["kinetic"] = 0.0
+
+    with tf.GradientTape(persistent=True) as tape:
+        losses = compute_training_losses(system, batch, models, config, diagnostic_weights)
+
+    rows: list[tuple[str, str]] = [
+        ("system", system.system_id),
+        (
+            "scheduled weights gamma/deriv/tau",
+            f"{weights['gamma']:.3e} / {weights['deriv']:.3e} / {weights['tau']:.3e}",
+        ),
+    ]
+    effective_norms = {}
+    for label, loss_name, weight_name in (
+        ("gamma", "pair_loss", "gamma"),
+        ("deriv", "deriv_loss", "deriv"),
+        ("tau", "tau_loss", "tau"),
+    ):
+        raw_total = gradient_global_norm(tape.gradient(losses[loss_name], all_vars))
+        effective_total = raw_total * weights[weight_name]
+        effective_norms[label] = effective_total
+        group_norms = {
+            group_name: gradient_global_norm(tape.gradient(losses[loss_name], variables)) if variables else 0.0
+            for group_name, variables in variable_groups.items()
+        }
+        rows.extend(
+            [
+                (f"{label} loss", f"{float(losses[loss_name].numpy()):.6e}"),
+                (f"{label} grad raw/effective", f"{raw_total:.6e} / {effective_total:.6e}"),
+                (
+                    f"{label} grad point/mode/pair/context",
+                    " / ".join(f"{group_norms[name]:.3e}" for name in ("point", "mode", "pair", "context")),
+                ),
+            ]
+        )
+    gamma_effective = max(effective_norms["gamma"], 1e-30)
+    rows.append(
+        (
+            "effective grad ratio deriv/tau vs gamma",
+            f"{effective_norms['deriv'] / gamma_effective:.6e} / {effective_norms['tau'] / gamma_effective:.6e}",
+        )
+    )
+    del tape
+
+    _, density_state = point_output_and_state(system, models, config)
+    derivative_pred, tau_pred = stencil_predictions(
+        system, models, config, rho_all=density_state.rho_neutral, density_state=density_state
+    )
+    rows.extend(
+        [
+            (
+                "deriv RMS target/pred",
+                f"{tensor_rms(to_tensor(system.derivative_true)):.6e} / {tensor_rms(derivative_pred):.6e}",
+            ),
+            (
+                "tau RMS target/pred",
+                f"{tensor_rms(to_tensor(system.tau_true)):.6e} / {tensor_rms(tau_pred):.6e}",
+            ),
+        ]
+    )
+    print_block("Gradient diagnostics", rows)
+
+
 def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBundle) -> tuple[TrainingHistory, dict[str, object]]:
     """multi-system transferable training."""
     optimizer = optimizer_from_config(config)
@@ -1229,6 +1321,17 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
     best_val_for_lr = np.inf
 
     vars_all = trainable_variables(models)
+    diagnostic_system = split.train_systems[0]
+    diagnostic_batch = (
+        sample_pair_batch(
+            diagnostic_system,
+            config,
+            epoch=0,
+            rng=np.random.default_rng(config.seed + 2026),
+        )
+        if config.gradient_diagnostics
+        else None
+    )
     last_stage_signature: tuple[int, ...] | None = None
     last_epoch = 0
     print_block("Base loss weights", loss_weight_rows(config))
@@ -1247,6 +1350,14 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
         [
             ("normalize_rho", config.normalize_rho),
             ("frozen density-state cache", config.freeze_point_after_pretrain),
+        ],
+    )
+    print_block(
+        "Gradient diagnostics",
+        [
+            ("enabled", config.gradient_diagnostics),
+            ("every epochs", max(config.gradient_diagnostics_every, 1)),
+            ("fixed train system", diagnostic_system.system_id),
         ],
     )
 
@@ -1308,6 +1419,14 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
                 history.val_components[key].append(float("nan"))
 
         history.val_objective.append(val_objective)
+
+        if (
+            validation_ran
+            and config.gradient_diagnostics
+            and epoch % max(config.gradient_diagnostics_every, 1) == 0
+        ):
+            assert diagnostic_batch is not None
+            print_gradient_diagnostics(diagnostic_system, diagnostic_batch, models, config, weights)
 
         if validation_ran:
             if val_objective < best_val_objective - 1e-9:

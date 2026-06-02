@@ -205,8 +205,15 @@ RDM_DERIV_RAMP_EPOCHS=40 \
 RDM_TAU_START_EPOCH=30 \
 RDM_TAU_RAMP_EPOCHS=40 \
 RDM_USE_KINETIC_LOSS=0 \
+RDM_GRADIENT_DIAGNOSTICS=1 \
+RDM_GRADIENT_DIAGNOSTICS_EVERY=5 \
 python train_transferable_1rdm.py ...
 ```
+
+Gradient diagnostics use one fixed train-system batch and report raw and
+schedule-weighted gradient norms for gamma, derivative, and tau losses. They
+also split each norm across the point, mode, pair, and context models and print
+target/prediction RMS values for derivative and tau fields.
 
 Recommended Fukui-feature training command for an existing 500-molecule charged
 oracle NPZ dataset:
