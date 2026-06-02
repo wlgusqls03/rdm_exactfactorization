@@ -116,6 +116,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-system-count", type=int, default=None)
     parser.add_argument("--axis-points", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--eval-pair-count", type=int, default=None)
     parser.add_argument("--width", type=int, default=None)
     parser.add_argument("--point-model-depth", type=int, default=None)
     parser.add_argument("--rank", type=int, default=None)
@@ -186,6 +187,7 @@ def apply_overrides(config: ExperimentConfig, args: argparse.Namespace) -> Exper
         ("test_system_count", "test_system_count"),
         ("axis_points", "axis_points"),
         ("batch_size", "batch_size"),
+        ("eval_pair_count", "eval_pair_count"),
         ("model_width", "width"),
         ("point_model_depth", "point_model_depth"),
         ("learned_rank", "rank"),
