@@ -93,6 +93,19 @@ uniform Cartesian grid라고 가정하며, `points`로부터 axis를 복원한�
 
 ## 파일 구조
 
+Point density pretrain은 기본적으로 scaled MSE, integrated relative L1,
+log-density MSE의 가중합을 사용한다. 부호가 있는 Fukui field에는 log 항을
+적용하지 않는다. 각 항은 CLI 또는 대응하는 `RDM_POINT_DENSITY_*` 환경
+변수로 조정할 수 있다.
+
+```bash
+python train_transferable_1rdm.py \
+  --point-density-mse-weight 1.0 \
+  --point-density-rel-l1-weight 0.25 \
+  --point-density-log-weight 0.02 \
+  --point-density-log-eps 1e-8
+```
+
 - `config.py`: 실험 설정
 - `systems.py`: KS-like synthetic system 생성과 NPZ loader
 - `data.py`: system split, pair feature, curriculum sampler

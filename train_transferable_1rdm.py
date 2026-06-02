@@ -133,6 +133,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--point-fukui-start-epoch", type=int, default=None)
     parser.add_argument("--point-fukui-ramp-epochs", type=int, default=None)
     parser.add_argument("--point-density-scale-floor", type=float, default=None)
+    parser.add_argument("--point-density-mse-weight", type=float, default=None)
+    parser.add_argument("--point-density-rel-l1-weight", type=float, default=None)
+    parser.add_argument("--point-density-log-weight", type=float, default=None)
+    parser.add_argument("--point-density-log-eps", type=float, default=None)
     parser.add_argument("--pair-density-feature-mode", choices=PAIR_DENSITY_FEATURE_MODES, default=None)
     parser.add_argument("--density-baseline-mode", choices=DENSITY_BASELINE_MODES, default=None)
     parser.add_argument("--sad-density-floor", type=float, default=None)
@@ -204,6 +208,10 @@ def apply_overrides(config: ExperimentConfig, args: argparse.Namespace) -> Exper
         ("point_fukui_start_epoch", "point_fukui_start_epoch"),
         ("point_fukui_ramp_epochs", "point_fukui_ramp_epochs"),
         ("point_density_scale_floor", "point_density_scale_floor"),
+        ("point_density_mse_weight", "point_density_mse_weight"),
+        ("point_density_rel_l1_weight", "point_density_rel_l1_weight"),
+        ("point_density_log_weight", "point_density_log_weight"),
+        ("point_density_log_eps", "point_density_log_eps"),
         ("pair_density_feature_mode", "pair_density_feature_mode"),
         ("density_baseline_mode", "density_baseline_mode"),
         ("sad_density_floor", "sad_density_floor"),

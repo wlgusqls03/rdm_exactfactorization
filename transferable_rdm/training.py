@@ -241,6 +241,55 @@ def scaled_field_mse(y_true: tf.Tensor, y_pred: tf.Tensor, scale_floor: float) -
     return tf.reduce_mean(tf.square((y_pred - y_true) / scale))
 
 
+def relative_field_l1(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
+    return tf.reduce_sum(tf.abs(y_pred - y_true)) / tf.maximum(tf.reduce_sum(tf.abs(y_true)), 1e-12)
+
+
+def log_density_mse(y_true: tf.Tensor, y_pred: tf.Tensor, eps: float) -> tf.Tensor:
+    floor = max(float(eps), 1e-30)
+    log_true = tf.math.log(tf.maximum(y_true, floor))
+    log_pred = tf.math.log(tf.maximum(y_pred, floor))
+    return tf.reduce_mean(tf.square(log_pred - log_true))
+
+
+def density_field_loss_components(
+    y_true: tf.Tensor,
+    y_pred: tf.Tensor,
+    config: ExperimentConfig,
+    *,
+    include_log: bool = True,
+) -> dict[str, tf.Tensor]:
+    scaled_mse = scaled_field_mse(y_true, y_pred, config.point_density_scale_floor)
+    relative_l1 = relative_field_l1(y_true, y_pred)
+    log_mse = (
+        log_density_mse(y_true, y_pred, config.point_density_log_eps)
+        if include_log
+        else tf.constant(0.0, dtype=tf.float32)
+    )
+    total = (
+        config.point_density_mse_weight
+        * scaled_mse
+        + config.point_density_rel_l1_weight * relative_l1
+        + config.point_density_log_weight * log_mse
+    )
+    return {
+        "total": total,
+        "scaled_mse": scaled_mse,
+        "relative_l1": relative_l1,
+        "log_mse": log_mse,
+    }
+
+
+def density_field_loss(
+    y_true: tf.Tensor,
+    y_pred: tf.Tensor,
+    config: ExperimentConfig,
+    *,
+    include_log: bool = True,
+) -> tf.Tensor:
+    return density_field_loss_components(y_true, y_pred, config, include_log=include_log)["total"]
+
+
 def point_fukui_weight_at_epoch(config: ExperimentConfig, epoch: int) -> float:
     if pair_density_feature_mode(config) != "fukui" or epoch < config.point_fukui_start_epoch:
         return 0.0
@@ -269,7 +318,8 @@ def point_pretrain_losses(
 ) -> dict[str, tf.Tensor]:
     pred = point_density_predictions(system, models, config)
     zero = tf.constant(0.0, dtype=tf.float32)
-    neutral_loss = scaled_field_mse(to_tensor(system.rho_diag), pred["rho_neutral"], config.point_density_scale_floor)
+    neutral_components = density_field_loss_components(to_tensor(system.rho_diag), pred["rho_neutral"], config)
+    neutral_loss = neutral_components["total"]
     charged_loss = zero
     fukui_loss = zero
     if pair_density_feature_mode(config) == "fukui":
@@ -277,14 +327,14 @@ def point_pretrain_losses(
         true_anion = to_tensor(system.rho_anion)
         if epoch >= config.point_charged_start_epoch:
             charged_loss = 0.5 * (
-                scaled_field_mse(true_cation, pred["rho_cation"], config.point_density_scale_floor)
-                + scaled_field_mse(true_anion, pred["rho_anion"], config.point_density_scale_floor)
+                density_field_loss(true_cation, pred["rho_cation"], config)
+                + density_field_loss(true_anion, pred["rho_anion"], config)
             )
         if epoch >= config.point_fukui_start_epoch:
             rho_neutral = to_tensor(system.rho_diag)
             fukui_loss = 0.5 * (
-                scaled_field_mse(true_anion - rho_neutral, pred["fukui_plus"], config.point_density_scale_floor)
-                + scaled_field_mse(rho_neutral - true_cation, pred["fukui_minus"], config.point_density_scale_floor)
+                density_field_loss(true_anion - rho_neutral, pred["fukui_plus"], config, include_log=False)
+                + density_field_loss(rho_neutral - true_cation, pred["fukui_minus"], config, include_log=False)
             )
     fukui_weight = point_fukui_weight_at_epoch(config, epoch)
     total = neutral_loss + config.point_charged_weight * charged_loss + fukui_weight * fukui_loss
@@ -293,6 +343,9 @@ def point_pretrain_losses(
         "neutral": neutral_loss,
         "charged": charged_loss,
         "fukui": fukui_loss,
+        "neutral_scaled_mse": neutral_components["scaled_mse"],
+        "neutral_relative_l1": neutral_components["relative_l1"],
+        "neutral_log_mse": neutral_components["log_mse"],
         "fukui_weight": tf.constant(fukui_weight, dtype=tf.float32),
         "delta_raw": pred["delta_raw"],
     }
@@ -383,6 +436,13 @@ def pretrain_point_model(
             ),
             ("density scale floor", f"{config.point_density_scale_floor:g}"),
             (
+                "density loss weights",
+                f"scaled-MSE={config.point_density_mse_weight:g}, "
+                f"relative-L1={config.point_density_rel_l1_weight:g}, "
+                f"log-rho-MSE={config.point_density_log_weight:g}",
+            ),
+            ("density log epsilon", f"{config.point_density_log_eps:g}"),
+            (
                 "lr decay",
                 f"factor={config.point_pretrain_lr_decay:g}, "
                 f"patience={config.point_pretrain_lr_patience}, min={config.point_pretrain_min_lr:g}",
@@ -414,7 +474,14 @@ def pretrain_point_model(
             print(f"Point pretrain Fukui ramp completed at epoch {epoch}.")
         previous_fukui_weight = current_fukui_weight
         running = 0.0
-        running_components = {"neutral": 0.0, "charged": 0.0, "fukui": 0.0}
+        running_components = {
+            "neutral": 0.0,
+            "charged": 0.0,
+            "fukui": 0.0,
+            "neutral_scaled_mse": 0.0,
+            "neutral_relative_l1": 0.0,
+            "neutral_log_mse": 0.0,
+        }
         last_delta_raw = None
         for _ in range(config.point_pretrain_steps_per_epoch):
             system = choose_system(split.train_systems, rng)
@@ -477,6 +544,11 @@ def pretrain_point_model(
                 f"fukui={running_components['fukui'] / denom:.3e} "
                 f"w(fukui)={point_fukui_weight_at_epoch(config, epoch):.3e} "
                 f"lr={float(optimizer.learning_rate.numpy()):.3e}"
+            )
+            print(
+                f"              rho_N terms scaled-MSE={running_components['neutral_scaled_mse'] / denom:.3e} "
+                f"relative-L1={running_components['neutral_relative_l1'] / denom:.3e} "
+                f"log-rho-MSE={running_components['neutral_log_mse'] / denom:.3e}"
             )
             if last_delta_raw is not None:
                 delta_diagnostics = empty_delta_diagnostics(int(last_delta_raw.shape[1]))
