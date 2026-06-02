@@ -12,6 +12,7 @@ from .density_features import (
     cache_frozen_density_state,
     cached_frozen_density_state,
     clear_frozen_density_state_cache,
+    density_baseline_mode,
     normalized_density_head,
     pair_density_features,
     pair_density_feature_mode,
@@ -146,6 +147,7 @@ def point_density_predictions(
 ) -> dict[str, tf.Tensor]:
     point_out = point_model_outputs(system, models)
     predictions = {
+        "delta_raw": point_out,
         "rho_neutral": normalized_density_head(
             system, point_out[:, 0:1], system.electron_count, config=config, normalize=config.normalize_rho
         ),
@@ -167,6 +169,71 @@ def point_density_predictions(
         predictions["fukui_plus"] = predictions["rho_anion"] - predictions["rho_neutral"]
         predictions["fukui_minus"] = predictions["rho_neutral"] - predictions["rho_cation"]
     return predictions
+
+
+def empty_delta_diagnostics(n_heads: int) -> dict[str, np.ndarray | int]:
+    return {
+        "min": np.full(n_heads, np.inf, dtype=np.float64),
+        "max": np.full(n_heads, -np.inf, dtype=np.float64),
+        "clip_low_count": np.zeros(n_heads, dtype=np.int64),
+        "clip_high_count": np.zeros(n_heads, dtype=np.int64),
+        "count": 0,
+    }
+
+
+def update_delta_diagnostics(
+    diagnostics: dict[str, np.ndarray | int],
+    raw_heads: tf.Tensor,
+    clip: float,
+) -> None:
+    clip = max(float(clip), 0.0)
+    diagnostics["min"] = np.minimum(diagnostics["min"], tf.reduce_min(raw_heads, axis=0).numpy())
+    diagnostics["max"] = np.maximum(diagnostics["max"], tf.reduce_max(raw_heads, axis=0).numpy())
+    diagnostics["clip_low_count"] += tf.reduce_sum(tf.cast(raw_heads <= -clip, tf.int64), axis=0).numpy()
+    diagnostics["clip_high_count"] += tf.reduce_sum(tf.cast(raw_heads >= clip, tf.int64), axis=0).numpy()
+    diagnostics["count"] += int(tf.shape(raw_heads)[0].numpy())
+
+
+def delta_diagnostic_scalars(diagnostics: dict[str, np.ndarray | int]) -> dict[str, float]:
+    labels = ("N", "N_minus_1", "N_plus_1")
+    count = max(int(diagnostics["count"]), 1)
+    scalars = {}
+    for index in range(len(diagnostics["min"])):
+        prefix = f"delta_{labels[index]}"
+        scalars[f"{prefix}_min"] = float(diagnostics["min"][index])
+        scalars[f"{prefix}_max"] = float(diagnostics["max"][index])
+        scalars[f"{prefix}_clip_low_fraction"] = float(diagnostics["clip_low_count"][index] / count)
+        scalars[f"{prefix}_clip_high_fraction"] = float(diagnostics["clip_high_count"][index] / count)
+    return scalars
+
+
+def format_delta_diagnostics(diagnostics: dict[str, np.ndarray | int]) -> str:
+    labels = ("N", "N-1", "N+1")
+    scalars = delta_diagnostic_scalars(diagnostics)
+    chunks = []
+    for index, label in enumerate(labels[: len(diagnostics["min"])]):
+        key = ("N", "N_minus_1", "N_plus_1")[index]
+        chunks.append(
+            f"{label}=[{scalars[f'delta_{key}_min']:.2f},{scalars[f'delta_{key}_max']:.2f}] "
+            f"clip={100.0 * scalars[f'delta_{key}_clip_low_fraction']:.2f}/"
+            f"{100.0 * scalars[f'delta_{key}_clip_high_fraction']:.2f}%"
+        )
+    return "; ".join(chunks)
+
+
+def format_delta_scalar_summary(summary: dict[str, object]) -> str:
+    labels = (("N", "N"), ("N-1", "N_minus_1"), ("N+1", "N_plus_1"))
+    chunks = []
+    for display_label, key in labels:
+        if f"delta_{key}_min" not in summary:
+            continue
+        chunks.append(
+            f"{display_label}=[{float(summary[f'delta_{key}_min']):.2f},"
+            f"{float(summary[f'delta_{key}_max']):.2f}] "
+            f"clip={100.0 * float(summary[f'delta_{key}_clip_low_fraction']):.2f}/"
+            f"{100.0 * float(summary[f'delta_{key}_clip_high_fraction']):.2f}%"
+        )
+    return "; ".join(chunks)
 
 
 def scaled_field_mse(y_true: tf.Tensor, y_pred: tf.Tensor, scale_floor: float) -> tf.Tensor:
@@ -227,6 +294,7 @@ def point_pretrain_losses(
         "charged": charged_loss,
         "fukui": fukui_loss,
         "fukui_weight": tf.constant(fukui_weight, dtype=tf.float32),
+        "delta_raw": pred["delta_raw"],
     }
 
 
@@ -238,8 +306,13 @@ def evaluate_point_model(
     keep_arrays: bool = False,
 ) -> dict[str, object]:
     per_system = []
+    delta_diagnostics = None
     for idx, system in enumerate(systems):
         pred = point_density_predictions(system, models, config)
+        if density_baseline_mode(config) == "sad-multiplicative":
+            if delta_diagnostics is None:
+                delta_diagnostics = empty_delta_diagnostics(int(pred["delta_raw"].shape[1]))
+            update_delta_diagnostics(delta_diagnostics, pred["delta_raw"], config.sad_residual_clip)
         entry: dict[str, object] = {
             "system_id": system.system_id,
             "rho_neutral_mae": float(np.mean(np.abs(pred["rho_neutral"].numpy() - system.rho_diag))),
@@ -274,6 +347,8 @@ def evaluate_point_model(
         if key.endswith("_mae") or key.endswith("_rel_l1")
     ]
     summary = {key: float(np.mean([entry[key] for entry in per_system])) for key in scalar_keys}
+    if delta_diagnostics is not None:
+        summary.update(delta_diagnostic_scalars(delta_diagnostics))
     summary["per_system"] = per_system
     return summary
 
@@ -340,6 +415,7 @@ def pretrain_point_model(
         previous_fukui_weight = current_fukui_weight
         running = 0.0
         running_components = {"neutral": 0.0, "charged": 0.0, "fukui": 0.0}
+        last_delta_raw = None
         for _ in range(config.point_pretrain_steps_per_epoch):
             system = choose_system(split.train_systems, rng)
             with tf.GradientTape() as tape:
@@ -351,6 +427,8 @@ def pretrain_point_model(
             running += float(loss.numpy())
             for key in running_components:
                 running_components[key] += float(losses[key].numpy())
+            if density_baseline_mode(config) == "sad-multiplicative":
+                last_delta_raw = losses["delta_raw"]
         train_loss = running / max(config.point_pretrain_steps_per_epoch, 1)
         history.train_loss.append(train_loss)
         history.learning_rate.append(float(optimizer.learning_rate.numpy()))
@@ -400,6 +478,10 @@ def pretrain_point_model(
                 f"w(fukui)={point_fukui_weight_at_epoch(config, epoch):.3e} "
                 f"lr={float(optimizer.learning_rate.numpy()):.3e}"
             )
+            if last_delta_raw is not None:
+                delta_diagnostics = empty_delta_diagnostics(int(last_delta_raw.shape[1]))
+                update_delta_diagnostics(delta_diagnostics, last_delta_raw, config.sad_residual_clip)
+                print(f"              delta raw sample {format_delta_diagnostics(delta_diagnostics)}")
         if stale_epochs >= config.point_pretrain_patience:
             print(f"Point pretrain early stopping at epoch {epoch}.")
             break
@@ -423,6 +505,8 @@ def pretrain_point_model(
             ("point trainable in pair stage", models.point_model.trainable),
         ],
     )
+    if density_baseline_mode(config) == "sad-multiplicative":
+        print(f"val delta raw               : {format_delta_scalar_summary(summary['val'])}")
     return history, summary
 
 
