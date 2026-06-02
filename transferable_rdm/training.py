@@ -52,8 +52,10 @@ VAL_HISTORY_KEYS = (
     "kernel_loss",
     "kernel_diag_error",
     "deriv_loss",
+    "deriv_raw_mse",
     "deriv_mae",
     "tau_loss",
+    "tau_raw_mse",
     "tau_mae",
     "kinetic_loss",
     "kinetic_abs_error",
@@ -112,6 +114,25 @@ class PointPretrainHistory:
 
 def weighted_mse(y_true: tf.Tensor, y_pred: tf.Tensor, weights: tf.Tensor) -> tf.Tensor:
     return tf.reduce_sum(weights * tf.square(y_true - y_pred)) / tf.reduce_sum(weights)
+
+
+def rms_normalized_huber(
+    y_true: tf.Tensor,
+    y_pred: tf.Tensor,
+    *,
+    scale_floor: float,
+    delta: float,
+) -> tf.Tensor:
+    """Huber loss after scaling errors by the target RMS."""
+    if scale_floor <= 0.0:
+        raise ValueError("RMS-normalized Huber scale_floor must be positive.")
+    if delta <= 0.0:
+        raise ValueError("RMS-normalized Huber delta must be positive.")
+    scale = tf.maximum(tf.sqrt(tf.reduce_mean(tf.square(y_true))), float(scale_floor))
+    scaled_abs_error = tf.abs((y_pred - y_true) / scale)
+    quadratic = tf.minimum(scaled_abs_error, float(delta))
+    linear = scaled_abs_error - quadratic
+    return tf.reduce_mean(0.5 * tf.square(quadratic) + float(delta) * linear)
 
 
 def to_tensor(array: np.ndarray) -> tf.Tensor:
@@ -739,6 +760,8 @@ def loss_enabled(config: ExperimentConfig, name: str) -> bool:
     preset = config.loss_preset.strip().lower()
     if preset in {"core5", "simple5"}:
         return name in {"gamma", "rho", "kernel", "trace", "mode"}
+    if preset in {"staged-physics", "physics7"}:
+        return name in {"gamma", "rho", "kernel", "deriv", "tau", "trace", "mode"}
     if preset in {"core7", "kerdf7"}:
         return name in {"gamma", "rho", "kernel", "trace", "mode", "kinetic"}
     if preset in {"all", "custom", "none"}:
@@ -754,11 +777,10 @@ def loss_weight(config: ExperimentConfig, name: str) -> float:
 
 def loss_schedule_multiplier(config: ExperimentConfig, name: str, epoch: int) -> float:
     """Epoch-dependent multiplier for staged loss terms."""
-    if name == "kinetic":
-        start_epoch = max(int(config.kinetic_start_epoch), 0)
-        ramp_epochs = max(int(config.kinetic_ramp_epochs), 0)
-    else:
+    if name not in {"deriv", "tau", "kinetic"}:
         return 1.0
+    start_epoch = max(int(getattr(config, f"{name}_start_epoch")), 0)
+    ramp_epochs = max(int(getattr(config, f"{name}_ramp_epochs")), 0)
 
     if epoch < start_epoch:
         return 0.0
@@ -780,6 +802,8 @@ def loss_weight_rows(config: ExperimentConfig, epoch: int | None = None) -> list
 
 def loss_schedule_rows(config: ExperimentConfig) -> list[tuple[str, str]]:
     return [
+        ("deriv start/ramp epochs", f"{config.deriv_start_epoch}/{config.deriv_ramp_epochs}"),
+        ("tau start/ramp epochs", f"{config.tau_start_epoch}/{config.tau_ramp_epochs}"),
         ("kinetic start/ramp epochs", f"{config.kinetic_start_epoch}/{config.kinetic_ramp_epochs}"),
     ]
 
@@ -793,7 +817,7 @@ def loss_stage_value(config: ExperimentConfig, name: str, epoch: int) -> int:
     """0: inactive, 1: scheduled ramp, 2: fully active."""
     if scheduled_loss_weight(config, name, epoch) == 0.0:
         return 0
-    if name == "kinetic" and loss_schedule_multiplier(config, name, epoch) < 1.0:
+    if loss_schedule_multiplier(config, name, epoch) < 1.0:
         return 1
     return 2
 
@@ -915,8 +939,24 @@ def evaluate_system(
     )
     derivative_pred = derivative_pred_t.numpy()
     tau_pred = tau_pred_t.numpy()
-    deriv_loss = float(np.mean((derivative_pred - system.derivative_true) ** 2))
-    tau_loss = float(np.mean((tau_pred - system.tau_true) ** 2))
+    deriv_raw_mse = float(np.mean((derivative_pred - system.derivative_true) ** 2))
+    tau_raw_mse = float(np.mean((tau_pred - system.tau_true) ** 2))
+    deriv_loss = float(
+        rms_normalized_huber(
+            to_tensor(system.derivative_true),
+            derivative_pred_t,
+            scale_floor=config.deriv_scale_floor,
+            delta=config.physics_huber_delta,
+        ).numpy()
+    )
+    tau_loss = float(
+        rms_normalized_huber(
+            to_tensor(system.tau_true),
+            tau_pred_t,
+            scale_floor=config.tau_scale_floor,
+            delta=config.physics_huber_delta,
+        ).numpy()
+    )
     deriv_mae = float(np.mean(np.abs(derivative_pred - system.derivative_true)))
     tau_mae = float(np.mean(np.abs(tau_pred - system.tau_true)))
     kinetic_loss_t, kinetic_pred_t, kinetic_ref = kinetic_energy_loss_from_tau(system, tau_pred_t)
@@ -969,8 +1009,10 @@ def evaluate_system(
         "kernel_loss": kernel_loss,
         "kernel_diag_error": kernel_diag_error,
         "deriv_loss": deriv_loss,
+        "deriv_raw_mse": deriv_raw_mse,
         "deriv_mae": deriv_mae,
         "tau_loss": tau_loss,
+        "tau_raw_mse": tau_raw_mse,
         "tau_mae": tau_mae,
         "kinetic_loss": kinetic_loss,
         "kinetic_pred": kinetic_pred,
@@ -1052,8 +1094,10 @@ def evaluate_systems(
         "kernel_loss",
         "kernel_diag_error",
         "deriv_loss",
+        "deriv_raw_mse",
         "deriv_mae",
         "tau_loss",
+        "tau_raw_mse",
         "tau_mae",
         "kinetic_loss",
         "kinetic_pred",
@@ -1130,8 +1174,18 @@ def compute_training_losses(
         derivative_pred, tau_pred = stencil_predictions(
             system, models, config, rho_all=rho_all, density_state=density_state
         )
-        deriv_loss = tf.reduce_mean(tf.square(derivative_pred - to_tensor(system.derivative_true)))
-        tau_loss = tf.reduce_mean(tf.square(tau_pred - to_tensor(system.tau_true)))
+        deriv_loss = rms_normalized_huber(
+            to_tensor(system.derivative_true),
+            derivative_pred,
+            scale_floor=config.deriv_scale_floor,
+            delta=config.physics_huber_delta,
+        )
+        tau_loss = rms_normalized_huber(
+            to_tensor(system.tau_true),
+            tau_pred,
+            scale_floor=config.tau_scale_floor,
+            delta=config.physics_huber_delta,
+        )
         kinetic_loss, _, _ = kinetic_energy_loss_from_tau(system, tau_pred)
     else:
         deriv_loss = zero
@@ -1179,6 +1233,15 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
     last_epoch = 0
     print_block("Base loss weights", loss_weight_rows(config))
     print_block("Loss schedule", loss_schedule_rows(config))
+    print_block(
+        "Physics loss",
+        [
+            ("deriv/tau loss", "target-RMS normalized Huber"),
+            ("Huber delta", f"{config.physics_huber_delta:.6g}"),
+            ("deriv/tau scale floor", f"{config.deriv_scale_floor:.6g} / {config.tau_scale_floor:.6g}"),
+            ("kinetic integral active", loss_enabled(config, "kinetic")),
+        ],
+    )
     print_block(
         "Density constraint",
         [
@@ -1295,10 +1358,15 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
                     + f"held-out loss gamma_pair={val_metrics['pair_loss']:.3e} "
                     + f"rho={val_metrics['rho_loss']:.3e} "
                     + f"T={val_metrics['kinetic_loss']:.3e} "
-                    + f"deriv={val_metrics['deriv_loss']:.3e} "
-                    + f"tau={val_metrics['tau_loss']:.3e} "
+                    + f"deriv_huber={val_metrics['deriv_loss']:.3e} "
+                    + f"tau_huber={val_metrics['tau_loss']:.3e} "
                     + f"trace_rel={val_metrics['trace_abs_rel_error']:.3e} "
                     + f"occ_pen={val_metrics['occ_penalty']:.3e}"
+                )
+                print(
+                    " " * 14
+                    + f"held-out raw mse deriv={val_metrics['deriv_raw_mse']:.3e} "
+                    + f"tau={val_metrics['tau_raw_mse']:.3e}"
                 )
 
         if validation_ran and epochs_without_improvement >= config.early_stopping_patience:

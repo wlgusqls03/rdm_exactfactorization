@@ -120,6 +120,7 @@ class ExperimentConfig:
     loss_preset: str = os.environ.get("RDM_LOSS_PRESET", "core5")
     # "all" / "custom" : individual RDM_USE_*_LOSS switches decide active terms
     # "core5"          : gamma + rho + kernel + trace + mode only
+    # "staged-physics" : core5 + RMS-normalized Huber derivative/tau terms
 
     use_gamma_loss: bool = env_flag("RDM_USE_GAMMA_LOSS", True)
     use_rho_loss: bool = env_flag("RDM_USE_RHO_LOSS", True)
@@ -146,8 +147,15 @@ class ExperimentConfig:
     # ------------------------------------------------------------------
     # These keep the base loss definition intact, but allow expensive or
     # delicate targets to enter only after the density/gamma fit has stabilized.
+    deriv_start_epoch: int = int(os.environ.get("RDM_DERIV_START_EPOCH", 30))
+    deriv_ramp_epochs: int = int(os.environ.get("RDM_DERIV_RAMP_EPOCHS", 40))
+    tau_start_epoch: int = int(os.environ.get("RDM_TAU_START_EPOCH", 30))
+    tau_ramp_epochs: int = int(os.environ.get("RDM_TAU_RAMP_EPOCHS", 40))
     kinetic_start_epoch: int = int(os.environ.get("RDM_KINETIC_START_EPOCH", 0))
     kinetic_ramp_epochs: int = int(os.environ.get("RDM_KINETIC_RAMP_EPOCHS", 0))
+    physics_huber_delta: float = float(os.environ.get("RDM_PHYSICS_HUBER_DELTA", 1.0))
+    deriv_scale_floor: float = float(os.environ.get("RDM_DERIV_SCALE_FLOOR", 1e-6))
+    tau_scale_floor: float = float(os.environ.get("RDM_TAU_SCALE_FLOOR", 1e-6))
 
     # ------------------------------------------------------------------
     # 출력 설정

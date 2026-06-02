@@ -191,6 +191,23 @@ The main training entry point is:
 train_transferable_1rdm.py
 ```
 
+For staged derivative and kinetic-density training, use
+`RDM_LOSS_PRESET=staged-physics`. This keeps the integrated kinetic-energy loss
+off, trains the core gamma/rho terms first, then ramps target-RMS-normalized
+Huber losses for the derivative and tau fields:
+
+```bash
+RDM_LOSS_PRESET=staged-physics \
+RDM_LAMBDA_DERIV=1.0e-4 \
+RDM_LAMBDA_TAU=1.0e-4 \
+RDM_DERIV_START_EPOCH=30 \
+RDM_DERIV_RAMP_EPOCHS=40 \
+RDM_TAU_START_EPOCH=30 \
+RDM_TAU_RAMP_EPOCHS=40 \
+RDM_USE_KINETIC_LOSS=0 \
+python train_transferable_1rdm.py ...
+```
+
 Recommended Fukui-feature training command for an existing 500-molecule charged
 oracle NPZ dataset:
 
