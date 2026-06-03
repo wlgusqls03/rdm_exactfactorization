@@ -215,6 +215,24 @@ schedule-weighted gradient norms for gamma, derivative, and tau losses. They
 also split each norm across the point, mode, pair, and context models and print
 target/prediction RMS values for derivative and tau fields.
 
+The default kernel also includes a near-diagonal local curvature correction:
+
+```text
+K = K_base * ((1 - gate) + gate * K_residual) + K_local
+```
+
+`K_local` is zero on the exact diagonal, so the density/kernel diagonal
+constraint is preserved, and is windowed by `exp(-|r-r'|^2 / sigma^2)` so it
+only acts on short-range off-diagonal stencil pairs. The local head is
+zero-initialized; it starts as the previous kernel and learns only if the
+derivative/tau losses supply useful signal. Useful controls:
+
+```bash
+RDM_USE_LOCAL_CURVATURE_KERNEL=1 \
+RDM_LOCAL_CURVATURE_SCALE=0.5 \
+RDM_LOCAL_CURVATURE_SIGMA=1.0
+```
+
 Recommended Fukui-feature training command for an existing 500-molecule charged
 oracle NPZ dataset:
 

@@ -77,6 +77,10 @@ class ExperimentConfig:
     density_baseline_mode: str = os.environ.get("RDM_DENSITY_BASELINE_MODE", "learned")
     sad_density_floor: float = float(os.environ.get("RDM_SAD_DENSITY_FLOOR", 1e-8))
     sad_residual_clip: float = float(os.environ.get("RDM_SAD_RESIDUAL_CLIP", 4.0))
+    use_local_curvature_kernel: bool = env_flag("RDM_USE_LOCAL_CURVATURE_KERNEL", True)
+    local_curvature_scale: float = float(os.environ.get("RDM_LOCAL_CURVATURE_SCALE", 0.5))
+    local_curvature_sigma: float = float(os.environ.get("RDM_LOCAL_CURVATURE_SIGMA", 1.0))
+    local_curvature_diag_eps: float = float(os.environ.get("RDM_LOCAL_CURVATURE_DIAG_EPS", 1e-8))
 
     # ------------------------------------------------------------------
     # 학습 설정
