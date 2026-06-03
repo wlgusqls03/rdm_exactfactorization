@@ -610,6 +610,15 @@ def kinetic_energy_reference(system: SystemRecord) -> float:
     return float(np.sum(system.tau_true) * system.cell_volume)
 
 
+def local_curvature_basis_scale(system: SystemRecord, config: ExperimentConfig) -> float:
+    """Undo pair-feature length normalization for local near-diagonal curvature terms."""
+    if config.local_curvature_basis_scale > 0.0:
+        return float(config.local_curvature_basis_scale)
+    domain_scale = max(float(np.max(np.abs(system.axis))), 1e-6)
+    step = max(float(system.step), 1e-8)
+    return (domain_scale / step) ** 2
+
+
 def kinetic_energy_loss_from_tau(system: SystemRecord, tau_pred: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor, float]:
     kinetic_pred = tf.reduce_sum(tau_pred) * system.cell_volume
     kinetic_ref = kinetic_energy_reference(system)
@@ -646,6 +655,7 @@ def diagonal_predictions(
         rho_r_override=rho_diag,
         rho_rp_override=rho_diag,
         pair_density_feat_t=pair_density_features(system, density_state, diag_idx, diag_idx, config),
+        local_curvature_basis_scale=local_curvature_basis_scale(system, config),
     )
     return outputs
 
@@ -681,6 +691,7 @@ def stencil_predictions(
         rho_r_override=gather_density(rho_all, left_idx),
         rho_rp_override=gather_density(rho_all, right_idx),
         pair_density_feat_t=pair_density_features(system, density_state, left_idx, right_idx, config),
+        local_curvature_basis_scale=local_curvature_basis_scale(system, config),
     )
     gamma_stencil = tf.reshape(outputs["gamma"], stencil_shape)
     d_h = (
@@ -727,6 +738,7 @@ def spectral_occupation_penalty(
         rho_r_override=gather_density(rho_all, left),
         rho_rp_override=gather_density(rho_all, right),
         pair_density_feat_t=pair_density_features(system, density_state, left, right, config),
+        local_curvature_basis_scale=local_curvature_basis_scale(system, config),
     )
     n_spec = len(subset)
     gamma_sub = tf.reshape(outputs["gamma"], (n_spec, n_spec))
@@ -853,6 +865,7 @@ def predict_full_gamma_matrix(
             rho_r_override=gather_density(rho_all, left),
             rho_rp_override=gather_density(rho_all, right),
             pair_density_feat_t=pair_density_features(system, density_state, left, right, config),
+            local_curvature_basis_scale=local_curvature_basis_scale(system, config),
         )
         pieces.append(outputs["gamma"].numpy())
     gamma_pairs = np.concatenate(pieces, axis=0).astype(np.float32)
@@ -887,6 +900,7 @@ def predict_pair_values(
         rho_r_override=gather_density(rho_all, left),
         rho_rp_override=gather_density(rho_all, right),
         pair_density_feat_t=pair_density_features(system, density_state, left, right, config),
+        local_curvature_basis_scale=local_curvature_basis_scale(system, config),
     )
     return outputs["gamma"].numpy().astype(np.float32)
 
@@ -1161,6 +1175,7 @@ def compute_training_losses(
         rho_r_override=gather_density(rho_all, batch.left_idx),
         rho_rp_override=gather_density(rho_all, batch.right_idx),
         pair_density_feat_t=pair_density_features(system, density_state, batch.left_idx, batch.right_idx, config),
+        local_curvature_basis_scale=local_curvature_basis_scale(system, config),
     )
     pair_loss = weighted_mse(to_tensor(batch.gamma_true), pair_outputs["gamma"], to_tensor(batch.weights))
 
@@ -1252,6 +1267,7 @@ def print_gradient_diagnostics(
 
     rows: list[tuple[str, str]] = [
         ("system", system.system_id),
+        ("local curvature basis scale", f"{local_curvature_basis_scale(system, config):.6e}"),
         (
             "scheduled weights gamma/deriv/tau",
             f"{weights['gamma']:.3e} / {weights['deriv']:.3e} / {weights['tau']:.3e}",

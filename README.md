@@ -245,8 +245,9 @@ RDM_LOCAL_CURVATURE_SIGMA=1.0 \
 RDM_LOCAL_CURVATURE_BASIS_SCALE=0
 ```
 
-`RDM_LOCAL_CURVATURE_BASIS_SCALE=0` uses the automatic
-`(domain_radius / grid_step)^2` conversion.
+`RDM_LOCAL_CURVATURE_BASIS_SCALE=0` uses the automatic per-system
+`(max(abs(axis)) / grid_step)^2` conversion. Set it to a positive value only to
+force one global conversion factor for all systems.
 
 Recommended Fukui-feature training command for an existing 500-molecule charged
 oracle NPZ dataset:
