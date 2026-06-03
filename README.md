@@ -215,7 +215,8 @@ schedule-weighted gradient norms for gamma, derivative, and tau losses. They
 also split each norm across the point, mode, pair, and context models and print
 target/prediction RMS values for derivative and tau fields.
 
-The default kernel also includes a near-diagonal local curvature correction:
+The default kernel also includes a near-diagonal, axis-resolved local curvature
+correction:
 
 ```text
 K = K_base * ((1 - gate) + gate * K_residual) + K_local
@@ -223,9 +224,18 @@ K = K_base * ((1 - gate) + gate * K_residual) + K_local
 
 `K_local` is zero on the exact diagonal, so the density/kernel diagonal
 constraint is preserved, and is windowed by `exp(-|r-r'|^2 / sigma^2)` so it
-only acts on short-range off-diagonal stencil pairs. The local head is
-zero-initialized; it starts as the previous kernel and learns only if the
-derivative/tau losses supply useful signal. Useful controls:
+only acts on short-range off-diagonal stencil pairs. The pair model emits
+axis-specific coefficients `c_x, c_y, c_z`, and the correction uses the
+quadratic form
+
+```text
+K_local = scale * window * (c_x s_x^2 + c_y s_y^2 + c_z s_z^2)
+```
+
+where `s_a` is the normalized pair separation component. The local heads are
+zero-initialized; training starts as the previous kernel and learns local
+curvature only if the derivative/tau losses supply useful signal. Useful
+controls:
 
 ```bash
 RDM_USE_LOCAL_CURVATURE_KERNEL=1 \

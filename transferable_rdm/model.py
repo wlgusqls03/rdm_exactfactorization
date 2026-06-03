@@ -91,7 +91,7 @@ def build_models(config: ExperimentConfig, point_feat_dim: int, pair_feat_dim: i
 
     pair_model
         pair feature + global context -> baseline width(alpha) + baseline/residual gate
-        (+ optional local curvature correction)
+        (+ optional axis-resolved local curvature correction)
 
     context_model
         global context -> system-specific mode scales
@@ -118,7 +118,7 @@ def build_models(config: ExperimentConfig, point_feat_dim: int, pair_feat_dim: i
     )
     pair_model = build_mlp(
         input_dim=pair_feat_dim + density_feature_dim + global_dim,
-        output_dim=3 if config.use_local_curvature_kernel else 2,
+        output_dim=5 if config.use_local_curvature_kernel else 2,
         width=config.model_width,
         depth=2,
         seed=config.seed + 23,
@@ -144,8 +144,8 @@ def build_models(config: ExperimentConfig, point_feat_dim: int, pair_feat_dim: i
     _ = context_model(dummy_context)
     if config.use_local_curvature_kernel:
         weights = pair_model.get_weights()
-        weights[-2][:, 2] = 0.0
-        weights[-1][2] = 0.0
+        weights[-2][:, 2:] = 0.0
+        weights[-1][2:] = 0.0
         pair_model.set_weights(weights)
 
     print_block(
@@ -249,7 +249,7 @@ def predict_from_features(
     point_out_rp = models.point_model(point_input_rp)                             # (batch, density heads)
     raw_modes_r = models.mode_model(point_input_r)                                # (batch, rank)
     raw_modes_rp = models.mode_model(point_input_rp)                              # (batch, rank)
-    pair_out = models.pair_model(pair_input)                                      # (batch, 2 or 3)
+    pair_out = models.pair_model(pair_input)                                      # (batch, 2 or 5)
 
     rho_raw_r = tf.nn.softplus(point_out_r[:, :1]) + 1e-6                         # (batch, 1)
     rho_raw_rp = tf.nn.softplus(point_out_rp[:, :1]) + 1e-6                       # (batch, 1)
@@ -269,13 +269,14 @@ def predict_from_features(
     unit_rp = weighted_feat_rp / tf.sqrt(tf.reduce_sum(weighted_feat_rp**2, axis=1, keepdims=True) + eps)
     residual_kernel = tf.reduce_sum(unit_r * unit_rp, axis=1, keepdims=True)      # (batch, 1)
 
+    sep_sq_components = pair_feat_t[:, 6:9]                                       # (batch, 3)
     sep_sq = pair_feat_t[:, 10:11]                                                # (batch, 1)
     alpha = tf.nn.softplus(pair_out[:, :1]) + 1e-6                                # (batch, 1)
     gate = tf.sigmoid(pair_out[:, 1:2])                                           # (batch, 1)
     baseline_kernel = tf.exp(-alpha * tf.maximum(sep_sq, 0.0))                    # (batch, 1)
 
     gated_kernel = baseline_kernel * ((1.0 - gate) + gate * residual_kernel)      # (batch, 1)
-    if models.pair_model.output_shape[-1] >= 3:
+    if models.pair_model.output_shape[-1] >= 5:
         sigma_sq = max(float(getattr(models, "_local_curvature_sigma", 0.0)), 0.0) ** 2
         if sigma_sq <= 0.0:
             sigma_sq = 1.0
@@ -285,6 +286,23 @@ def predict_from_features(
             / (sep_sq + diag_eps)
             * tf.exp(-tf.maximum(sep_sq, 0.0) / sigma_sq)
         )
+        local_axis_coeff = tf.tanh(pair_out[:, 2:5])
+        local_correction = (
+            float(getattr(models, "_local_curvature_scale", 0.0))
+            * local_window
+            * tf.reduce_sum(local_axis_coeff * sep_sq_components, axis=1, keepdims=True)
+        )
+    elif models.pair_model.output_shape[-1] >= 3:
+        sigma_sq = max(float(getattr(models, "_local_curvature_sigma", 0.0)), 0.0) ** 2
+        if sigma_sq <= 0.0:
+            sigma_sq = 1.0
+        diag_eps = max(float(getattr(models, "_local_curvature_diag_eps", 1e-8)), 1e-12)
+        local_window = (
+            sep_sq
+            / (sep_sq + diag_eps)
+            * tf.exp(-tf.maximum(sep_sq, 0.0) / sigma_sq)
+        )
+        local_axis_coeff = tf.zeros((batch_size, 3), dtype=tf.float32)
         local_correction = (
             float(getattr(models, "_local_curvature_scale", 0.0))
             * local_window
@@ -292,6 +310,7 @@ def predict_from_features(
         )
     else:
         local_window = tf.zeros_like(gated_kernel)
+        local_axis_coeff = tf.zeros((batch_size, 3), dtype=tf.float32)
         local_correction = tf.zeros_like(gated_kernel)
 
     kernel = gated_kernel + local_correction                                      # (batch, 1)
@@ -308,6 +327,7 @@ def predict_from_features(
         "baseline_kernel": baseline_kernel,
         "residual_kernel": residual_kernel,
         "local_window": local_window,
+        "local_axis_coeff": local_axis_coeff,
         "local_correction": local_correction,
         "alpha": alpha,
         "gate": gate,
