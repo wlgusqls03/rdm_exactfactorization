@@ -147,6 +147,11 @@ def build_models(config: ExperimentConfig, point_feat_dim: int, pair_feat_dim: i
         weights[-2][:, 2:] = 0.0
         weights[-1][2:] = 0.0
         pair_model.set_weights(weights)
+    local_basis_scale = (
+        float(config.local_curvature_basis_scale)
+        if config.local_curvature_basis_scale > 0.0
+        else (float(config.domain_radius) / max(float(config.step), 1e-8)) ** 2
+    )
 
     print_block(
         "Model dimensions",
@@ -160,6 +165,7 @@ def build_models(config: ExperimentConfig, point_feat_dim: int, pair_feat_dim: i
             ("local curvature kernel", config.use_local_curvature_kernel),
             ("local curvature scale", f"{config.local_curvature_scale:.6g}" if config.use_local_curvature_kernel else "off"),
             ("local curvature sigma", f"{config.local_curvature_sigma:.6g}" if config.use_local_curvature_kernel else "off"),
+            ("local curvature basis scale", f"{local_basis_scale:.6g}" if config.use_local_curvature_kernel else "off"),
             ("point output dim", n_density_heads),
             ("learned_rank", config.learned_rank),
             ("point params", point_model.count_params()),
@@ -177,6 +183,7 @@ def build_models(config: ExperimentConfig, point_feat_dim: int, pair_feat_dim: i
     bundle._local_curvature_scale = float(config.local_curvature_scale)
     bundle._local_curvature_sigma = float(config.local_curvature_sigma)
     bundle._local_curvature_diag_eps = float(config.local_curvature_diag_eps)
+    bundle._local_curvature_basis_scale = local_basis_scale
     return bundle
 
 
@@ -269,7 +276,9 @@ def predict_from_features(
     unit_rp = weighted_feat_rp / tf.sqrt(tf.reduce_sum(weighted_feat_rp**2, axis=1, keepdims=True) + eps)
     residual_kernel = tf.reduce_sum(unit_r * unit_rp, axis=1, keepdims=True)      # (batch, 1)
 
-    sep_sq_components = pair_feat_t[:, 6:9]                                       # (batch, 3)
+    sep_sq_components = (
+        pair_feat_t[:, 6:9] * float(getattr(models, "_local_curvature_basis_scale", 1.0))
+    )                                                                             # (batch, 3)
     sep_sq = pair_feat_t[:, 10:11]                                                # (batch, 1)
     alpha = tf.nn.softplus(pair_out[:, :1]) + 1e-6                                # (batch, 1)
     gate = tf.sigmoid(pair_out[:, 1:2])                                           # (batch, 1)

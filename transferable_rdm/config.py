@@ -81,6 +81,7 @@ class ExperimentConfig:
     local_curvature_scale: float = float(os.environ.get("RDM_LOCAL_CURVATURE_SCALE", 0.5))
     local_curvature_sigma: float = float(os.environ.get("RDM_LOCAL_CURVATURE_SIGMA", 1.0))
     local_curvature_diag_eps: float = float(os.environ.get("RDM_LOCAL_CURVATURE_DIAG_EPS", 1e-8))
+    local_curvature_basis_scale: float = float(os.environ.get("RDM_LOCAL_CURVATURE_BASIS_SCALE", 0.0))
 
     # ------------------------------------------------------------------
     # 학습 설정

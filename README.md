@@ -232,7 +232,8 @@ quadratic form
 K_local = scale * window * (c_x s_x^2 + c_y s_y^2 + c_z s_z^2)
 ```
 
-where `s_a` is the normalized pair separation component. The local heads are
+where `s_a^2` is the pair-feature separation square rescaled from
+`Delta_a^2 / domain^2` to approximately `Delta_a^2 / h^2`. The local heads are
 zero-initialized; training starts as the previous kernel and learns local
 curvature only if the derivative/tau losses supply useful signal. Useful
 controls:
@@ -240,8 +241,12 @@ controls:
 ```bash
 RDM_USE_LOCAL_CURVATURE_KERNEL=1 \
 RDM_LOCAL_CURVATURE_SCALE=0.5 \
-RDM_LOCAL_CURVATURE_SIGMA=1.0
+RDM_LOCAL_CURVATURE_SIGMA=1.0 \
+RDM_LOCAL_CURVATURE_BASIS_SCALE=0
 ```
+
+`RDM_LOCAL_CURVATURE_BASIS_SCALE=0` uses the automatic
+`(domain_radius / grid_step)^2` conversion.
 
 Recommended Fukui-feature training command for an existing 500-molecule charged
 oracle NPZ dataset:
