@@ -456,10 +456,8 @@ def kinetic_density_from_orbitals(
 def build_atoms(record: Qm9Record, axis_points: int, spacing_bohr: float, Atoms: object) -> tuple[object, np.ndarray]:
     coords_bohr = record.coords_angstrom * ANGSTROM_TO_BOHR
     coords_bohr_centered = coords_bohr - np.mean(coords_bohr, axis=0, keepdims=True)
-    # GPAW stores only the nonzero interior values for pbc=False.  A cell
-    # with N stored values has N + 1 grid intervals including the two zero
-    # boundaries, while the stored coordinates are centered at
-    # (i + 1 - (N + 1) / 2) * h.
+    # Use a cell one spacing wider than the target point count so the finite
+    # box leaves room for nonperiodic boundary handling in GPAW.
     box_angstrom = (axis_points + 1) * spacing_bohr * BOHR_TO_ANGSTROM
     positions_angstrom = coords_bohr_centered * BOHR_TO_ANGSTROM + 0.5 * box_angstrom
     atoms = Atoms(record.symbols, positions=positions_angstrom, cell=[box_angstrom] * 3, pbc=False)
@@ -472,15 +470,14 @@ def run_gpaw(record: Qm9Record, args: argparse.Namespace) -> dict[str, object]:
 
     coords_bohr = record.coords_angstrom * ANGSTROM_TO_BOHR
     coords_bohr_centered = coords_bohr - np.mean(coords_bohr, axis=0, keepdims=True)
-    axis_points = choose_axis_points(
+    requested_axis_points = choose_axis_points(
         coords_bohr_centered,
         args.grid_spacing_bohr,
         args.padding_bohr,
         args.max_axis_points,
         args.gpaw_grid_divisor,
     )
-    axis, points_bohr = centered_grid(axis_points, args.grid_spacing_bohr)
-    atoms, coords_bohr_centered = build_atoms(record, axis_points, args.grid_spacing_bohr, Atoms)
+    atoms, coords_bohr_centered = build_atoms(record, requested_axis_points, args.grid_spacing_bohr, Atoms)
 
     electron_guess = sum(ELEMENT_Z[symbol] for symbol in record.symbols)
     nbands = max(1, electron_guess // 2 + int(args.nbands_extra))
@@ -489,7 +486,7 @@ def run_gpaw(record: Qm9Record, args: argparse.Namespace) -> dict[str, object]:
     calc = GPAW(
         mode=FD(nn=args.fd_order),
         xc=args.xc,
-        gpts=(axis_points + 1, axis_points + 1, axis_points + 1),
+        gpts=(requested_axis_points + 1, requested_axis_points + 1, requested_axis_points + 1),
         nbands=nbands,
         setups=(args.setups if args.setups else None),
         convergence={"energy": args.energy_convergence_ev, "density": args.density_convergence},
@@ -507,11 +504,26 @@ def run_gpaw(record: Qm9Record, args: argparse.Namespace) -> dict[str, object]:
         raise RuntimeError(f"No occupied bands found for {record.qm9_id}.")
 
     orbitals = []
+    actual_shape = None
     for band in occupied:
         psi = np.asarray(calc.get_pseudo_wave_function(band=int(band), spin=0, kpt=0), dtype=np.float64)
-        if psi.shape != (axis_points, axis_points, axis_points):
-            raise RuntimeError(f"Unexpected GPAW wavefunction shape {psi.shape}; expected {(axis_points,) * 3}.")
+        if psi.ndim != 3 or len(set(psi.shape)) != 1:
+            raise RuntimeError(f"Unexpected GPAW wavefunction shape {psi.shape}; expected a cubic 3D grid.")
+        if actual_shape is None:
+            actual_shape = psi.shape
+        elif psi.shape != actual_shape:
+            raise RuntimeError(
+                f"Inconsistent GPAW wavefunction shapes for {record.qm9_id}: {psi.shape} vs {actual_shape}."
+            )
         orbitals.append(psi.reshape(-1))
+    if actual_shape is None:
+        raise RuntimeError(f"No wavefunctions returned for {record.qm9_id}.")
+    axis_points = int(actual_shape[0])
+    axis, points_bohr = centered_grid(axis_points, args.grid_spacing_bohr)
+    if len(points_bohr) != orbitals[0].size:
+        raise RuntimeError(
+            f"Point/grid mismatch for {record.qm9_id}: {len(points_bohr)} points vs {orbitals[0].size} wavefunction values."
+        )
     psi_matrix = normalize_orbitals(np.stack(orbitals, axis=1), args.grid_spacing_bohr**3)
     occupancies = occupancies_all[occupied]
     eigenvalues_ev = eigenvalues_ev_all[occupied]
