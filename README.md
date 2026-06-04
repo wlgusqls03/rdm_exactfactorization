@@ -183,6 +183,54 @@ python scripts/build_qm9_pyscf_npz.py \
   --grid-level 1
 ```
 
+### FD/Pseudopotential Reference Builder
+
+For a self-consistent real-space reference, use the GPAW finite-difference
+builder:
+
+```text
+scripts/build_qm9_gpaw_fd_npz.py
+```
+
+It runs GPAW in real-space FD mode, extracts occupied pseudo-wavefunctions on
+the same uniform grid used by the model, and writes
+
+- `gamma_matrix = sum_n f_n psi_n(r_i) psi_n(r_j)`;
+- `rho_diag = diag(gamma_matrix)`;
+- `tau_true_fd_orbital = 1/2 sum_n f_n |grad_h psi_n|^2`;
+- `tau_true_fd_gamma`, the same-grid near-diagonal curvature diagnostic from
+  `gamma_matrix`;
+- loader-compatible `tau_true_ao` and `derivative_true_ao` aliases, which in
+  this dataset are FD orbital-gradient references rather than AO-gradient
+  references.
+
+GPAW and ASE must be installed in the active environment. A small dry run can
+select molecules and estimate grid sizes without running SCF:
+
+```bash
+python scripts/build_qm9_gpaw_fd_npz.py \
+  --npz-glob 'qmugs_npz/qm9_pyscf_ldavwn_b631gd_atoms10_400_50_50_spacing1p5_kp/*.npz' \
+  --output-dir qmugs_npz/qm9_gpaw_fd_smoke \
+  --num-systems 5 \
+  --grid-spacing-bohr 0.8 \
+  --padding-bohr 4.0 \
+  --max-axis-points 25 \
+  --dry-run
+```
+
+The first actual smoke dataset should use only a few small molecules:
+
+```bash
+python scripts/build_qm9_gpaw_fd_npz.py \
+  --npz-glob 'qmugs_npz/qm9_pyscf_ldavwn_b631gd_atoms10_400_50_50_spacing1p5_kp/*.npz' \
+  --output-dir qmugs_npz/qm9_gpaw_fd_smoke \
+  --num-systems 5 \
+  --grid-spacing-bohr 0.8 \
+  --padding-bohr 4.0 \
+  --max-axis-points 25 \
+  --xc LDA
+```
+
 ## Training
 
 The main training entry point is:
