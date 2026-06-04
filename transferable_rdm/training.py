@@ -694,36 +694,46 @@ def stencil_predictions(
         rho_all = density_state.rho_neutral
     stencil_order = int(system.stencil_left.shape[2])
     stencil_shape = system.stencil_left.shape
-    left_idx = system.stencil_left.reshape(-1)
-    right_idx = system.stencil_right.reshape(-1)
-    outputs = predict_from_features(
-        to_tensor(system.local_features[left_idx]),
-        to_tensor(system.local_features[right_idx]),
-        to_tensor(build_pair_features(system, left_idx, right_idx)),
-        to_tensor(system.global_context),
-        models,
-        rho_r_override=gather_density(rho_all, left_idx),
-        rho_rp_override=gather_density(rho_all, right_idx),
-        pair_density_feat_t=pair_density_features(system, density_state, left_idx, right_idx, config),
-        local_curvature_basis_scale=local_curvature_basis_scale(system, config),
-    )
-    gamma_stencil = tf.reshape(outputs["gamma"], stencil_shape)
-    d_h = (
-        gamma_stencil[:, :, 0]
-        - gamma_stencil[:, :, 1]
-        - gamma_stencil[:, :, 2]
-        + gamma_stencil[:, :, 3]
-    ) / (4.0 * system.step * system.step)
-    if stencil_order >= 8:
-        d_2h = (
-            gamma_stencil[:, :, 4]
-            - gamma_stencil[:, :, 5]
-            - gamma_stencil[:, :, 6]
-            + gamma_stencil[:, :, 7]
-        ) / (16.0 * system.step * system.step)
-        derivative_pred = (4.0 * d_h - d_2h) / 3.0
-    else:
-        derivative_pred = d_h
+    n_centers = int(stencil_shape[0])
+    flat_per_center = int(np.prod(stencil_shape[1:]))
+    chunk_pairs = max(int(config.stencil_prediction_chunk_size), flat_per_center)
+    chunk_centers = max(1, chunk_pairs // flat_per_center)
+
+    derivative_chunks = []
+    for start in range(0, n_centers, chunk_centers):
+        end = min(start + chunk_centers, n_centers)
+        chunk_shape = (end - start,) + stencil_shape[1:]
+        left_idx = system.stencil_left[start:end].reshape(-1)
+        right_idx = system.stencil_right[start:end].reshape(-1)
+        outputs = predict_from_features(
+            to_tensor(system.local_features[left_idx]),
+            to_tensor(system.local_features[right_idx]),
+            to_tensor(build_pair_features(system, left_idx, right_idx)),
+            to_tensor(system.global_context),
+            models,
+            rho_r_override=gather_density(rho_all, left_idx),
+            rho_rp_override=gather_density(rho_all, right_idx),
+            pair_density_feat_t=pair_density_features(system, density_state, left_idx, right_idx, config),
+            local_curvature_basis_scale=local_curvature_basis_scale(system, config),
+        )
+        gamma_stencil = tf.reshape(outputs["gamma"], chunk_shape)
+        d_h = (
+            gamma_stencil[:, :, 0]
+            - gamma_stencil[:, :, 1]
+            - gamma_stencil[:, :, 2]
+            + gamma_stencil[:, :, 3]
+        ) / (4.0 * system.step * system.step)
+        if stencil_order >= 8:
+            d_2h = (
+                gamma_stencil[:, :, 4]
+                - gamma_stencil[:, :, 5]
+                - gamma_stencil[:, :, 6]
+                + gamma_stencil[:, :, 7]
+            ) / (16.0 * system.step * system.step)
+            derivative_chunks.append((4.0 * d_h - d_2h) / 3.0)
+        else:
+            derivative_chunks.append(d_h)
+    derivative_pred = tf.concat(derivative_chunks, axis=0)
     tau_pred = 0.5 * tf.reduce_sum(derivative_pred, axis=1, keepdims=True)
     return derivative_pred, tau_pred
 
