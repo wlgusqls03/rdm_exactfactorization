@@ -72,6 +72,8 @@ CSV_METRIC_KEYS = [
     "deriv_loss",
     "deriv_raw_mse",
     "deriv_mae",
+    "deriv_pred_ao_raw_mse",
+    "deriv_pred_ao_mae",
     "deriv_fd_ao_raw_mse",
     "deriv_fd_ao_mae",
     "deriv_fd_ao_rms_ratio",
@@ -80,6 +82,8 @@ CSV_METRIC_KEYS = [
     "tau_loss",
     "tau_raw_mse",
     "tau_mae",
+    "tau_pred_ao_raw_mse",
+    "tau_pred_ao_mae",
     "tau_fd_ao_raw_mse",
     "tau_fd_ao_mae",
     "tau_fd_ao_rms_ratio",
@@ -106,6 +110,12 @@ CSV_METRIC_KEYS = [
     "symmetry_mae",
     "near_diag_mae",
     "far_offdiag_mae",
+    "curvature_target_min",
+    "curvature_target_p05",
+    "curvature_target_p50",
+    "curvature_target_p95",
+    "curvature_target_max",
+    "curvature_target_neg_frac",
 ]
 
 CSV_SYSTEM_KEYS = [
@@ -155,12 +165,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pair-density-feature-mode", choices=PAIR_DENSITY_FEATURE_MODES, default=None)
     parser.add_argument("--pair-density-symmetric", dest="pair_density_symmetric", action="store_true", default=None)
     parser.add_argument("--no-pair-density-symmetric", dest="pair_density_symmetric", action="store_false")
+    parser.add_argument("--pair-density-hessian", dest="pair_density_hessian", action="store_true", default=None)
+    parser.add_argument("--no-pair-density-hessian", dest="pair_density_hessian", action="store_false")
+    parser.add_argument("--pair-density-hessian-clip", type=float, default=None)
+    parser.add_argument(
+        "--use-potential-laplacian-feature",
+        dest="use_potential_laplacian_feature",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument("--no-potential-laplacian-feature", dest="use_potential_laplacian_feature", action="store_false")
+    parser.add_argument("--potential-laplacian-clip", type=float, default=None)
     parser.add_argument("--density-baseline-mode", choices=DENSITY_BASELINE_MODES, default=None)
     parser.add_argument("--sad-density-floor", type=float, default=None)
     parser.add_argument("--sad-residual-clip", type=float, default=None)
     parser.add_argument("--symmetrize-kernel-output", dest="symmetrize_kernel_output", action="store_true", default=None)
     parser.add_argument("--no-symmetrize-kernel-output", dest="symmetrize_kernel_output", action="store_false")
     parser.add_argument("--local-curvature-form", choices=["quadratic", "legacy"], default=None)
+    parser.add_argument("--local-curvature-init-bias", type=float, default=None)
+    parser.add_argument("--physics-target", choices=["ao", "fd"], default=None)
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--npz-glob", type=str, default=None)
@@ -238,11 +261,17 @@ def apply_overrides(config: ExperimentConfig, args: argparse.Namespace) -> Exper
         ("point_density_log_eps", "point_density_log_eps"),
         ("pair_density_feature_mode", "pair_density_feature_mode"),
         ("pair_density_symmetric", "pair_density_symmetric"),
+        ("pair_density_hessian", "pair_density_hessian"),
+        ("pair_density_hessian_clip", "pair_density_hessian_clip"),
+        ("use_potential_laplacian_feature", "use_potential_laplacian_feature"),
+        ("potential_laplacian_clip", "potential_laplacian_clip"),
         ("density_baseline_mode", "density_baseline_mode"),
         ("sad_density_floor", "sad_density_floor"),
         ("sad_residual_clip", "sad_residual_clip"),
         ("symmetrize_kernel_output", "symmetrize_kernel_output"),
         ("local_curvature_form", "local_curvature_form"),
+        ("local_curvature_init_bias", "local_curvature_init_bias"),
+        ("physics_target", "physics_target"),
         ("run_name", "run_name"),
         ("output_dir", "output_dir"),
         ("npz_glob", "npz_glob"),
@@ -264,6 +293,12 @@ def apply_auto_run_dir(config: ExperimentConfig) -> ExperimentConfig:
     safe_run_name = config.run_name.strip() or "run"
     output_dir = Path(config.output_dir) / f"{safe_run_name}_{stamp}"
     return replace(config, output_dir=str(output_dir))
+
+
+def configure_system_feature_metadata(systems: list, config: ExperimentConfig) -> None:
+    for system in systems:
+        system.metadata["use_potential_laplacian_feature"] = bool(config.use_potential_laplacian_feature)
+        system.metadata["potential_laplacian_clip"] = float(config.potential_laplacian_clip)
 
 
 def make_overfit_split(systems: list, config: ExperimentConfig) -> DatasetSplit:
@@ -541,6 +576,7 @@ def main() -> None:
     set_global_seed(config.seed)
 
     systems = build_system_corpus(config)
+    configure_system_feature_metadata(systems, config)
     split = make_overfit_split(systems, config) if config.overfit_one_system else split_systems(systems, config)
     if density_baseline_mode(config) == "sad-multiplicative":
         missing_sad = [system.system_id for system in systems if system.rho_sad is None]
@@ -566,6 +602,8 @@ def main() -> None:
             ("base pair dim", base_pair_dim),
             ("density descriptor dim", pair_density_feature_dim(config)),
             ("symmetric pair descriptors", config.pair_density_symmetric),
+            ("density Hessian descriptors", config.pair_density_hessian),
+            ("potential Laplacian feature", config.use_potential_laplacian_feature),
             ("density baseline mode", density_baseline_mode(config)),
             ("SAD floor/residual clip", f"{config.sad_density_floor:g} / {config.sad_residual_clip:g}"),
         ],

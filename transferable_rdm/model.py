@@ -146,7 +146,7 @@ def build_models(config: ExperimentConfig, point_feat_dim: int, pair_feat_dim: i
         weights = pair_model.get_weights()
         weights[-2][:, 2:] = 0.0
         if config.local_curvature_form.strip().lower() == "quadratic":
-            weights[-1][2:] = -4.0
+            weights[-1][2:] = float(config.local_curvature_init_bias)
         else:
             weights[-1][2:] = 0.0
         pair_model.set_weights(weights)
@@ -175,6 +175,7 @@ def build_models(config: ExperimentConfig, point_feat_dim: int, pair_feat_dim: i
             ("local curvature form", config.local_curvature_form if config.use_local_curvature_kernel else "off"),
             ("local curvature scale", f"{config.local_curvature_scale:.6g}" if config.use_local_curvature_kernel else "off"),
             ("local curvature sigma", f"{config.local_curvature_sigma:.6g}" if config.use_local_curvature_kernel else "off"),
+            ("local curvature init bias", f"{config.local_curvature_init_bias:.6g}" if config.use_local_curvature_kernel else "off"),
             ("local curvature basis scale", local_basis_label if config.use_local_curvature_kernel else "off"),
             ("point output dim", n_density_heads),
             ("learned_rank", config.learned_rank),
@@ -254,6 +255,8 @@ def local_curvature_window(sep_sq: tf.Tensor, models: ModelBundle) -> tf.Tensor:
     sigma_sq = max(float(getattr(models, "_local_curvature_sigma", 0.0)), 0.0) ** 2
     if sigma_sq <= 0.0:
         sigma_sq = 1.0
+    if str(getattr(models, "_local_curvature_form", "quadratic")) == "quadratic":
+        return tf.exp(-tf.maximum(sep_sq, 0.0) / sigma_sq)
     diag_eps = max(float(getattr(models, "_local_curvature_diag_eps", 1e-8)), 1e-12)
     return sep_sq / (sep_sq + diag_eps) * tf.exp(-tf.maximum(sep_sq, 0.0) / sigma_sq)
 

@@ -16,6 +16,7 @@ from .density_features import (
     normalized_density_head,
     pair_density_features,
     pair_density_feature_mode,
+    richardson_gradient_3d,
 )
 from .data import (
     DatasetSplit,
@@ -54,12 +55,14 @@ VAL_HISTORY_KEYS = (
     "deriv_loss",
     "deriv_raw_mse",
     "deriv_mae",
+    "deriv_pred_ao_mae",
     "deriv_fd_ao_mae",
     "deriv_fd_ao_rms_ratio",
     "deriv_pred_fd_mae",
     "tau_loss",
     "tau_raw_mse",
     "tau_mae",
+    "tau_pred_ao_mae",
     "tau_fd_ao_mae",
     "tau_fd_ao_rms_ratio",
     "tau_pred_fd_mae",
@@ -93,6 +96,9 @@ EVAL_OBJECTIVE_TERMS = (
     ("occ", "occ_penalty"),
     ("kinetic", "kinetic_loss"),
 )
+
+PHYSICS_TARGET_MODES = ("ao", "fd")
+_TRUE_GAMMA_STENCIL_TARGET_CACHE: dict[int, tuple[np.ndarray, np.ndarray]] = {}
 
 
 @dataclass
@@ -724,6 +730,9 @@ def stencil_predictions(
 
 def true_gamma_stencil_targets(system: SystemRecord) -> tuple[np.ndarray, np.ndarray]:
     """Compute derivative/tau targets from the true gamma on the model stencil."""
+    cached = _TRUE_GAMMA_STENCIL_TARGET_CACHE.get(id(system))
+    if cached is not None:
+        return cached
     stencil_order = int(system.stencil_left.shape[2])
     stencil_shape = system.stencil_left.shape
     left_idx = system.stencil_left.reshape(-1)
@@ -746,7 +755,56 @@ def true_gamma_stencil_targets(system: SystemRecord) -> tuple[np.ndarray, np.nda
     else:
         derivative_fd = d_h
     tau_fd = 0.5 * np.sum(derivative_fd, axis=1, keepdims=True)
-    return derivative_fd.astype(np.float32), tau_fd.astype(np.float32)
+    targets = (derivative_fd.astype(np.float32), tau_fd.astype(np.float32))
+    _TRUE_GAMMA_STENCIL_TARGET_CACHE[id(system)] = targets
+    return targets
+
+
+def physics_target_mode(config: ExperimentConfig) -> str:
+    mode = config.physics_target.strip().lower()
+    if mode not in PHYSICS_TARGET_MODES:
+        raise ValueError(f"Unknown RDM_PHYSICS_TARGET: {config.physics_target!r}. Choose 'ao' or 'fd'.")
+    return mode
+
+
+def physics_stencil_targets(system: SystemRecord, config: ExperimentConfig) -> tuple[np.ndarray, np.ndarray]:
+    if physics_target_mode(config) == "fd":
+        return true_gamma_stencil_targets(system)
+    return system.derivative_true, system.tau_true
+
+
+def curvature_target_diagnostics(
+    system: SystemRecord,
+    derivative_target: np.ndarray,
+    *,
+    rho_cut_fraction: float = 1e-4,
+) -> dict[str, float]:
+    """Estimate axis-resolved effective kernel curvature target statistics."""
+    rho = np.asarray(system.rho_diag, dtype=np.float32)
+    rho_scale = max(float(np.max(rho)), 1e-30)
+    mask = rho[system.interior_point_indices, 0] > rho_cut_fraction * rho_scale
+    if not np.any(mask):
+        return {
+            "curvature_target_min": float("nan"),
+            "curvature_target_p05": float("nan"),
+            "curvature_target_p50": float("nan"),
+            "curvature_target_p95": float("nan"),
+            "curvature_target_max": float("nan"),
+            "curvature_target_neg_frac": float("nan"),
+        }
+    grad_rho = richardson_gradient_3d(to_tensor(rho), len(system.axis), system.step).numpy()
+    rho_interior = np.maximum(rho[system.interior_point_indices], 1e-30)
+    grad_term = grad_rho[system.interior_point_indices] ** 2 / (4.0 * rho_interior)
+    curvature_target = (derivative_target - grad_term) / rho_interior
+    values = curvature_target[mask].reshape(-1)
+    return {
+        "curvature_target_min": float(np.min(values)),
+        "curvature_target_p05": float(np.percentile(values, 5.0)),
+        "curvature_target_p50": float(np.percentile(values, 50.0)),
+        "curvature_target_p95": float(np.percentile(values, 95.0)),
+        "curvature_target_max": float(np.max(values)),
+        "curvature_target_neg_frac": float(np.mean(values < 0.0)),
+    }
 
 
 def np_rms(value: np.ndarray) -> float:
@@ -998,13 +1056,18 @@ def evaluate_system(
     derivative_pred = derivative_pred_t.numpy()
     tau_pred = tau_pred_t.numpy()
     derivative_true_fd, tau_true_fd = true_gamma_stencil_targets(system)
-    deriv_raw_mse = float(np.mean((derivative_pred - system.derivative_true) ** 2))
-    tau_raw_mse = float(np.mean((tau_pred - system.tau_true) ** 2))
+    derivative_target, tau_target = physics_stencil_targets(system, config)
+    deriv_raw_mse = float(np.mean((derivative_pred - derivative_target) ** 2))
+    tau_raw_mse = float(np.mean((tau_pred - tau_target) ** 2))
+    deriv_pred_ao_raw_mse = float(np.mean((derivative_pred - system.derivative_true) ** 2))
+    deriv_pred_ao_mae = float(np.mean(np.abs(derivative_pred - system.derivative_true)))
     deriv_fd_ao_raw_mse = float(np.mean((derivative_true_fd - system.derivative_true) ** 2))
     deriv_fd_ao_mae = float(np.mean(np.abs(derivative_true_fd - system.derivative_true)))
     deriv_fd_ao_rms_ratio = safe_rms_ratio(derivative_true_fd, system.derivative_true)
     deriv_pred_fd_raw_mse = float(np.mean((derivative_pred - derivative_true_fd) ** 2))
     deriv_pred_fd_mae = float(np.mean(np.abs(derivative_pred - derivative_true_fd)))
+    tau_pred_ao_raw_mse = float(np.mean((tau_pred - system.tau_true) ** 2))
+    tau_pred_ao_mae = float(np.mean(np.abs(tau_pred - system.tau_true)))
     tau_fd_ao_raw_mse = float(np.mean((tau_true_fd - system.tau_true) ** 2))
     tau_fd_ao_mae = float(np.mean(np.abs(tau_true_fd - system.tau_true)))
     tau_fd_ao_rms_ratio = safe_rms_ratio(tau_true_fd, system.tau_true)
@@ -1012,7 +1075,7 @@ def evaluate_system(
     tau_pred_fd_mae = float(np.mean(np.abs(tau_pred - tau_true_fd)))
     deriv_loss = float(
         rms_normalized_huber(
-            to_tensor(system.derivative_true),
+            to_tensor(derivative_target),
             derivative_pred_t,
             scale_floor=config.deriv_scale_floor,
             delta=config.physics_huber_delta,
@@ -1020,14 +1083,15 @@ def evaluate_system(
     )
     tau_loss = float(
         rms_normalized_huber(
-            to_tensor(system.tau_true),
+            to_tensor(tau_target),
             tau_pred_t,
             scale_floor=config.tau_scale_floor,
             delta=config.physics_huber_delta,
         ).numpy()
     )
-    deriv_mae = float(np.mean(np.abs(derivative_pred - system.derivative_true)))
-    tau_mae = float(np.mean(np.abs(tau_pred - system.tau_true)))
+    deriv_mae = float(np.mean(np.abs(derivative_pred - derivative_target)))
+    tau_mae = float(np.mean(np.abs(tau_pred - tau_target)))
+    curvature_stats = curvature_target_diagnostics(system, derivative_target)
     kinetic_loss_t, kinetic_pred_t, kinetic_ref = kinetic_energy_loss_from_tau(system, tau_pred_t)
     kinetic_loss = float(kinetic_loss_t.numpy())
     kinetic_pred = float(kinetic_pred_t.numpy())
@@ -1081,6 +1145,8 @@ def evaluate_system(
         "deriv_loss": deriv_loss,
         "deriv_raw_mse": deriv_raw_mse,
         "deriv_mae": deriv_mae,
+        "deriv_pred_ao_raw_mse": deriv_pred_ao_raw_mse,
+        "deriv_pred_ao_mae": deriv_pred_ao_mae,
         "deriv_fd_ao_raw_mse": deriv_fd_ao_raw_mse,
         "deriv_fd_ao_mae": deriv_fd_ao_mae,
         "deriv_fd_ao_rms_ratio": deriv_fd_ao_rms_ratio,
@@ -1089,6 +1155,8 @@ def evaluate_system(
         "tau_loss": tau_loss,
         "tau_raw_mse": tau_raw_mse,
         "tau_mae": tau_mae,
+        "tau_pred_ao_raw_mse": tau_pred_ao_raw_mse,
+        "tau_pred_ao_mae": tau_pred_ao_mae,
         "tau_fd_ao_raw_mse": tau_fd_ao_raw_mse,
         "tau_fd_ao_mae": tau_fd_ao_mae,
         "tau_fd_ao_rms_ratio": tau_fd_ao_rms_ratio,
@@ -1129,6 +1197,8 @@ def evaluate_system(
         "ked_pred_integral": tau_pred_integral,
         "kinetic_energy_ref": kinetic_energy_ref,
         "kinetic_energy_ref_error": kinetic_energy_ref_error,
+        "physics_target": physics_target_mode(config),
+        **curvature_stats,
         "rho_true_diag": system.rho_diag,
         "rho_pred_diag": rho_all.numpy(),
         "tau_true": system.tau_true,
@@ -1180,6 +1250,8 @@ def evaluate_systems(
         "deriv_loss",
         "deriv_raw_mse",
         "deriv_mae",
+        "deriv_pred_ao_raw_mse",
+        "deriv_pred_ao_mae",
         "deriv_fd_ao_raw_mse",
         "deriv_fd_ao_mae",
         "deriv_fd_ao_rms_ratio",
@@ -1188,6 +1260,8 @@ def evaluate_systems(
         "tau_loss",
         "tau_raw_mse",
         "tau_mae",
+        "tau_pred_ao_raw_mse",
+        "tau_pred_ao_mae",
         "tau_fd_ao_raw_mse",
         "tau_fd_ao_mae",
         "tau_fd_ao_rms_ratio",
@@ -1214,6 +1288,12 @@ def evaluate_systems(
         "symmetry_mae",
         "near_diag_mae",
         "far_offdiag_mae",
+        "curvature_target_min",
+        "curvature_target_p05",
+        "curvature_target_p50",
+        "curvature_target_p95",
+        "curvature_target_max",
+        "curvature_target_neg_frac",
     ]
     scalar_keys.extend(
         key
@@ -1272,14 +1352,15 @@ def compute_training_losses(
         derivative_pred, tau_pred = stencil_predictions(
             system, models, config, rho_all=rho_all, density_state=density_state
         )
+        derivative_target, tau_target = physics_stencil_targets(system, config)
         deriv_loss = rms_normalized_huber(
-            to_tensor(system.derivative_true),
+            to_tensor(derivative_target),
             derivative_pred,
             scale_floor=config.deriv_scale_floor,
             delta=config.physics_huber_delta,
         )
         tau_loss = rms_normalized_huber(
-            to_tensor(system.tau_true),
+            to_tensor(tau_target),
             tau_pred,
             scale_floor=config.tau_scale_floor,
             delta=config.physics_huber_delta,
@@ -1393,11 +1474,13 @@ def print_gradient_diagnostics(
         system, models, config, rho_all=density_state.rho_neutral, density_state=density_state
     )
     derivative_true_fd, tau_true_fd = true_gamma_stencil_targets(system)
+    derivative_target, tau_target = physics_stencil_targets(system, config)
     rows.extend(
         [
+            ("physics target", physics_target_mode(config)),
             (
                 "deriv RMS target/pred",
-                f"{tensor_rms(to_tensor(system.derivative_true)):.6e} / {tensor_rms(derivative_pred):.6e}",
+                f"{np_rms(derivative_target):.6e} / {tensor_rms(derivative_pred):.6e}",
             ),
             (
                 "deriv RMS true-FD/target-AO",
@@ -1405,7 +1488,7 @@ def print_gradient_diagnostics(
             ),
             (
                 "tau RMS target/pred",
-                f"{tensor_rms(to_tensor(system.tau_true)):.6e} / {tensor_rms(tau_pred):.6e}",
+                f"{np_rms(tau_target):.6e} / {tensor_rms(tau_pred):.6e}",
             ),
             (
                 "tau RMS true-FD/target-AO",
@@ -1447,6 +1530,7 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
     print_block(
         "Physics loss",
         [
+            ("physics target", physics_target_mode(config)),
             ("deriv/tau loss", "target-RMS normalized Huber"),
             ("Huber delta", f"{config.physics_huber_delta:.6g}"),
             ("deriv/tau scale floor", f"{config.deriv_scale_floor:.6g} / {config.tau_scale_floor:.6g}"),

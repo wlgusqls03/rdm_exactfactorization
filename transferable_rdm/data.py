@@ -10,6 +10,9 @@ from .systems import SystemRecord
 from .utils import print_block
 
 
+_POTENTIAL_LAPLACIAN_CACHE: dict[int, np.ndarray] = {}
+
+
 @dataclass
 class DatasetSplit:
     """system-level split.
@@ -156,10 +159,66 @@ def build_pair_features(system: SystemRecord, left_idx: np.ndarray, right_idx: n
             0.5 * (pot_r + pot_rp) / pot_scale,
             0.5 * (grad_r + grad_rp) * step_scale / pot_scale,
             np.abs(grad_r - grad_rp) * step_scale / pot_scale,
-        ],
+        ]
+        + potential_laplacian_pair_features(system, left_idx, right_idx, step_scale, pot_scale),
         axis=1,
     )
     return pair_features.astype(np.float32)
+
+
+def signed_log_scaled_np(values: np.ndarray, clip: float) -> np.ndarray:
+    clip = max(float(clip), 1.0)
+    clipped = np.clip(values, -clip, clip)
+    return np.sign(clipped) * np.log1p(np.abs(clipped)) / np.log1p(clip)
+
+
+def richardson_laplacian_np(grid_values: np.ndarray, n_axis: int, h: float) -> np.ndarray:
+    vol = np.reshape(grid_values, (n_axis, n_axis, n_axis))
+    padded = np.pad(vol, ((2, 2), (2, 2), (2, 2)), mode="symmetric")
+    center = padded[2 : n_axis + 2, 2 : n_axis + 2, 2 : n_axis + 2]
+
+    def second_derivative(axis: int) -> np.ndarray:
+        slices = [slice(2, n_axis + 2), slice(2, n_axis + 2), slice(2, n_axis + 2)]
+        values = []
+        for offset in (0, 1, 3, 4):
+            shifted = list(slices)
+            shifted[axis] = slice(offset, offset + n_axis)
+            values.append(padded[tuple(shifted)])
+        return (-values[0] + 16.0 * values[1] - 30.0 * center + 16.0 * values[2] - values[3]) / (
+            12.0 * h * h
+        )
+
+    return np.reshape(second_derivative(0) + second_derivative(1) + second_derivative(2), (-1, 1))
+
+
+def potential_laplacian_descriptor(system: SystemRecord) -> np.ndarray:
+    cached = _POTENTIAL_LAPLACIAN_CACHE.get(id(system))
+    if cached is not None:
+        return cached
+    n_axis = len(system.axis)
+    lap = richardson_laplacian_np(system.potential, n_axis, system.step)
+    pot_scale = max(float(np.std(system.potential)), 1.0)
+    descriptor = signed_log_scaled_np(
+        lap * (system.step**2) / pot_scale,
+        system.metadata.get("potential_laplacian_clip", 8.0),
+    ).astype(np.float32)
+    _POTENTIAL_LAPLACIAN_CACHE[id(system)] = descriptor
+    return descriptor
+
+
+def potential_laplacian_pair_features(
+    system: SystemRecord,
+    left_idx: np.ndarray,
+    right_idx: np.ndarray,
+    step_scale: float,
+    pot_scale: float,
+) -> list[np.ndarray]:
+    if not bool(system.metadata.get("use_potential_laplacian_feature", True)):
+        return []
+    lap = potential_laplacian_descriptor(system)
+    lap_r = lap[left_idx]
+    lap_rp = lap[right_idx]
+    return [0.5 * (lap_r + lap_rp), np.abs(lap_r - lap_rp)]
 
 
 def choose_system(train_systems: list[SystemRecord], rng: np.random.Generator) -> SystemRecord:
