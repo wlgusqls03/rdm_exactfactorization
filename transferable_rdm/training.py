@@ -733,6 +733,13 @@ def true_gamma_stencil_targets(system: SystemRecord) -> tuple[np.ndarray, np.nda
     cached = _TRUE_GAMMA_STENCIL_TARGET_CACHE.get(id(system))
     if cached is not None:
         return cached
+    if system.derivative_true_fd is not None and system.tau_true_fd is not None:
+        targets = (
+            np.asarray(system.derivative_true_fd, dtype=np.float32),
+            np.asarray(system.tau_true_fd, dtype=np.float32),
+        )
+        _TRUE_GAMMA_STENCIL_TARGET_CACHE[id(system)] = targets
+        return targets
     stencil_order = int(system.stencil_left.shape[2])
     stencil_shape = system.stencil_left.shape
     left_idx = system.stencil_left.reshape(-1)
@@ -1220,7 +1227,7 @@ def evaluate_system(
     if keep_arrays and len(system.points) <= config.full_eval_max_points:
         gamma_pred_matrix = predict_full_gamma_matrix(system, models, config)
         metrics["gamma_pred_matrix"] = gamma_pred_matrix
-        metrics["gamma_true_matrix"] = system.load_gamma_matrix()
+        metrics["gamma_true_matrix"] = system.gamma_submatrix(np.arange(len(system.points), dtype=np.int64))
     metrics["objective"] = objective_from_metrics(metrics, config, epoch=epoch)
     return metrics
 

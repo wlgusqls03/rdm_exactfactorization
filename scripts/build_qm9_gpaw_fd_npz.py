@@ -63,6 +63,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--energy-convergence-ev", type=float, default=5e-4)
     parser.add_argument("--density-convergence", type=float, default=1e-4)
     parser.add_argument("--tau-stencil", choices=["central2", "richardson"], default="richardson")
+    parser.add_argument(
+        "--store-full-gamma",
+        action="store_true",
+        help=(
+            "Store dense gamma_matrix. Use only for tiny smoke tests; the default "
+            "lazy psi_occ format is required for fine grids."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true", help="Select molecules and print grid sizes without running GPAW.")
     return parser.parse_args()
 
@@ -149,6 +157,69 @@ def prepare_stencil_targets(
         np.asarray(right_idx, dtype=np.int64),
         derivative_arr,
     ), tau.astype(np.float32)
+
+
+def interior_indices(axis_points: int, tau_stencil: str) -> np.ndarray:
+    margin = max(stencil_offsets(axis_points, tau_stencil))
+    return np.asarray(
+        [
+            flat_index(i, j, k, axis_points)
+            for i in range(margin, axis_points - margin)
+            for j in range(margin, axis_points - margin)
+            for k in range(margin, axis_points - margin)
+        ],
+        dtype=np.int64,
+    )
+
+
+def gamma_values_from_orbitals(
+    psi_occ: np.ndarray,
+    occupancies: np.ndarray,
+    left_idx: np.ndarray,
+    right_idx: np.ndarray,
+) -> np.ndarray:
+    psi = np.asarray(psi_occ, dtype=np.float64)
+    occ = np.asarray(occupancies, dtype=np.float64)
+    return np.sum(psi[left_idx] * psi[right_idx] * occ[None, :], axis=1)
+
+
+def prepare_stencil_targets_from_orbitals(
+    axis_points: int,
+    psi_occ: np.ndarray,
+    occupancies: np.ndarray,
+    step: float,
+    tau_stencil: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    offsets = stencil_offsets(axis_points, tau_stencil)
+    margin = max(offsets)
+    derivative_true = []
+    for i in range(margin, axis_points - margin):
+        for j in range(margin, axis_points - margin):
+            for k in range(margin, axis_points - margin):
+                per_dim_deriv = []
+                for dim in range(3):
+                    dim_left = []
+                    dim_right = []
+                    for offset in offsets:
+                        plus = [i, j, k]
+                        minus = [i, j, k]
+                        plus[dim] += offset
+                        minus[dim] -= offset
+                        idx_plus = flat_index(plus[0], plus[1], plus[2], axis_points)
+                        idx_minus = flat_index(minus[0], minus[1], minus[2], axis_points)
+                        dim_left.extend([idx_plus, idx_plus, idx_minus, idx_minus])
+                        dim_right.extend([idx_plus, idx_minus, idx_plus, idx_minus])
+                    values = gamma_values_from_orbitals(
+                        psi_occ,
+                        occupancies,
+                        np.asarray(dim_left, dtype=np.int64),
+                        np.asarray(dim_right, dtype=np.int64),
+                    )
+                    per_dim_deriv.append(mixed_derivative_from_stencil(values, step))
+                derivative_true.append(per_dim_deriv)
+    derivative_arr = np.asarray(derivative_true, dtype=np.float32)
+    tau = 0.5 * np.sum(derivative_arr, axis=1, keepdims=True)
+    return derivative_arr, tau.astype(np.float32)
 
 
 def parse_qm9_float(value: str) -> float:
@@ -423,9 +494,7 @@ def run_gpaw(record: Qm9Record, args: argparse.Namespace) -> dict[str, object]:
     eigenvalues_ev = eigenvalues_ev_all[occupied]
     electron_count = float(np.sum(occupancies))
 
-    gamma_matrix = (psi_matrix * occupancies[None, :]) @ psi_matrix.T
-    gamma_matrix = 0.5 * (gamma_matrix + gamma_matrix.T)
-    rho_diag = np.diag(gamma_matrix).reshape(-1, 1)
+    rho_diag = np.sum(psi_matrix * psi_matrix * occupancies[None, :], axis=1, keepdims=True)
     trace = float(np.sum(rho_diag) * args.grid_spacing_bohr**3)
     if abs(trace - electron_count) > max(2e-4, 2e-4 * electron_count):
         raise RuntimeError(f"Trace check failed for {record.qm9_id}: grid trace={trace}, occ sum={electron_count}")
@@ -436,13 +505,14 @@ def run_gpaw(record: Qm9Record, args: argparse.Namespace) -> dict[str, object]:
         occupancies,
         args.grid_spacing_bohr,
     )
-    (stencil_info, tau_gamma_fd) = prepare_stencil_targets(
+    derivative_gamma_fd, tau_gamma_fd = prepare_stencil_targets_from_orbitals(
         axis_points=axis_points,
-        gamma_matrix=gamma_matrix,
+        psi_occ=psi_matrix,
+        occupancies=occupancies,
         step=args.grid_spacing_bohr,
         tau_stencil=args.tau_stencil,
     )
-    interior_idx, _, _, derivative_gamma_fd = stencil_info
+    interior_idx = interior_indices(axis_points, args.tau_stencil)
     interior_tau_orbital = tau_orbital_fd[interior_idx]
     tau_consistency_mae = float(np.mean(np.abs(interior_tau_orbital - tau_gamma_fd)))
     tau_consistency_rms_ratio = float(
@@ -453,6 +523,10 @@ def run_gpaw(record: Qm9Record, args: argparse.Namespace) -> dict[str, object]:
     potential, grad = nuclear_potential_and_grad(points_bohr, coords_bohr_centered, atomic_numbers)
     local_features = build_local_features(points_bohr, coords_bohr_centered, atomic_numbers, potential, grad, electron_count)
     global_context = build_global_context(record.symbols, coords_bohr_centered, electron_count)
+    gamma_matrix = np.empty((0, 0), dtype=np.float32)
+    if args.store_full_gamma:
+        gamma_matrix = (psi_matrix * occupancies[None, :]) @ psi_matrix.T
+        gamma_matrix = 0.5 * (gamma_matrix + gamma_matrix.T)
     return {
         "axis_points": axis_points,
         "axis": axis,
@@ -464,6 +538,7 @@ def run_gpaw(record: Qm9Record, args: argparse.Namespace) -> dict[str, object]:
         "global_context": global_context,
         "gamma_matrix": gamma_matrix.astype(np.float32),
         "rho_diag": rho_diag.astype(np.float32),
+        "psi_occ": psi_matrix.astype(np.float32),
         "derivative_orbital_fd": derivative_orbital_fd,
         "tau_orbital_fd": tau_orbital_fd,
         "derivative_gamma_fd_interior": derivative_gamma_fd.astype(np.float32),
@@ -488,6 +563,7 @@ def write_npz(record: Qm9Record, args: argparse.Namespace, output_path: Path) ->
         points=points_bohr,
         gamma_matrix=np.asarray(result["gamma_matrix"], dtype=np.float32),
         rho_diag=np.asarray(result["rho_diag"], dtype=np.float32),
+        psi_occ=np.asarray(result["psi_occ"], dtype=np.float32),
         # Legacy training-loader names. In this dataset these are FD orbital-gradient references.
         derivative_true_ao=np.asarray(result["derivative_orbital_fd"], dtype=np.float32),
         tau_true_ao=np.asarray(result["tau_orbital_fd"], dtype=np.float32),

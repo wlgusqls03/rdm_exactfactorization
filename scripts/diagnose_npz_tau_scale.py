@@ -61,6 +61,56 @@ def tau_fd_from_gamma(gamma: np.ndarray, axis_points: int, step: float, stencil:
     return derivative.astype(np.float64), tau.astype(np.float64)
 
 
+def gamma_values_from_orbitals(
+    psi_occ: np.ndarray,
+    occupancies: np.ndarray,
+    left_idx: np.ndarray,
+    right_idx: np.ndarray,
+) -> np.ndarray:
+    psi = np.asarray(psi_occ, dtype=np.float64)
+    occ = np.asarray(occupancies, dtype=np.float64)
+    return np.sum(psi[left_idx] * psi[right_idx] * occ[None, :], axis=1)
+
+
+def tau_fd_from_orbitals(
+    psi_occ: np.ndarray,
+    occupancies: np.ndarray,
+    axis_points: int,
+    step: float,
+    stencil: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    offsets = stencil_offsets(axis_points, stencil)
+    margin = max(offsets)
+    derivative_true = []
+    for i in range(margin, axis_points - margin):
+        for j in range(margin, axis_points - margin):
+            for k in range(margin, axis_points - margin):
+                per_dim = []
+                for dim in range(3):
+                    dim_left = []
+                    dim_right = []
+                    for offset in offsets:
+                        plus = [i, j, k]
+                        minus = [i, j, k]
+                        plus[dim] += offset
+                        minus[dim] -= offset
+                        idx_plus = flat_index(plus[0], plus[1], plus[2], axis_points)
+                        idx_minus = flat_index(minus[0], minus[1], minus[2], axis_points)
+                        dim_left.extend([idx_plus, idx_plus, idx_minus, idx_minus])
+                        dim_right.extend([idx_plus, idx_minus, idx_plus, idx_minus])
+                    values = gamma_values_from_orbitals(
+                        psi_occ,
+                        occupancies,
+                        np.asarray(dim_left, dtype=np.int64),
+                        np.asarray(dim_right, dtype=np.int64),
+                    )
+                    per_dim.append(mixed_derivative_from_stencil(values, step))
+                derivative_true.append(per_dim)
+    derivative_arr = np.asarray(derivative_true, dtype=np.float64)
+    tau = 0.5 * np.sum(derivative_arr, axis=1, keepdims=True)
+    return derivative_arr, tau
+
+
 def summarize_tau_candidate(
     name: str,
     gamma: np.ndarray,
@@ -178,7 +228,13 @@ def diagnose(path: Path, stencil: str) -> None:
         print_row("keys", ", ".join(sorted(payload.files)))
 
         points = np.asarray(payload["points"], dtype=np.float64)
-        gamma = np.asarray(payload["gamma_matrix"], dtype=np.float64)
+        gamma = np.asarray(payload["gamma_matrix"], dtype=np.float64) if "gamma_matrix" in payload else np.empty((0, 0))
+        psi_occ = np.asarray(payload["psi_occ"], dtype=np.float64) if "psi_occ" in payload else None
+        occupancies = np.asarray(payload["occupancies"], dtype=np.float64) if "occupancies" in payload else None
+        has_dense_gamma = gamma.ndim == 2 and gamma.size > 0
+        has_lazy_gamma = psi_occ is not None and occupancies is not None and psi_occ.size > 0
+        if not has_dense_gamma and not has_lazy_gamma:
+            raise KeyError(f"{path} has neither dense gamma_matrix nor psi_occ+occupancies.")
         rho_payload = np.asarray(payload["rho_diag"], dtype=np.float64) if "rho_diag" in payload else None
         tau_ao = np.asarray(payload["tau_true_ao"], dtype=np.float64) if "tau_true_ao" in payload else None
         deriv_ao = np.asarray(payload["derivative_true_ao"], dtype=np.float64) if "derivative_true_ao" in payload else None
@@ -208,11 +264,17 @@ def diagnose(path: Path, stencil: str) -> None:
         print_row("electron_count", f"{electron_count:.8e}")
         print_row("gamma_trace_scale", f"{gamma_trace_scale:.8e}")
 
-        gamma_diag = np.diag(gamma).reshape(-1, 1)
+        if has_dense_gamma:
+            gamma_diag = np.diag(gamma).reshape(-1, 1)
+            gamma_source = "dense gamma_matrix"
+        else:
+            gamma_diag = np.sum(psi_occ * psi_occ * occupancies[None, :], axis=1, keepdims=True)
+            gamma_source = "lazy psi_occ"
         rho_ref = rho_payload.reshape(-1, 1) if rho_payload is not None else gamma_diag
         print()
         print("[Gamma Diagonal / Density]")
-        print_row("gamma shape", gamma.shape)
+        print_row("gamma source", gamma_source)
+        print_row("gamma shape", gamma.shape if has_dense_gamma else f"lazy psi_occ {psi_occ.shape}")
         print_row("mean gamma_ii", f"{float(np.mean(gamma_diag)):.8e}")
         print_row("mean rho_ref", f"{float(np.mean(rho_ref)):.8e}")
         print_row("MAE(gamma_ii, rho_ref)", f"{mae(gamma_diag, rho_ref):.8e}")
@@ -244,22 +306,40 @@ def diagnose(path: Path, stencil: str) -> None:
 
         print()
         print("[FD Tau Candidates]")
-        candidates: list[tuple[str, np.ndarray, float]] = [
-            ("gamma, h_coord", gamma, h_coord),
-            ("gamma, h_stored", gamma, h_stored),
-            ("gamma, h_coord/10", gamma, h_coord / 10.0),
-            ("gamma, h_coord*AngstromToBohr", gamma, h_coord * ANGSTROM_TO_BOHR),
-            ("gamma, h_coord/AngstromToBohr", gamma, h_coord / ANGSTROM_TO_BOHR),
-            ("gamma/dV, h_coord", gamma / dvol, h_coord),
-            ("gamma*dV, h_coord", gamma * dvol, h_coord),
-        ]
-        rows = [summarize_tau_candidate(name, cand_gamma, axis_points, step, stencil, tau_ao) for name, cand_gamma, step in candidates]
+        if has_dense_gamma:
+            candidates: list[tuple[str, np.ndarray, float]] = [
+                ("gamma, h_coord", gamma, h_coord),
+                ("gamma, h_stored", gamma, h_stored),
+                ("gamma, h_coord/10", gamma, h_coord / 10.0),
+                ("gamma, h_coord*AngstromToBohr", gamma, h_coord * ANGSTROM_TO_BOHR),
+                ("gamma, h_coord/AngstromToBohr", gamma, h_coord / ANGSTROM_TO_BOHR),
+                ("gamma/dV, h_coord", gamma / dvol, h_coord),
+                ("gamma*dV, h_coord", gamma * dvol, h_coord),
+            ]
+            rows = [summarize_tau_candidate(name, cand_gamma, axis_points, step, stencil, tau_ao) for name, cand_gamma, step in candidates]
+        else:
+            _, tau_fd = tau_fd_from_orbitals(psi_occ, occupancies, axis_points, h_coord, stencil)
+            if tau_ao is None:
+                rows = [("psi_occ lazy gamma, h_coord", rms(tau_fd), float("nan"), float("nan"))]
+            else:
+                tau_ao_interior = interior_values(tau_ao, axis_points, stencil)
+                rows = [
+                    (
+                        "psi_occ lazy gamma, h_coord",
+                        rms(tau_fd),
+                        rms(tau_fd) / max(rms(tau_ao_interior), 1e-30),
+                        mae(tau_fd, tau_ao_interior),
+                    )
+                ]
         print(f"{'candidate':<32} {'RMS(FD)':>14} {'RMS(FD)/RMS(AO)':>18} {'MAE(FD,AO)':>14}")
         for name, fd_rms, ratio, err in rows:
             print(f"{name:<32} {fd_rms:14.6e} {ratio:18.6e} {err:14.6e}")
 
         if tau_ao is not None:
-            _, tau_fd = tau_fd_from_gamma(gamma, axis_points, h_coord, stencil)
+            if has_dense_gamma:
+                _, tau_fd = tau_fd_from_gamma(gamma, axis_points, h_coord, stencil)
+            else:
+                _, tau_fd = tau_fd_from_orbitals(psi_occ, occupancies, axis_points, h_coord, stencil)
             fd_rms = rms(tau_fd)
             ao_rms = rms(tau_ao_interior)
             best_h_factor = np.sqrt(fd_rms / max(ao_rms, 1e-30))

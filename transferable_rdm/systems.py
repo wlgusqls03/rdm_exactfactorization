@@ -160,6 +160,7 @@ class SystemRecord:
     gamma_matrix: np.ndarray
     gamma_pairs: np.ndarray
     rho_diag: np.ndarray
+    psi_occ: np.ndarray | None
     rho_sad: np.ndarray | None
     rho_cation: np.ndarray | None
     rho_anion: np.ndarray | None
@@ -176,6 +177,8 @@ class SystemRecord:
     stencil_right: np.ndarray
     derivative_true: np.ndarray
     tau_true: np.ndarray
+    derivative_true_fd: np.ndarray | None
+    tau_true_fd: np.ndarray | None
 
     electron_count: float
     occupancies: np.ndarray
@@ -192,10 +195,26 @@ class SystemRecord:
         return load_gamma_matrix_cached(str(source_path))
 
     def gamma_values(self, left_idx: np.ndarray, right_idx: np.ndarray) -> np.ndarray:
+        if self.psi_occ is not None and self.psi_occ.size:
+            psi = np.asarray(self.psi_occ, dtype=np.float32)
+            occ = np.asarray(self.occupancies, dtype=np.float32)
+            if psi.shape[1] != occ.shape[0]:
+                raise RuntimeError(
+                    f"System {self.system_id} psi_occ/occupancies mismatch: "
+                    f"{psi.shape[1]} orbitals vs {occ.shape[0]} occupations."
+                )
+            values = np.sum(psi[left_idx] * psi[right_idx] * occ[None, :], axis=1)
+            return values.reshape(-1, 1).astype(np.float32)
         gamma = self.load_gamma_matrix()
         return gamma[left_idx, right_idx].reshape(-1, 1).astype(np.float32)
 
     def gamma_submatrix(self, indices: np.ndarray) -> np.ndarray:
+        if self.psi_occ is not None and self.psi_occ.size:
+            psi = np.asarray(self.psi_occ[indices], dtype=np.float32)
+            occ = np.asarray(self.occupancies, dtype=np.float32)
+            weighted = psi * occ[None, :]
+            gamma = weighted @ psi.T
+            return (0.5 * (gamma + gamma.T)).astype(np.float32)
         gamma = self.load_gamma_matrix()
         return gamma[np.ix_(indices, indices)].astype(np.float32)
 
@@ -588,12 +607,15 @@ def finalize_system_record(
     keep_gamma_matrix: bool = True,
     derivative_true_grid: np.ndarray | None = None,
     tau_true_grid: np.ndarray | None = None,
+    derivative_true_fd: np.ndarray | None = None,
+    tau_true_fd: np.ndarray | None = None,
     hartree_potential: np.ndarray | None = None,
     xc_potential_local: np.ndarray | None = None,
     ks_potential: np.ndarray | None = None,
     kinetic_potential: np.ndarray | None = None,
     kinetic_potential_centered: np.ndarray | None = None,
     rho_diag_override: np.ndarray | None = None,
+    psi_occ: np.ndarray | None = None,
     rho_sad: np.ndarray | None = None,
     rho_cation: np.ndarray | None = None,
     rho_anion: np.ndarray | None = None,
@@ -682,6 +704,11 @@ def finalize_system_record(
         gamma_matrix=gamma_matrix.astype(np.float32) if keep_gamma_matrix else np.empty((0, 0), dtype=np.float32),
         gamma_pairs=np.empty((0, 1), dtype=np.float32),
         rho_diag=rho_diag,
+        psi_occ=(
+            np.asarray(psi_occ, dtype=np.float32)
+            if psi_occ is not None
+            else None
+        ),
         rho_sad=(
             np.asarray(rho_sad, dtype=np.float32).reshape(n_points, 1)
             if rho_sad is not None
@@ -708,6 +735,16 @@ def finalize_system_record(
         stencil_right=stencil_right.astype(np.int64),
         derivative_true=derivative_true.astype(np.float32),
         tau_true=tau_true.astype(np.float32),
+        derivative_true_fd=(
+            np.asarray(derivative_true_fd, dtype=np.float32)
+            if derivative_true_fd is not None
+            else None
+        ),
+        tau_true_fd=(
+            np.asarray(tau_true_fd, dtype=np.float32)
+            if tau_true_fd is not None
+            else None
+        ),
         electron_count=float(electron_count),
         occupancies=np.asarray(occupancies, dtype=np.float32),
         orbital_energies=np.asarray(orbital_energies, dtype=np.float32),
@@ -854,6 +891,7 @@ def load_npz_system(path: str | Path, config: ExperimentConfig) -> SystemRecord:
             else None
         )
         occupancies = np.asarray(payload["occupancies"], dtype=np.float32) if "occupancies" in payload else np.array([], dtype=np.float32)
+        psi_occ = np.asarray(payload["psi_occ"], dtype=np.float32) if "psi_occ" in payload else None
         orbital_energies = np.asarray(payload["orbital_energies"], dtype=np.float32) if "orbital_energies" in payload else np.array([], dtype=np.float32)
         derivative_true_grid = (
             np.asarray(payload["derivative_true_ao"], dtype=np.float32)
@@ -861,6 +899,16 @@ def load_npz_system(path: str | Path, config: ExperimentConfig) -> SystemRecord:
             else None
         )
         tau_true_grid = np.asarray(payload["tau_true_ao"], dtype=np.float32) if "tau_true_ao" in payload else None
+        derivative_true_fd = (
+            np.asarray(payload["derivative_true_fd_gamma"], dtype=np.float32)
+            if "derivative_true_fd_gamma" in payload
+            else None
+        )
+        tau_true_fd = (
+            np.asarray(payload["tau_true_fd_gamma"], dtype=np.float32)
+            if "tau_true_fd_gamma" in payload
+            else None
+        )
         electron_count_from_payload = float(payload["electron_count"]) if "electron_count" in payload else None
         rho_diag_override = np.asarray(payload["rho_diag"], dtype=np.float32) if "rho_diag" in payload else None
         rho_sad = np.asarray(payload["rho_sad"], dtype=np.float32) if "rho_sad" in payload else None
@@ -938,12 +986,15 @@ def load_npz_system(path: str | Path, config: ExperimentConfig) -> SystemRecord:
         keep_gamma_matrix=False,
         derivative_true_grid=derivative_true_grid,
         tau_true_grid=tau_true_grid,
+        derivative_true_fd=derivative_true_fd,
+        tau_true_fd=tau_true_fd,
         hartree_potential=hartree_potential,
         xc_potential_local=xc_potential_local,
         ks_potential=ks_potential,
         kinetic_potential=kinetic_potential,
         kinetic_potential_centered=kinetic_potential_centered,
         rho_diag_override=rho_diag_override,
+        psi_occ=psi_occ,
         rho_sad=rho_sad,
         rho_cation=rho_cation,
         rho_anion=rho_anion,

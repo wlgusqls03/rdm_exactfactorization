@@ -193,9 +193,12 @@ scripts/build_qm9_gpaw_fd_npz.py
 ```
 
 It runs GPAW in real-space FD mode, extracts occupied pseudo-wavefunctions on
-the same uniform grid used by the model, and writes
+the same uniform grid used by the model, and writes a lazy/factorized reference
+by default:
 
-- `gamma_matrix = sum_n f_n psi_n(r_i) psi_n(r_j)`;
+- `psi_occ`: occupied pseudo-wavefunctions on the model grid;
+- `occupancies`;
+- on-the-fly `gamma_ij = sum_n f_n psi_n(r_i) psi_n(r_j)`;
 - `rho_diag = diag(gamma_matrix)`;
 - `tau_true_fd_orbital = 1/2 sum_n f_n |grad_h psi_n|^2`;
 - `tau_true_fd_gamma`, the same-grid near-diagonal curvature diagnostic from
@@ -203,6 +206,10 @@ the same uniform grid used by the model, and writes
 - loader-compatible `tau_true_ao` and `derivative_true_ao` aliases, which in
   this dataset are FD orbital-gradient references rather than AO-gradient
   references.
+
+The dense `gamma_matrix` is not stored unless `--store-full-gamma` is passed.
+This is required for fine grids such as `0.4` or `0.3` bohr, where dense gamma
+would scale as `N_grid^2`.
 
 GPAW and ASE must be installed in the active environment. A small dry run can
 select molecules and estimate grid sizes without running SCF:
@@ -228,6 +235,20 @@ python scripts/build_qm9_gpaw_fd_npz.py \
   --grid-spacing-bohr 0.8 \
   --padding-bohr 4.0 \
   --max-axis-points 25 \
+  --xc LDA
+```
+
+After the smoke test passes, a more serious FD dataset should use a finer
+spacing and the default lazy gamma format:
+
+```bash
+python scripts/build_qm9_gpaw_fd_npz.py \
+  --npz-glob 'qmugs_npz/qm9_pyscf_ldavwn_b631gd_atoms10_400_50_50_spacing1p5_kp/*.npz' \
+  --output-dir qmugs_npz/qm9_gpaw_fd_h0p4 \
+  --num-systems 50 \
+  --grid-spacing-bohr 0.4 \
+  --padding-bohr 4.0 \
+  --max-axis-points 55 \
   --xc LDA
 ```
 
