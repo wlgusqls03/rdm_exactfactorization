@@ -368,7 +368,11 @@ def kinetic_density_from_orbitals(
 def build_atoms(record: Qm9Record, axis_points: int, spacing_bohr: float, Atoms: object) -> tuple[object, np.ndarray]:
     coords_bohr = record.coords_angstrom * ANGSTROM_TO_BOHR
     coords_bohr_centered = coords_bohr - np.mean(coords_bohr, axis=0, keepdims=True)
-    box_angstrom = axis_points * spacing_bohr * BOHR_TO_ANGSTROM
+    # GPAW stores only the nonzero interior values for pbc=False.  A cell
+    # with N stored values has N + 1 grid intervals including the two zero
+    # boundaries, while the stored coordinates are centered at
+    # (i + 1 - (N + 1) / 2) * h.
+    box_angstrom = (axis_points + 1) * spacing_bohr * BOHR_TO_ANGSTROM
     positions_angstrom = coords_bohr_centered * BOHR_TO_ANGSTROM + 0.5 * box_angstrom
     atoms = Atoms(record.symbols, positions=positions_angstrom, cell=[box_angstrom] * 3, pbc=False)
     return atoms, coords_bohr_centered
@@ -391,7 +395,7 @@ def run_gpaw(record: Qm9Record, args: argparse.Namespace) -> dict[str, object]:
     calc = GPAW(
         mode=FD(nn=args.fd_order),
         xc=args.xc,
-        gpts=(axis_points, axis_points, axis_points),
+        gpts=(axis_points + 1, axis_points + 1, axis_points + 1),
         nbands=nbands,
         setups=(args.setups if args.setups else None),
         convergence={"energy": args.energy_convergence_ev, "density": args.density_convergence},
@@ -509,7 +513,7 @@ def write_npz(record: Qm9Record, args: argparse.Namespace, output_path: Path) ->
         axis_points=np.asarray(axis_points, dtype=np.int32),
         grid_spacing_bohr=np.asarray(args.grid_spacing_bohr, dtype=np.float32),
         grid_radius_bohr=np.asarray(float(np.max(np.abs(result["axis"]))), dtype=np.float32),
-        box_length_bohr=np.asarray(axis_points * args.grid_spacing_bohr, dtype=np.float32),
+        box_length_bohr=np.asarray((axis_points + 1) * args.grid_spacing_bohr, dtype=np.float32),
         kinetic_energy_hartree=np.asarray(result["kinetic_energy_hartree"], dtype=np.float32),
         total_energy_hartree=np.asarray(result["total_energy_hartree"], dtype=np.float32),
         tau_reference=np.asarray("gpaw_fd_orbital_gradient"),
@@ -534,7 +538,7 @@ def write_npz(record: Qm9Record, args: argparse.Namespace, output_path: Path) ->
         "tau_fd_gamma_over_orbital_rms": float(result["tau_consistency_rms_ratio"]),
         "axis_points": axis_points,
         "grid_spacing_bohr": float(args.grid_spacing_bohr),
-        "box_length_bohr": axis_points * float(args.grid_spacing_bohr),
+        "box_length_bohr": (axis_points + 1) * float(args.grid_spacing_bohr),
         "xc": args.xc,
         "setups": args.setups,
     }
