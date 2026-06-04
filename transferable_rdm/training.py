@@ -680,6 +680,7 @@ def stencil_predictions(
     config: ExperimentConfig,
     rho_all: tf.Tensor | None = None,
     density_state: DensityFeatureState | None = None,
+    max_centers: int | None = None,
 ) -> tuple[tf.Tensor, tf.Tensor]:
     """explicit near-diagonal mixed derivative prediction.
 
@@ -695,6 +696,8 @@ def stencil_predictions(
     stencil_order = int(system.stencil_left.shape[2])
     stencil_shape = system.stencil_left.shape
     n_centers = int(stencil_shape[0])
+    if max_centers is not None and int(max_centers) > 0:
+        n_centers = min(n_centers, int(max_centers))
     flat_per_center = int(np.prod(stencil_shape[1:]))
     chunk_pairs = max(int(config.stencil_prediction_chunk_size), flat_per_center)
     chunk_centers = max(1, chunk_pairs // flat_per_center)
@@ -1342,6 +1345,7 @@ def compute_training_losses(
     models: ModelBundle,
     config: ExperimentConfig,
     weights: dict[str, float],
+    stencil_center_limit: int | None = None,
 ) -> dict[str, tf.Tensor]:
     """Compute all train-step losses, skipping expensive inactive terms."""
     _, density_state = point_output_and_state(system, models, config)
@@ -1367,9 +1371,17 @@ def compute_training_losses(
     zero = tf.constant(0.0, dtype=tf.float32)
     if weights["deriv"] != 0.0 or weights["tau"] != 0.0 or weights["kinetic"] != 0.0:
         derivative_pred, tau_pred = stencil_predictions(
-            system, models, config, rho_all=rho_all, density_state=density_state
+            system,
+            models,
+            config,
+            rho_all=rho_all,
+            density_state=density_state,
+            max_centers=stencil_center_limit,
         )
         derivative_target, tau_target = physics_stencil_targets(system, config)
+        if stencil_center_limit is not None and int(stencil_center_limit) > 0:
+            derivative_target = derivative_target[: int(stencil_center_limit)]
+            tau_target = tau_target[: int(stencil_center_limit)]
         deriv_loss = rms_normalized_huber(
             to_tensor(derivative_target),
             derivative_pred,
@@ -1442,12 +1454,24 @@ def print_gradient_diagnostics(
     diagnostic_weights["deriv"] = 1.0
     diagnostic_weights["tau"] = 1.0
     diagnostic_weights["kinetic"] = 0.0
+    diagnostic_stencil_centers = int(config.gradient_diagnostic_stencil_centers)
 
     with tf.GradientTape(persistent=True) as tape:
-        losses = compute_training_losses(system, batch, models, config, diagnostic_weights)
+        losses = compute_training_losses(
+            system,
+            batch,
+            models,
+            config,
+            diagnostic_weights,
+            stencil_center_limit=diagnostic_stencil_centers,
+        )
 
     rows: list[tuple[str, str]] = [
         ("system", system.system_id),
+        (
+            "diagnostic stencil centers",
+            f"{min(diagnostic_stencil_centers, int(system.stencil_left.shape[0]))}/{int(system.stencil_left.shape[0])}",
+        ),
         ("local curvature basis scale", f"{local_curvature_basis_scale(system, config):.6e}"),
         (
             "scheduled weights gamma/deriv/tau",
@@ -1488,10 +1512,20 @@ def print_gradient_diagnostics(
 
     _, density_state = point_output_and_state(system, models, config)
     derivative_pred, tau_pred = stencil_predictions(
-        system, models, config, rho_all=density_state.rho_neutral, density_state=density_state
+        system,
+        models,
+        config,
+        rho_all=density_state.rho_neutral,
+        density_state=density_state,
+        max_centers=diagnostic_stencil_centers,
     )
     derivative_true_fd, tau_true_fd = true_gamma_stencil_targets(system)
     derivative_target, tau_target = physics_stencil_targets(system, config)
+    if diagnostic_stencil_centers > 0:
+        derivative_true_fd = derivative_true_fd[:diagnostic_stencil_centers]
+        tau_true_fd = tau_true_fd[:diagnostic_stencil_centers]
+        derivative_target = derivative_target[:diagnostic_stencil_centers]
+        tau_target = tau_target[:diagnostic_stencil_centers]
     rows.extend(
         [
             ("physics target", physics_target_mode(config)),
@@ -1551,6 +1585,7 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
             ("deriv/tau loss", "target-RMS normalized Huber"),
             ("Huber delta", f"{config.physics_huber_delta:.6g}"),
             ("deriv/tau scale floor", f"{config.deriv_scale_floor:.6g} / {config.tau_scale_floor:.6g}"),
+            ("train stencil centers", "full" if config.train_stencil_centers <= 0 else config.train_stencil_centers),
             ("kinetic integral active", loss_enabled(config, "kinetic")),
         ],
     )
@@ -1567,6 +1602,7 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
             ("enabled", config.gradient_diagnostics),
             ("every epochs", max(config.gradient_diagnostics_every, 1)),
             ("fixed train system", diagnostic_system.system_id),
+            ("stencil centers", config.gradient_diagnostic_stencil_centers),
         ],
     )
 
@@ -1591,7 +1627,14 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
             batch = sample_pair_batch(system, config, epoch, rng)
 
             with tf.GradientTape() as tape:
-                losses = compute_training_losses(system, batch, models, config, weights)
+                losses = compute_training_losses(
+                    system,
+                    batch,
+                    models,
+                    config,
+                    weights,
+                    stencil_center_limit=config.train_stencil_centers,
+                )
                 total_loss = weighted_training_objective(losses, weights)
 
             grads = tape.gradient(total_loss, vars_all)

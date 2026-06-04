@@ -102,6 +102,8 @@ class ExperimentConfig:
     early_stopping_patience: int = int(os.environ.get("RDM_PATIENCE", 40))
     gradient_diagnostics: bool = env_flag("RDM_GRADIENT_DIAGNOSTICS", False)
     gradient_diagnostics_every: int = int(os.environ.get("RDM_GRADIENT_DIAGNOSTICS_EVERY", 5))
+    gradient_diagnostic_stencil_centers: int = int(os.environ.get("RDM_GRADIENT_DIAGNOSTIC_STENCIL_CENTERS", 256))
+    train_stencil_centers: int = int(os.environ.get("RDM_TRAIN_STENCIL_CENTERS", 0))
     stencil_prediction_chunk_size: int = int(os.environ.get("RDM_STENCIL_PREDICTION_CHUNK_SIZE", 65536))
     overfit_one_system: bool = env_flag("RDM_OVERFIT_ONE_SYSTEM", False)
     overfit_system_index: int = int(os.environ.get("RDM_OVERFIT_SYSTEM_INDEX", 0))
