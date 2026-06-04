@@ -50,6 +50,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grid-spacing-bohr", type=float, default=0.55)
     parser.add_argument("--padding-bohr", type=float, default=5.0)
     parser.add_argument("--max-axis-points", type=int, default=35)
+    parser.add_argument(
+        "--gpaw-grid-divisor",
+        type=int,
+        default=8,
+        help=(
+            "Choose axis_points so the GPAW nonperiodic gpts=axis_points+1 grid is divisible "
+            "by this value. This avoids multigrid coarsening failures such as Grid [15 15 15] "
+            "not divisible by 2."
+        ),
+    )
     parser.add_argument("--xc", type=str, default="LDA")
     parser.add_argument(
         "--setups",
@@ -317,12 +327,19 @@ def molecular_formula(symbols: list[str]) -> str:
     return "".join(parts)
 
 
-def choose_axis_points(coords_bohr_centered: np.ndarray, spacing_bohr: float, padding_bohr: float, cap: int) -> int:
+def choose_axis_points(
+    coords_bohr_centered: np.ndarray,
+    spacing_bohr: float,
+    padding_bohr: float,
+    cap: int,
+    gpaw_grid_divisor: int = 8,
+) -> int:
     radius = float(np.max(np.abs(coords_bohr_centered)) + padding_bohr)
-    n = int(np.ceil(2.0 * radius / spacing_bohr))
-    n = max(8, n)
-    if n % 2 == 0:
-        n += 1
+    intervals = max(8, int(np.ceil(2.0 * radius / spacing_bohr)))
+    divisor = max(int(gpaw_grid_divisor), 1)
+    if intervals % divisor:
+        intervals += divisor - (intervals % divisor)
+    n = intervals - 1
     if cap > 0 and n > cap:
         raise RuntimeError(
             f"axis_points={n} exceeds --max-axis-points={cap}. "
@@ -455,7 +472,13 @@ def run_gpaw(record: Qm9Record, args: argparse.Namespace) -> dict[str, object]:
 
     coords_bohr = record.coords_angstrom * ANGSTROM_TO_BOHR
     coords_bohr_centered = coords_bohr - np.mean(coords_bohr, axis=0, keepdims=True)
-    axis_points = choose_axis_points(coords_bohr_centered, args.grid_spacing_bohr, args.padding_bohr, args.max_axis_points)
+    axis_points = choose_axis_points(
+        coords_bohr_centered,
+        args.grid_spacing_bohr,
+        args.padding_bohr,
+        args.max_axis_points,
+        args.gpaw_grid_divisor,
+    )
     axis, points_bohr = centered_grid(axis_points, args.grid_spacing_bohr)
     atoms, coords_bohr_centered = build_atoms(record, axis_points, args.grid_spacing_bohr, Atoms)
 
@@ -688,7 +711,13 @@ def main() -> None:
         coords_bohr = record.coords_angstrom * ANGSTROM_TO_BOHR
         centered = coords_bohr - np.mean(coords_bohr, axis=0, keepdims=True)
         try:
-            axis_points = choose_axis_points(centered, args.grid_spacing_bohr, args.padding_bohr, args.max_axis_points)
+            axis_points = choose_axis_points(
+                centered,
+                args.grid_spacing_bohr,
+                args.padding_bohr,
+                args.max_axis_points,
+                args.gpaw_grid_divisor,
+            )
         except RuntimeError as exc:
             skipped.append({"qm9_id": record.qm9_id, "reason": str(exc)})
             continue
