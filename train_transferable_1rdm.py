@@ -41,7 +41,7 @@ def configure_tensorflow_environment_preimport() -> None:
 configure_tensorflow_environment_preimport()
 
 from transferable_rdm.config import ExperimentConfig
-from transferable_rdm.data import build_pair_features, split_systems
+from transferable_rdm.data import DatasetSplit, build_pair_features, compact_system_ids, split_systems
 from transferable_rdm.density_features import (
     DENSITY_BASELINE_MODES,
     PAIR_DENSITY_FEATURE_MODES,
@@ -72,9 +72,19 @@ CSV_METRIC_KEYS = [
     "deriv_loss",
     "deriv_raw_mse",
     "deriv_mae",
+    "deriv_fd_ao_raw_mse",
+    "deriv_fd_ao_mae",
+    "deriv_fd_ao_rms_ratio",
+    "deriv_pred_fd_raw_mse",
+    "deriv_pred_fd_mae",
     "tau_loss",
     "tau_raw_mse",
     "tau_mae",
+    "tau_fd_ao_raw_mse",
+    "tau_fd_ao_mae",
+    "tau_fd_ao_rms_ratio",
+    "tau_pred_fd_raw_mse",
+    "tau_pred_fd_mae",
     "kinetic_loss",
     "kinetic_pred",
     "kinetic_training_ref",
@@ -84,8 +94,11 @@ CSV_METRIC_KEYS = [
     "trace_rel_error",
     "trace_abs_rel_error",
     "tau_true_integral",
+    "tau_true_fd_integral",
+    "tau_fd_ao_integral_error",
     "tau_pred_integral",
     "ked_true_integral",
+    "ked_true_fd_integral",
     "ked_pred_integral",
     "kinetic_energy_ref",
     "kinetic_energy_ref_error",
@@ -140,14 +153,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--point-density-log-weight", type=float, default=None)
     parser.add_argument("--point-density-log-eps", type=float, default=None)
     parser.add_argument("--pair-density-feature-mode", choices=PAIR_DENSITY_FEATURE_MODES, default=None)
+    parser.add_argument("--pair-density-symmetric", dest="pair_density_symmetric", action="store_true", default=None)
+    parser.add_argument("--no-pair-density-symmetric", dest="pair_density_symmetric", action="store_false")
     parser.add_argument("--density-baseline-mode", choices=DENSITY_BASELINE_MODES, default=None)
     parser.add_argument("--sad-density-floor", type=float, default=None)
     parser.add_argument("--sad-residual-clip", type=float, default=None)
+    parser.add_argument("--symmetrize-kernel-output", dest="symmetrize_kernel_output", action="store_true", default=None)
+    parser.add_argument("--no-symmetrize-kernel-output", dest="symmetrize_kernel_output", action="store_false")
+    parser.add_argument("--local-curvature-form", choices=["quadratic", "legacy"], default=None)
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--npz-glob", type=str, default=None)
     parser.add_argument("--auto-run-dir", dest="auto_run_dir", action="store_true", default=None)
     parser.add_argument("--no-auto-run-dir", dest="auto_run_dir", action="store_false")
+    parser.add_argument("--overfit-one-system", dest="overfit_one_system", action="store_true", default=None)
+    parser.add_argument("--no-overfit-one-system", dest="overfit_one_system", action="store_false")
+    parser.add_argument("--overfit-system-index", type=int, default=None)
+    parser.add_argument("--overfit-system-id", type=str, default=None)
     return parser.parse_args()
 
 
@@ -215,13 +237,19 @@ def apply_overrides(config: ExperimentConfig, args: argparse.Namespace) -> Exper
         ("point_density_log_weight", "point_density_log_weight"),
         ("point_density_log_eps", "point_density_log_eps"),
         ("pair_density_feature_mode", "pair_density_feature_mode"),
+        ("pair_density_symmetric", "pair_density_symmetric"),
         ("density_baseline_mode", "density_baseline_mode"),
         ("sad_density_floor", "sad_density_floor"),
         ("sad_residual_clip", "sad_residual_clip"),
+        ("symmetrize_kernel_output", "symmetrize_kernel_output"),
+        ("local_curvature_form", "local_curvature_form"),
         ("run_name", "run_name"),
         ("output_dir", "output_dir"),
         ("npz_glob", "npz_glob"),
         ("auto_run_dir", "auto_run_dir"),
+        ("overfit_one_system", "overfit_one_system"),
+        ("overfit_system_index", "overfit_system_index"),
+        ("overfit_system_id", "overfit_system_id"),
     ]:
         value = getattr(args, arg_name)
         if value is not None:
@@ -236,6 +264,47 @@ def apply_auto_run_dir(config: ExperimentConfig) -> ExperimentConfig:
     safe_run_name = config.run_name.strip() or "run"
     output_dir = Path(config.output_dir) / f"{safe_run_name}_{stamp}"
     return replace(config, output_dir=str(output_dir))
+
+
+def make_overfit_split(systems: list, config: ExperimentConfig) -> DatasetSplit:
+    """Use one system for train/val/test to test representational capacity."""
+    if not systems:
+        raise RuntimeError("No systems are available for one-system overfit mode.")
+    selected = None
+    requested_id = config.overfit_system_id.strip()
+    if requested_id:
+        exact_matches = [system for system in systems if system.system_id == requested_id]
+        partial_matches = [system for system in systems if requested_id in system.system_id]
+        matches = exact_matches or partial_matches
+        if not matches:
+            raise RuntimeError(f"No system matched --overfit-system-id={requested_id!r}.")
+        if len(matches) > 1 and not exact_matches:
+            raise RuntimeError(
+                f"--overfit-system-id={requested_id!r} matched multiple systems: "
+                f"{compact_system_ids(matches)}"
+            )
+        selected = matches[0]
+    else:
+        index = int(config.overfit_system_index)
+        if index < 0:
+            index += len(systems)
+        if index < 0 or index >= len(systems):
+            raise RuntimeError(
+                f"--overfit-system-index={config.overfit_system_index} is out of range for {len(systems)} systems."
+            )
+        selected = systems[index]
+    split = DatasetSplit(train_systems=[selected], val_systems=[selected], test_systems=[selected])
+    print_block(
+        "One-system overfit split",
+        [
+            ("system", selected.system_id),
+            ("formula", selected.metadata.get("formula", "")),
+            ("axis points", len(selected.axis)),
+            ("n_points", len(selected.points)),
+            ("train/val/test", "same system"),
+        ],
+    )
+    return split
 
 
 def rotated_output_path(path: Path, generation: int) -> Path:
@@ -331,6 +400,9 @@ def summarize_for_json(summary: dict[str, object]) -> dict[str, object]:
         "pair_loss": representative["pair_loss"],
         "density_mae": representative["density_mae"],
         "tau_mae": representative["tau_mae"],
+        "tau_fd_ao_mae": representative["tau_fd_ao_mae"],
+        "tau_fd_ao_rms_ratio": representative["tau_fd_ao_rms_ratio"],
+        "tau_pred_fd_mae": representative["tau_pred_fd_mae"],
         "kinetic_loss": representative["kinetic_loss"],
         "kinetic_pred": representative["kinetic_pred"],
         "kinetic_training_ref": representative["kinetic_training_ref"],
@@ -340,6 +412,8 @@ def summarize_for_json(summary: dict[str, object]) -> dict[str, object]:
         "trace_true": representative["trace_true"],
         "trace_pred": representative["trace_pred"],
         "tau_true_integral": representative["tau_true_integral"],
+        "tau_true_fd_integral": representative["tau_true_fd_integral"],
+        "tau_fd_ao_integral_error": representative["tau_fd_ao_integral_error"],
         "tau_pred_integral": representative["tau_pred_integral"],
         "kinetic_energy_ref": representative["kinetic_energy_ref"],
         "kinetic_energy_ref_error": representative["kinetic_energy_ref_error"],
@@ -467,7 +541,7 @@ def main() -> None:
     set_global_seed(config.seed)
 
     systems = build_system_corpus(config)
-    split = split_systems(systems, config)
+    split = make_overfit_split(systems, config) if config.overfit_one_system else split_systems(systems, config)
     if density_baseline_mode(config) == "sad-multiplicative":
         missing_sad = [system.system_id for system in systems if system.rho_sad is None]
         if missing_sad:
@@ -491,6 +565,7 @@ def main() -> None:
             ("mode", config.pair_density_feature_mode),
             ("base pair dim", base_pair_dim),
             ("density descriptor dim", pair_density_feature_dim(config)),
+            ("symmetric pair descriptors", config.pair_density_symmetric),
             ("density baseline mode", density_baseline_mode(config)),
             ("SAD floor/residual clip", f"{config.sad_density_floor:g} / {config.sad_residual_clip:g}"),
         ],

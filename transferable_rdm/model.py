@@ -145,12 +145,19 @@ def build_models(config: ExperimentConfig, point_feat_dim: int, pair_feat_dim: i
     if config.use_local_curvature_kernel:
         weights = pair_model.get_weights()
         weights[-2][:, 2:] = 0.0
-        weights[-1][2:] = 0.0
+        if config.local_curvature_form.strip().lower() == "quadratic":
+            weights[-1][2:] = -4.0
+        else:
+            weights[-1][2:] = 0.0
         pair_model.set_weights(weights)
     local_basis_scale = (
         float(config.local_curvature_basis_scale)
         if config.local_curvature_basis_scale > 0.0
-        else (float(config.domain_radius) / max(float(config.step), 1e-8)) ** 2
+        else (
+            float(config.domain_radius) ** 2
+            if config.local_curvature_form.strip().lower() == "quadratic"
+            else (float(config.domain_radius) / max(float(config.step), 1e-8)) ** 2
+        )
     )
     local_basis_label = f"{local_basis_scale:.6g}" if config.local_curvature_basis_scale > 0.0 else "system-specific"
 
@@ -163,7 +170,9 @@ def build_models(config: ExperimentConfig, point_feat_dim: int, pair_feat_dim: i
             ("point density heads", n_density_heads),
             ("pair density features", pair_density_feature_mode(config)),
             ("pair density feature dim", density_feature_dim),
+            ("symmetric kernel output", config.symmetrize_kernel_output),
             ("local curvature kernel", config.use_local_curvature_kernel),
+            ("local curvature form", config.local_curvature_form if config.use_local_curvature_kernel else "off"),
             ("local curvature scale", f"{config.local_curvature_scale:.6g}" if config.use_local_curvature_kernel else "off"),
             ("local curvature sigma", f"{config.local_curvature_sigma:.6g}" if config.use_local_curvature_kernel else "off"),
             ("local curvature basis scale", local_basis_label if config.use_local_curvature_kernel else "off"),
@@ -185,6 +194,9 @@ def build_models(config: ExperimentConfig, point_feat_dim: int, pair_feat_dim: i
     bundle._local_curvature_sigma = float(config.local_curvature_sigma)
     bundle._local_curvature_diag_eps = float(config.local_curvature_diag_eps)
     bundle._local_curvature_basis_scale = local_basis_scale
+    bundle._local_curvature_form = config.local_curvature_form.strip().lower()
+    bundle._symmetrize_kernel_output = bool(config.symmetrize_kernel_output)
+    bundle._pair_density_symmetric = bool(config.pair_density_symmetric)
     return bundle
 
 
@@ -224,6 +236,94 @@ def make_mode_weights(global_context_t: tf.Tensor, models: ModelBundle) -> tf.Te
     return tf.concat([anchor, descending + 1e-6], axis=1)                 # (1, rank_total)
 
 
+def reverse_pair_density_features(pair_density_feat_t: tf.Tensor, models: ModelBundle) -> tf.Tensor:
+    """Swap left/right endpoint descriptor slots for K_theta(r', r)."""
+    if bool(getattr(models, "_pair_density_symmetric", False)):
+        return pair_density_feat_t
+    n_features = pair_density_feat_t.shape[-1]
+    if n_features is None or int(n_features) == 0:
+        return pair_density_feat_t
+    if int(n_features) % 6 != 0:
+        return pair_density_feat_t
+    reshaped = tf.reshape(pair_density_feat_t, (tf.shape(pair_density_feat_t)[0], int(n_features) // 6, 6))
+    reversed_slots = tf.gather(reshaped, [1, 0, 3, 2, 5, 4], axis=2)
+    return tf.reshape(reversed_slots, tf.shape(pair_density_feat_t))
+
+
+def local_curvature_window(sep_sq: tf.Tensor, models: ModelBundle) -> tf.Tensor:
+    sigma_sq = max(float(getattr(models, "_local_curvature_sigma", 0.0)), 0.0) ** 2
+    if sigma_sq <= 0.0:
+        sigma_sq = 1.0
+    diag_eps = max(float(getattr(models, "_local_curvature_diag_eps", 1e-8)), 1e-12)
+    return sep_sq / (sep_sq + diag_eps) * tf.exp(-tf.maximum(sep_sq, 0.0) / sigma_sq)
+
+
+def kernel_from_pair_output(
+    pair_out: tf.Tensor,
+    residual_kernel: tf.Tensor,
+    sep_sq: tf.Tensor,
+    sep_sq_components: tf.Tensor,
+    models: ModelBundle,
+) -> dict[str, tf.Tensor]:
+    alpha = tf.nn.softplus(pair_out[:, :1]) + 1e-6
+    gate = tf.sigmoid(pair_out[:, 1:2])
+    baseline_kernel = tf.exp(-alpha * tf.maximum(sep_sq, 0.0))
+    gated_kernel = baseline_kernel * ((1.0 - gate) + gate * residual_kernel)
+
+    if pair_out.shape[-1] is not None and int(pair_out.shape[-1]) >= 5:
+        local_window = local_curvature_window(sep_sq, models)
+        local_scale = float(getattr(models, "_local_curvature_scale", 0.0))
+        curvature_form = str(getattr(models, "_local_curvature_form", "quadratic"))
+        if curvature_form == "quadratic":
+            local_axis_coeff = tf.nn.softplus(pair_out[:, 2:5])
+            local_correction = (
+                -0.5
+                * local_scale
+                * local_window
+                * tf.reduce_sum(local_axis_coeff * sep_sq_components, axis=1, keepdims=True)
+            )
+        elif curvature_form in {"legacy", "signed"}:
+            local_axis_coeff = tf.tanh(pair_out[:, 2:5])
+            local_correction = (
+                local_scale
+                * local_window
+                * tf.reduce_sum(local_axis_coeff * sep_sq_components, axis=1, keepdims=True)
+            )
+        else:
+            raise ValueError(f"Unknown local curvature form: {curvature_form!r}. Choose 'quadratic' or 'legacy'.")
+    elif pair_out.shape[-1] is not None and int(pair_out.shape[-1]) >= 3:
+        local_window = local_curvature_window(sep_sq, models)
+        local_axis_coeff = tf.zeros((tf.shape(pair_out)[0], 3), dtype=tf.float32)
+        local_correction = (
+            float(getattr(models, "_local_curvature_scale", 0.0))
+            * local_window
+            * tf.tanh(pair_out[:, 2:3])
+        )
+    else:
+        local_window = tf.zeros_like(gated_kernel)
+        local_axis_coeff = tf.zeros((tf.shape(pair_out)[0], 3), dtype=tf.float32)
+        local_correction = tf.zeros_like(gated_kernel)
+
+    kernel = gated_kernel + local_correction
+    return {
+        "kernel": kernel,
+        "gated_kernel": gated_kernel,
+        "baseline_kernel": baseline_kernel,
+        "local_window": local_window,
+        "local_axis_coeff": local_axis_coeff,
+        "local_correction": local_correction,
+        "alpha": alpha,
+        "gate": gate,
+    }
+
+
+def average_kernel_outputs(
+    forward: dict[str, tf.Tensor],
+    reverse: dict[str, tf.Tensor],
+) -> dict[str, tf.Tensor]:
+    return {key: 0.5 * (forward[key] + reverse[key]) for key in forward}
+
+
 def predict_from_features(
     point_feat_r_t: tf.Tensor,
     point_feat_rp_t: tf.Tensor,
@@ -250,8 +350,9 @@ def predict_from_features(
 
     point_input_r = tf.concat([point_feat_r_t, tiled_global], axis=1)             # (batch, d_point+d_global)
     point_input_rp = tf.concat([point_feat_rp_t, tiled_global], axis=1)           # (batch, d_point+d_global)
+    base_pair_feat_t = pair_feat_t
     if pair_density_feat_t is not None:
-        pair_feat_t = tf.concat([pair_feat_t, pair_density_feat_t], axis=1)
+        pair_feat_t = tf.concat([base_pair_feat_t, pair_density_feat_t], axis=1)
     pair_input = tf.concat([pair_feat_t, tiled_global], axis=1)                   # (batch, d_pair+d_global)
 
     point_out_r = models.point_model(point_input_r)                               # (batch, density heads)
@@ -285,49 +386,21 @@ def predict_from_features(
     )
     sep_sq_components = pair_feat_t[:, 6:9] * basis_scale                         # (batch, 3)
     sep_sq = pair_feat_t[:, 10:11]                                                # (batch, 1)
-    alpha = tf.nn.softplus(pair_out[:, :1]) + 1e-6                                # (batch, 1)
-    gate = tf.sigmoid(pair_out[:, 1:2])                                           # (batch, 1)
-    baseline_kernel = tf.exp(-alpha * tf.maximum(sep_sq, 0.0))                    # (batch, 1)
+    kernel_outputs = kernel_from_pair_output(pair_out, residual_kernel, sep_sq, sep_sq_components, models)
+    if bool(getattr(models, "_symmetrize_kernel_output", False)):
+        if pair_density_feat_t is not None:
+            reverse_density_feat_t = reverse_pair_density_features(pair_density_feat_t, models)
+            reverse_pair_feat_t = tf.concat([base_pair_feat_t, reverse_density_feat_t], axis=1)
+        else:
+            reverse_pair_feat_t = base_pair_feat_t
+        reverse_pair_input = tf.concat([reverse_pair_feat_t, tiled_global], axis=1)
+        reverse_pair_out = models.pair_model(reverse_pair_input)
+        reverse_kernel_outputs = kernel_from_pair_output(
+            reverse_pair_out, residual_kernel, sep_sq, sep_sq_components, models
+        )
+        kernel_outputs = average_kernel_outputs(kernel_outputs, reverse_kernel_outputs)
 
-    gated_kernel = baseline_kernel * ((1.0 - gate) + gate * residual_kernel)      # (batch, 1)
-    if models.pair_model.output_shape[-1] >= 5:
-        sigma_sq = max(float(getattr(models, "_local_curvature_sigma", 0.0)), 0.0) ** 2
-        if sigma_sq <= 0.0:
-            sigma_sq = 1.0
-        diag_eps = max(float(getattr(models, "_local_curvature_diag_eps", 1e-8)), 1e-12)
-        local_window = (
-            sep_sq
-            / (sep_sq + diag_eps)
-            * tf.exp(-tf.maximum(sep_sq, 0.0) / sigma_sq)
-        )
-        local_axis_coeff = tf.tanh(pair_out[:, 2:5])
-        local_correction = (
-            float(getattr(models, "_local_curvature_scale", 0.0))
-            * local_window
-            * tf.reduce_sum(local_axis_coeff * sep_sq_components, axis=1, keepdims=True)
-        )
-    elif models.pair_model.output_shape[-1] >= 3:
-        sigma_sq = max(float(getattr(models, "_local_curvature_sigma", 0.0)), 0.0) ** 2
-        if sigma_sq <= 0.0:
-            sigma_sq = 1.0
-        diag_eps = max(float(getattr(models, "_local_curvature_diag_eps", 1e-8)), 1e-12)
-        local_window = (
-            sep_sq
-            / (sep_sq + diag_eps)
-            * tf.exp(-tf.maximum(sep_sq, 0.0) / sigma_sq)
-        )
-        local_axis_coeff = tf.zeros((batch_size, 3), dtype=tf.float32)
-        local_correction = (
-            float(getattr(models, "_local_curvature_scale", 0.0))
-            * local_window
-            * tf.tanh(pair_out[:, 2:3])
-        )
-    else:
-        local_window = tf.zeros_like(gated_kernel)
-        local_axis_coeff = tf.zeros((batch_size, 3), dtype=tf.float32)
-        local_correction = tf.zeros_like(gated_kernel)
-
-    kernel = gated_kernel + local_correction                                      # (batch, 1)
+    kernel = kernel_outputs["kernel"]                                             # (batch, 1)
     gamma = tf.sqrt(rho_r * rho_rp) * kernel                                      # (batch, 1)
 
     return {
@@ -337,13 +410,13 @@ def predict_from_features(
         "rho_raw_r": rho_raw_r,
         "rho_raw_rp": rho_raw_rp,
         "kernel": kernel,
-        "gated_kernel": gated_kernel,
-        "baseline_kernel": baseline_kernel,
+        "gated_kernel": kernel_outputs["gated_kernel"],
+        "baseline_kernel": kernel_outputs["baseline_kernel"],
         "residual_kernel": residual_kernel,
-        "local_window": local_window,
-        "local_axis_coeff": local_axis_coeff,
-        "local_correction": local_correction,
-        "alpha": alpha,
-        "gate": gate,
+        "local_window": kernel_outputs["local_window"],
+        "local_axis_coeff": kernel_outputs["local_axis_coeff"],
+        "local_correction": kernel_outputs["local_correction"],
+        "alpha": kernel_outputs["alpha"],
+        "gate": kernel_outputs["gate"],
         "mode_weights": mode_weights,
     }

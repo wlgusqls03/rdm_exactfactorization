@@ -54,9 +54,15 @@ VAL_HISTORY_KEYS = (
     "deriv_loss",
     "deriv_raw_mse",
     "deriv_mae",
+    "deriv_fd_ao_mae",
+    "deriv_fd_ao_rms_ratio",
+    "deriv_pred_fd_mae",
     "tau_loss",
     "tau_raw_mse",
     "tau_mae",
+    "tau_fd_ao_mae",
+    "tau_fd_ao_rms_ratio",
+    "tau_pred_fd_mae",
     "kinetic_loss",
     "kinetic_abs_error",
     "trace_loss",
@@ -615,6 +621,8 @@ def local_curvature_basis_scale(system: SystemRecord, config: ExperimentConfig) 
     if config.local_curvature_basis_scale > 0.0:
         return float(config.local_curvature_basis_scale)
     domain_scale = max(float(np.max(np.abs(system.axis))), 1e-6)
+    if config.local_curvature_form.strip().lower() == "quadratic":
+        return domain_scale**2
     step = max(float(system.step), 1e-8)
     return (domain_scale / step) ** 2
 
@@ -712,6 +720,42 @@ def stencil_predictions(
         derivative_pred = d_h
     tau_pred = 0.5 * tf.reduce_sum(derivative_pred, axis=1, keepdims=True)
     return derivative_pred, tau_pred
+
+
+def true_gamma_stencil_targets(system: SystemRecord) -> tuple[np.ndarray, np.ndarray]:
+    """Compute derivative/tau targets from the true gamma on the model stencil."""
+    stencil_order = int(system.stencil_left.shape[2])
+    stencil_shape = system.stencil_left.shape
+    left_idx = system.stencil_left.reshape(-1)
+    right_idx = system.stencil_right.reshape(-1)
+    gamma_stencil = system.gamma_values(left_idx, right_idx).reshape(stencil_shape)
+    d_h = (
+        gamma_stencil[:, :, 0]
+        - gamma_stencil[:, :, 1]
+        - gamma_stencil[:, :, 2]
+        + gamma_stencil[:, :, 3]
+    ) / (4.0 * system.step * system.step)
+    if stencil_order >= 8:
+        d_2h = (
+            gamma_stencil[:, :, 4]
+            - gamma_stencil[:, :, 5]
+            - gamma_stencil[:, :, 6]
+            + gamma_stencil[:, :, 7]
+        ) / (16.0 * system.step * system.step)
+        derivative_fd = (4.0 * d_h - d_2h) / 3.0
+    else:
+        derivative_fd = d_h
+    tau_fd = 0.5 * np.sum(derivative_fd, axis=1, keepdims=True)
+    return derivative_fd.astype(np.float32), tau_fd.astype(np.float32)
+
+
+def np_rms(value: np.ndarray) -> float:
+    return float(np.sqrt(np.mean(np.square(value)))) if value.size else float("nan")
+
+
+def safe_rms_ratio(numerator: np.ndarray, denominator: np.ndarray) -> float:
+    denom = max(np_rms(denominator), 1e-30)
+    return float(np_rms(numerator) / denom)
 
 
 def spectral_occupation_penalty(
@@ -953,8 +997,19 @@ def evaluate_system(
     )
     derivative_pred = derivative_pred_t.numpy()
     tau_pred = tau_pred_t.numpy()
+    derivative_true_fd, tau_true_fd = true_gamma_stencil_targets(system)
     deriv_raw_mse = float(np.mean((derivative_pred - system.derivative_true) ** 2))
     tau_raw_mse = float(np.mean((tau_pred - system.tau_true) ** 2))
+    deriv_fd_ao_raw_mse = float(np.mean((derivative_true_fd - system.derivative_true) ** 2))
+    deriv_fd_ao_mae = float(np.mean(np.abs(derivative_true_fd - system.derivative_true)))
+    deriv_fd_ao_rms_ratio = safe_rms_ratio(derivative_true_fd, system.derivative_true)
+    deriv_pred_fd_raw_mse = float(np.mean((derivative_pred - derivative_true_fd) ** 2))
+    deriv_pred_fd_mae = float(np.mean(np.abs(derivative_pred - derivative_true_fd)))
+    tau_fd_ao_raw_mse = float(np.mean((tau_true_fd - system.tau_true) ** 2))
+    tau_fd_ao_mae = float(np.mean(np.abs(tau_true_fd - system.tau_true)))
+    tau_fd_ao_rms_ratio = safe_rms_ratio(tau_true_fd, system.tau_true)
+    tau_pred_fd_raw_mse = float(np.mean((tau_pred - tau_true_fd) ** 2))
+    tau_pred_fd_mae = float(np.mean(np.abs(tau_pred - tau_true_fd)))
     deriv_loss = float(
         rms_normalized_huber(
             to_tensor(system.derivative_true),
@@ -1006,6 +1061,7 @@ def evaluate_system(
     min_eig_pred = float(np.min(occ_eigs_t.numpy()))
     top_mo_occ_true = topk_descending(system.occupancies, 6) if len(system.occupancies) else np.array([], dtype=np.float32)
     tau_true_integral = float(np.sum(system.tau_true) * system.cell_volume)
+    tau_true_fd_integral = float(np.sum(tau_true_fd) * system.cell_volume)
     tau_pred_integral = float(np.sum(tau_pred) * system.cell_volume)
 
     metrics = {
@@ -1025,9 +1081,19 @@ def evaluate_system(
         "deriv_loss": deriv_loss,
         "deriv_raw_mse": deriv_raw_mse,
         "deriv_mae": deriv_mae,
+        "deriv_fd_ao_raw_mse": deriv_fd_ao_raw_mse,
+        "deriv_fd_ao_mae": deriv_fd_ao_mae,
+        "deriv_fd_ao_rms_ratio": deriv_fd_ao_rms_ratio,
+        "deriv_pred_fd_raw_mse": deriv_pred_fd_raw_mse,
+        "deriv_pred_fd_mae": deriv_pred_fd_mae,
         "tau_loss": tau_loss,
         "tau_raw_mse": tau_raw_mse,
         "tau_mae": tau_mae,
+        "tau_fd_ao_raw_mse": tau_fd_ao_raw_mse,
+        "tau_fd_ao_mae": tau_fd_ao_mae,
+        "tau_fd_ao_rms_ratio": tau_fd_ao_rms_ratio,
+        "tau_pred_fd_raw_mse": tau_pred_fd_raw_mse,
+        "tau_pred_fd_mae": tau_pred_fd_mae,
         "kinetic_loss": kinetic_loss,
         "kinetic_pred": kinetic_pred,
         "kinetic_training_ref": kinetic_ref,
@@ -1055,14 +1121,18 @@ def evaluate_system(
         "top_occ_pred": topk_descending(subset_eigs_pred, 6),
         "min_eig_pred": min_eig_pred,
         "tau_true_integral": tau_true_integral,
+        "tau_true_fd_integral": tau_true_fd_integral,
+        "tau_fd_ao_integral_error": tau_true_fd_integral - tau_true_integral,
         "tau_pred_integral": tau_pred_integral,
         "ked_true_integral": tau_true_integral,
+        "ked_true_fd_integral": tau_true_fd_integral,
         "ked_pred_integral": tau_pred_integral,
         "kinetic_energy_ref": kinetic_energy_ref,
         "kinetic_energy_ref_error": kinetic_energy_ref_error,
         "rho_true_diag": system.rho_diag,
         "rho_pred_diag": rho_all.numpy(),
         "tau_true": system.tau_true,
+        "tau_true_fd": tau_true_fd,
         "tau_pred": tau_pred,
         "gamma_true_sample": gamma_true_pairs,
         "gamma_pred_sample": gamma_pred_pairs,
@@ -1110,9 +1180,19 @@ def evaluate_systems(
         "deriv_loss",
         "deriv_raw_mse",
         "deriv_mae",
+        "deriv_fd_ao_raw_mse",
+        "deriv_fd_ao_mae",
+        "deriv_fd_ao_rms_ratio",
+        "deriv_pred_fd_raw_mse",
+        "deriv_pred_fd_mae",
         "tau_loss",
         "tau_raw_mse",
         "tau_mae",
+        "tau_fd_ao_raw_mse",
+        "tau_fd_ao_mae",
+        "tau_fd_ao_rms_ratio",
+        "tau_pred_fd_raw_mse",
+        "tau_pred_fd_mae",
         "kinetic_loss",
         "kinetic_pred",
         "kinetic_training_ref",
@@ -1122,8 +1202,11 @@ def evaluate_systems(
         "trace_rel_error",
         "trace_abs_rel_error",
         "tau_true_integral",
+        "tau_true_fd_integral",
+        "tau_fd_ao_integral_error",
         "tau_pred_integral",
         "ked_true_integral",
+        "ked_true_fd_integral",
         "ked_pred_integral",
         "kinetic_energy_ref",
         "kinetic_energy_ref_error",
@@ -1309,6 +1392,7 @@ def print_gradient_diagnostics(
     derivative_pred, tau_pred = stencil_predictions(
         system, models, config, rho_all=density_state.rho_neutral, density_state=density_state
     )
+    derivative_true_fd, tau_true_fd = true_gamma_stencil_targets(system)
     rows.extend(
         [
             (
@@ -1316,8 +1400,16 @@ def print_gradient_diagnostics(
                 f"{tensor_rms(to_tensor(system.derivative_true)):.6e} / {tensor_rms(derivative_pred):.6e}",
             ),
             (
+                "deriv RMS true-FD/target-AO",
+                f"{np_rms(derivative_true_fd):.6e} / {np_rms(system.derivative_true):.6e}",
+            ),
+            (
                 "tau RMS target/pred",
                 f"{tensor_rms(to_tensor(system.tau_true)):.6e} / {tensor_rms(tau_pred):.6e}",
+            ),
+            (
+                "tau RMS true-FD/target-AO",
+                f"{np_rms(tau_true_fd):.6e} / {np_rms(system.tau_true):.6e}",
             ),
         ]
     )
@@ -1503,6 +1595,12 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
                     + f"held-out raw mse deriv={val_metrics['deriv_raw_mse']:.3e} "
                     + f"tau={val_metrics['tau_raw_mse']:.3e}"
                 )
+                print(
+                    " " * 14
+                    + f"held-out FD-vs-AO tau_mae={val_metrics['tau_fd_ao_mae']:.3e} "
+                    + f"pred-vs-FD tau_mae={val_metrics['tau_pred_fd_mae']:.3e} "
+                    + f"tau_fd/ao_rms={val_metrics['tau_fd_ao_rms_ratio']:.3e}"
+                )
 
         if validation_ran and epochs_without_improvement >= config.early_stopping_patience:
             print(f"Early stopping at epoch {epoch}.")
@@ -1529,6 +1627,9 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
         ("held-out kinetic abs err", f"{final_val['kinetic_abs_error']:.6e}"),
         ("held-out trace rel err", f"{final_val['trace_abs_rel_error']:.6e}"),
         ("held-out tau MAE", f"{final_val['tau_mae']:.6e}"),
+        ("held-out tau FD-vs-AO MAE", f"{final_val['tau_fd_ao_mae']:.6e}"),
+        ("held-out tau pred-vs-FD MAE", f"{final_val['tau_pred_fd_mae']:.6e}"),
+        ("held-out tau FD/AO RMS", f"{final_val['tau_fd_ao_rms_ratio']:.6e}"),
         ("held-out symmetry MAE", f"{final_val['symmetry_mae']:.6e}"),
         ("held-out kernel diag err", f"{final_val['kernel_diag_error']:.6e}"),
     ]
@@ -1542,6 +1643,8 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
                 ("test kinetic loss", f"{final_test['kinetic_loss']:.6e}"),
                 ("test kinetic abs err", f"{final_test['kinetic_abs_error']:.6e}"),
                 ("test tau MAE", f"{final_test['tau_mae']:.6e}"),
+                ("test tau FD-vs-AO MAE", f"{final_test['tau_fd_ao_mae']:.6e}"),
+                ("test tau pred-vs-FD MAE", f"{final_test['tau_pred_fd_mae']:.6e}"),
             ]
         )
     print_block("Final transferable summary", rows)

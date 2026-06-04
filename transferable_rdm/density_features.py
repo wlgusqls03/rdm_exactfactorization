@@ -223,14 +223,32 @@ def pair_density_features(
     right_idx = tf.convert_to_tensor(right_idx, dtype=tf.int64)
     features = []
     for _, scaled_values, scaled_grad, scaled_lap in state.descriptor_fields:
+        values_left = tf.gather(scaled_values, left_idx)
+        values_right = tf.gather(scaled_values, right_idx)
+        grad_left = tf.gather(scaled_grad, left_idx)
+        grad_right = tf.gather(scaled_grad, right_idx)
+        lap_left = tf.gather(scaled_lap, left_idx)
+        lap_right = tf.gather(scaled_lap, right_idx)
+        if config.pair_density_symmetric:
+            features.extend(
+                [
+                    0.5 * (values_left + values_right),
+                    tf.abs(values_left - values_right),
+                    0.5 * (grad_left + grad_right),
+                    tf.abs(grad_left - grad_right),
+                    0.5 * (lap_left + lap_right),
+                    tf.abs(lap_left - lap_right),
+                ]
+            )
+            continue
         features.extend(
             [
-                tf.gather(scaled_values, left_idx),
-                tf.gather(scaled_values, right_idx),
-                tf.gather(scaled_grad, left_idx),
-                tf.gather(scaled_grad, right_idx),
-                tf.gather(scaled_lap, left_idx),
-                tf.gather(scaled_lap, right_idx),
+                values_left,
+                values_right,
+                grad_left,
+                grad_right,
+                lap_left,
+                lap_right,
             ]
         )
     return tf.concat(features, axis=1)
