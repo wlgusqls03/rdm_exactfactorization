@@ -653,18 +653,23 @@ def diagonal_predictions(
     config: ExperimentConfig,
     rho_all: tf.Tensor | None = None,
     density_state: DensityFeatureState | None = None,
+    diag_indices: np.ndarray | None = None,
 ) -> dict[str, tf.Tensor]:
     """r = r' diagonal prediction."""
     if density_state is None:
         _, density_state = point_output_and_state(system, models, config)
     if rho_all is None:
         rho_all = density_state.rho_neutral
-    diag_idx = np.arange(len(system.points), dtype=np.int64)
+    diag_idx = (
+        np.arange(len(system.points), dtype=np.int64)
+        if diag_indices is None
+        else np.asarray(diag_indices, dtype=np.int64)
+    )
     pair_feat = build_pair_features(system, diag_idx, diag_idx)
     rho_diag = gather_density(rho_all, diag_idx)
     outputs = predict_from_features(
-        to_tensor(system.local_features),
-        to_tensor(system.local_features),
+        to_tensor(system.local_features[diag_idx]),
+        to_tensor(system.local_features[diag_idx]),
         to_tensor(pair_feat),
         to_tensor(system.global_context),
         models,
@@ -674,6 +679,21 @@ def diagonal_predictions(
         local_curvature_basis_scale=local_curvature_basis_scale(system, config),
     )
     return outputs
+
+
+def select_diagonal_indices(
+    system: SystemRecord,
+    max_points: int | None,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray | None:
+    """Return sampled diagonal point indices, or None when using all points."""
+    n_points = int(len(system.points))
+    if max_points is None or int(max_points) <= 0 or int(max_points) >= n_points:
+        return None
+    count = int(max_points)
+    if rng is None:
+        return np.arange(count, dtype=np.int64)
+    return np.sort(rng.choice(n_points, size=count, replace=False)).astype(np.int64)
 
 
 def select_stencil_center_indices(
@@ -1431,6 +1451,7 @@ def compute_training_losses(
     weights: dict[str, float],
     stencil_center_limit: int | None = None,
     stencil_center_indices: np.ndarray | None = None,
+    diagonal_indices: np.ndarray | None = None,
 ) -> dict[str, tf.Tensor]:
     """Compute all train-step losses, skipping expensive inactive terms."""
     _, density_state = point_output_and_state(system, models, config)
@@ -1448,9 +1469,17 @@ def compute_training_losses(
     )
     pair_loss = weighted_mse(to_tensor(batch.gamma_true), pair_outputs["gamma"], to_tensor(batch.weights))
 
-    diag_outputs = diagonal_predictions(system, models, config, rho_all=rho_all, density_state=density_state)
+    diag_outputs = diagonal_predictions(
+        system,
+        models,
+        config,
+        rho_all=rho_all,
+        density_state=density_state,
+        diag_indices=diagonal_indices,
+    )
     gamma_diag = diag_outputs["gamma"]
-    rho_loss = tf.reduce_mean(tf.square(gamma_diag - to_tensor(system.rho_diag)))
+    rho_target = system.rho_diag if diagonal_indices is None else system.rho_diag[np.asarray(diagonal_indices, dtype=np.int64)]
+    rho_loss = tf.reduce_mean(tf.square(gamma_diag - to_tensor(rho_target)))
     kernel_loss = tf.reduce_mean(tf.square(diag_outputs["kernel"] - 1.0))
 
     zero = tf.constant(0.0, dtype=tf.float32)
@@ -1490,7 +1519,10 @@ def compute_training_losses(
         tau_loss = zero
         kinetic_loss = zero
 
-    trace_pred = tf.reduce_sum(gamma_diag) * system.cell_volume
+    if diagonal_indices is None:
+        trace_pred = tf.reduce_sum(gamma_diag) * system.cell_volume
+    else:
+        trace_pred = tf.reduce_mean(gamma_diag) * float(len(system.points)) * system.cell_volume
     trace_scale = max(system.electron_count, 1.0)
     trace_loss = tf.square((trace_pred - system.electron_count) / trace_scale)
 
@@ -1550,6 +1582,14 @@ def print_gradient_diagnostics(
         diagnostic_stencil_centers,
         rng=np.random.default_rng(config.seed + 4401),
     )
+    diagnostic_mode = str(config.gradient_diagnostic_mode).strip().lower()
+    if diagnostic_mode not in {"fast", "full"}:
+        raise ValueError("RDM_GRADIENT_DIAGNOSTIC_MODE must be 'fast' or 'full'.")
+    diagnostic_diagonal_indices = select_diagonal_indices(
+        system,
+        config.train_diagonal_points,
+        rng=np.random.default_rng(config.seed + 4402),
+    )
 
     with tf.GradientTape(persistent=True) as tape:
         losses = compute_training_losses(
@@ -1560,10 +1600,20 @@ def print_gradient_diagnostics(
             diagnostic_weights,
             stencil_center_limit=diagnostic_stencil_centers,
             stencil_center_indices=diagnostic_center_indices,
+            diagonal_indices=diagnostic_diagonal_indices,
         )
 
     rows: list[tuple[str, str]] = [
         ("system", system.system_id),
+        ("mode", diagnostic_mode),
+        (
+            "diagnostic diagonal points",
+            (
+                "full"
+                if diagnostic_diagonal_indices is None
+                else f"{len(diagnostic_diagonal_indices)}/{len(system.points)}"
+            ),
+        ),
         (
             "diagnostic stencil centers",
             f"{min(diagnostic_stencil_centers, int(system.stencil_left.shape[0]))}/{int(system.stencil_left.shape[0])}",
@@ -1583,20 +1633,23 @@ def print_gradient_diagnostics(
         raw_total = gradient_global_norm(tape.gradient(losses[loss_name], all_vars))
         effective_total = raw_total * weights[weight_name]
         effective_norms[label] = effective_total
-        group_norms = {
-            group_name: gradient_global_norm(tape.gradient(losses[loss_name], variables)) if variables else 0.0
-            for group_name, variables in variable_groups.items()
-        }
         rows.extend(
             [
                 (f"{label} loss", f"{float(losses[loss_name].numpy()):.6e}"),
                 (f"{label} grad raw/effective", f"{raw_total:.6e} / {effective_total:.6e}"),
+            ]
+        )
+        if diagnostic_mode == "full":
+            group_norms = {
+                group_name: gradient_global_norm(tape.gradient(losses[loss_name], variables)) if variables else 0.0
+                for group_name, variables in variable_groups.items()
+            }
+            rows.append(
                 (
                     f"{label} grad point/mode/pair/context",
                     " / ".join(f"{group_norms[name]:.3e}" for name in ("point", "mode", "pair", "context")),
-                ),
-            ]
-        )
+                )
+            )
     gamma_effective = max(effective_norms["gamma"], 1e-30)
     rows.append(
         (
@@ -1605,6 +1658,16 @@ def print_gradient_diagnostics(
         )
     )
     del tape
+
+    if diagnostic_mode == "fast":
+        rows.extend(
+            [
+                ("physics target", physics_target_mode(config)),
+                ("RMS diagnostics", "skipped in fast mode"),
+            ]
+        )
+        print_block("Gradient diagnostics", rows)
+        return
 
     _, density_state = point_output_and_state(system, models, config)
     derivative_pred, tau_pred = stencil_predictions(
@@ -1687,6 +1750,7 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
             ("deriv/tau loss", "target-RMS normalized Huber"),
             ("Huber delta", f"{config.physics_huber_delta:.6g}"),
             ("deriv/tau scale floor", f"{config.deriv_scale_floor:.6g} / {config.tau_scale_floor:.6g}"),
+            ("train diagonal points", "full" if config.train_diagonal_points <= 0 else config.train_diagonal_points),
             ("train stencil centers", "full" if config.train_stencil_centers <= 0 else config.train_stencil_centers),
             (
                 "stencil feature cache centers",
@@ -1707,6 +1771,7 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
         [
             ("enabled", config.gradient_diagnostics),
             ("every epochs", max(config.gradient_diagnostics_every, 1)),
+            ("mode", config.gradient_diagnostic_mode),
             ("fixed train system", diagnostic_system.system_id),
             ("stencil centers", config.gradient_diagnostic_stencil_centers),
         ],
@@ -1736,6 +1801,7 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
                 if (weights["deriv"] != 0.0 or weights["tau"] != 0.0 or weights["kinetic"] != 0.0)
                 else None
             )
+            diagonal_indices = select_diagonal_indices(system, config.train_diagonal_points, rng)
 
             with tf.GradientTape() as tape:
                 losses = compute_training_losses(
@@ -1746,6 +1812,7 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
                     weights,
                     stencil_center_limit=config.train_stencil_centers,
                     stencil_center_indices=stencil_center_indices,
+                    diagonal_indices=diagonal_indices,
                 )
                 total_loss = weighted_training_objective(losses, weights)
 
