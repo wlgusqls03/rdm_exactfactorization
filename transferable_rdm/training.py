@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -99,6 +100,7 @@ EVAL_OBJECTIVE_TERMS = (
 
 PHYSICS_TARGET_MODES = ("ao", "fd")
 _TRUE_GAMMA_STENCIL_TARGET_CACHE: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+_STENCIL_PAIR_FEATURE_CACHE: OrderedDict[tuple[int, int], np.ndarray] = OrderedDict()
 
 
 @dataclass
@@ -674,6 +676,79 @@ def diagonal_predictions(
     return outputs
 
 
+def select_stencil_center_indices(
+    system: SystemRecord,
+    max_centers: int | None,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray | None:
+    """Return sampled stencil-center indices, or None when using all centers."""
+    n_centers = int(system.stencil_left.shape[0])
+    if max_centers is None or int(max_centers) <= 0 or int(max_centers) >= n_centers:
+        return None
+    count = int(max_centers)
+    if rng is None:
+        return np.arange(count, dtype=np.int64)
+    return np.sort(rng.choice(n_centers, size=count, replace=False)).astype(np.int64)
+
+
+def _stencil_cache_trim(max_centers: int) -> None:
+    if max_centers <= 0:
+        _STENCIL_PAIR_FEATURE_CACHE.clear()
+        return
+    while len(_STENCIL_PAIR_FEATURE_CACHE) > max_centers:
+        _STENCIL_PAIR_FEATURE_CACHE.popitem(last=False)
+
+
+def stencil_pair_features_for_centers(
+    system: SystemRecord,
+    center_indices: np.ndarray,
+    config: ExperimentConfig,
+) -> np.ndarray:
+    """CPU-side LRU cache for immutable base pair features on stencil centers."""
+    center_indices = np.asarray(center_indices, dtype=np.int64)
+    if center_indices.size == 0:
+        return np.zeros((0, 0), dtype=np.float32)
+    max_cache_centers = int(config.stencil_feature_cache_max_centers)
+    stencil_shape = system.stencil_left.shape
+    flat_per_center = int(np.prod(stencil_shape[1:]))
+    cache_enabled = max_cache_centers > 0
+    cache_key_prefix = id(system)
+
+    cached_by_position: dict[int, np.ndarray] = {}
+    missing_positions = []
+    missing_centers = []
+    if cache_enabled:
+        for position, center in enumerate(center_indices):
+            key = (cache_key_prefix, int(center))
+            cached = _STENCIL_PAIR_FEATURE_CACHE.get(key)
+            if cached is None:
+                missing_positions.append(position)
+                missing_centers.append(int(center))
+                continue
+            _STENCIL_PAIR_FEATURE_CACHE.move_to_end(key)
+            cached_by_position[position] = cached
+    else:
+        missing_positions = list(range(len(center_indices)))
+        missing_centers = [int(center) for center in center_indices]
+
+    if missing_centers:
+        missing_array = np.asarray(missing_centers, dtype=np.int64)
+        left_idx = system.stencil_left[missing_array].reshape(-1)
+        right_idx = system.stencil_right[missing_array].reshape(-1)
+        missing_features = build_pair_features(system, left_idx, right_idx)
+        missing_features = missing_features.reshape((len(missing_centers),) + stencil_shape[1:] + (-1,))
+        for position, center, features in zip(missing_positions, missing_centers, missing_features):
+            features = np.asarray(features, dtype=np.float32)
+            cached_by_position[position] = features
+            if cache_enabled:
+                _STENCIL_PAIR_FEATURE_CACHE[(cache_key_prefix, int(center))] = features
+        if cache_enabled:
+            _stencil_cache_trim(max_cache_centers)
+
+    ordered = [cached_by_position[position] for position in range(len(center_indices))]
+    return np.stack(ordered, axis=0).reshape((len(center_indices) * flat_per_center, -1)).astype(np.float32)
+
+
 def stencil_predictions(
     system: SystemRecord,
     models: ModelBundle,
@@ -681,6 +756,7 @@ def stencil_predictions(
     rho_all: tf.Tensor | None = None,
     density_state: DensityFeatureState | None = None,
     max_centers: int | None = None,
+    center_indices: np.ndarray | None = None,
 ) -> tuple[tf.Tensor, tf.Tensor]:
     """explicit near-diagonal mixed derivative prediction.
 
@@ -695,9 +771,11 @@ def stencil_predictions(
         rho_all = density_state.rho_neutral
     stencil_order = int(system.stencil_left.shape[2])
     stencil_shape = system.stencil_left.shape
-    n_centers = int(stencil_shape[0])
-    if max_centers is not None and int(max_centers) > 0:
-        n_centers = min(n_centers, int(max_centers))
+    if center_indices is None:
+        selected_centers = select_stencil_center_indices(system, max_centers)
+    else:
+        selected_centers = np.asarray(center_indices, dtype=np.int64)
+    n_centers = int(stencil_shape[0]) if selected_centers is None else int(len(selected_centers))
     flat_per_center = int(np.prod(stencil_shape[1:]))
     chunk_pairs = max(int(config.stencil_prediction_chunk_size), flat_per_center)
     chunk_centers = max(1, chunk_pairs // flat_per_center)
@@ -706,12 +784,18 @@ def stencil_predictions(
     for start in range(0, n_centers, chunk_centers):
         end = min(start + chunk_centers, n_centers)
         chunk_shape = (end - start,) + stencil_shape[1:]
-        left_idx = system.stencil_left[start:end].reshape(-1)
-        right_idx = system.stencil_right[start:end].reshape(-1)
+        chunk_centers_idx = (
+            np.arange(start, end, dtype=np.int64)
+            if selected_centers is None
+            else selected_centers[start:end]
+        )
+        left_idx = system.stencil_left[chunk_centers_idx].reshape(-1)
+        right_idx = system.stencil_right[chunk_centers_idx].reshape(-1)
+        pair_feat = stencil_pair_features_for_centers(system, chunk_centers_idx, config)
         outputs = predict_from_features(
             to_tensor(system.local_features[left_idx]),
             to_tensor(system.local_features[right_idx]),
-            to_tensor(build_pair_features(system, left_idx, right_idx)),
+            to_tensor(pair_feat),
             to_tensor(system.global_context),
             models,
             rho_r_override=gather_density(rho_all, left_idx),
@@ -1346,6 +1430,7 @@ def compute_training_losses(
     config: ExperimentConfig,
     weights: dict[str, float],
     stencil_center_limit: int | None = None,
+    stencil_center_indices: np.ndarray | None = None,
 ) -> dict[str, tf.Tensor]:
     """Compute all train-step losses, skipping expensive inactive terms."""
     _, density_state = point_output_and_state(system, models, config)
@@ -1377,9 +1462,14 @@ def compute_training_losses(
             rho_all=rho_all,
             density_state=density_state,
             max_centers=stencil_center_limit,
+            center_indices=stencil_center_indices,
         )
         derivative_target, tau_target = physics_stencil_targets(system, config)
-        if stencil_center_limit is not None and int(stencil_center_limit) > 0:
+        if stencil_center_indices is not None:
+            stencil_center_indices = np.asarray(stencil_center_indices, dtype=np.int64)
+            derivative_target = derivative_target[stencil_center_indices]
+            tau_target = tau_target[stencil_center_indices]
+        elif stencil_center_limit is not None and int(stencil_center_limit) > 0:
             derivative_target = derivative_target[: int(stencil_center_limit)]
             tau_target = tau_target[: int(stencil_center_limit)]
         deriv_loss = rms_normalized_huber(
@@ -1455,6 +1545,11 @@ def print_gradient_diagnostics(
     diagnostic_weights["tau"] = 1.0
     diagnostic_weights["kinetic"] = 0.0
     diagnostic_stencil_centers = int(config.gradient_diagnostic_stencil_centers)
+    diagnostic_center_indices = select_stencil_center_indices(
+        system,
+        diagnostic_stencil_centers,
+        rng=np.random.default_rng(config.seed + 4401),
+    )
 
     with tf.GradientTape(persistent=True) as tape:
         losses = compute_training_losses(
@@ -1464,6 +1559,7 @@ def print_gradient_diagnostics(
             config,
             diagnostic_weights,
             stencil_center_limit=diagnostic_stencil_centers,
+            stencil_center_indices=diagnostic_center_indices,
         )
 
     rows: list[tuple[str, str]] = [
@@ -1518,10 +1614,16 @@ def print_gradient_diagnostics(
         rho_all=density_state.rho_neutral,
         density_state=density_state,
         max_centers=diagnostic_stencil_centers,
+        center_indices=diagnostic_center_indices,
     )
     derivative_true_fd, tau_true_fd = true_gamma_stencil_targets(system)
     derivative_target, tau_target = physics_stencil_targets(system, config)
-    if diagnostic_stencil_centers > 0:
+    if diagnostic_center_indices is not None:
+        derivative_true_fd = derivative_true_fd[diagnostic_center_indices]
+        tau_true_fd = tau_true_fd[diagnostic_center_indices]
+        derivative_target = derivative_target[diagnostic_center_indices]
+        tau_target = tau_target[diagnostic_center_indices]
+    elif diagnostic_stencil_centers > 0:
         derivative_true_fd = derivative_true_fd[:diagnostic_stencil_centers]
         tau_true_fd = tau_true_fd[:diagnostic_stencil_centers]
         derivative_target = derivative_target[:diagnostic_stencil_centers]
@@ -1586,6 +1688,10 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
             ("Huber delta", f"{config.physics_huber_delta:.6g}"),
             ("deriv/tau scale floor", f"{config.deriv_scale_floor:.6g} / {config.tau_scale_floor:.6g}"),
             ("train stencil centers", "full" if config.train_stencil_centers <= 0 else config.train_stencil_centers),
+            (
+                "stencil feature cache centers",
+                "disabled" if config.stencil_feature_cache_max_centers <= 0 else config.stencil_feature_cache_max_centers,
+            ),
             ("kinetic integral active", loss_enabled(config, "kinetic")),
         ],
     )
@@ -1625,6 +1731,11 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
         for _ in range(config.steps_per_epoch):
             system = choose_system(split.train_systems, rng)
             batch = sample_pair_batch(system, config, epoch, rng)
+            stencil_center_indices = (
+                select_stencil_center_indices(system, config.train_stencil_centers, rng)
+                if (weights["deriv"] != 0.0 or weights["tau"] != 0.0 or weights["kinetic"] != 0.0)
+                else None
+            )
 
             with tf.GradientTape() as tape:
                 losses = compute_training_losses(
@@ -1634,6 +1745,7 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
                     config,
                     weights,
                     stencil_center_limit=config.train_stencil_centers,
+                    stencil_center_indices=stencil_center_indices,
                 )
                 total_loss = weighted_training_objective(losses, weights)
 
