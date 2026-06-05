@@ -483,17 +483,19 @@ def run_gpaw(record: Qm9Record, args: argparse.Namespace) -> dict[str, object]:
     nbands = max(1, electron_guess // 2 + int(args.nbands_extra))
     txt = str(args.output_dir / "gpaw_logs" / f"{record.qm9_id}.txt")
     Path(txt).parent.mkdir(parents=True, exist_ok=True)
-    calc = GPAW(
-        mode=FD(nn=args.fd_order),
-        xc=args.xc,
-        gpts=(requested_axis_points + 1, requested_axis_points + 1, requested_axis_points + 1),
-        nbands=nbands,
-        setups=(args.setups if args.setups else None),
-        convergence={"energy": args.energy_convergence_ev, "density": args.density_convergence},
-        maxiter=args.maxiter,
-        mixer=Mixer(0.05, 5, 50.0),
-        txt=txt,
-    )
+    gpaw_kwargs = {
+        "mode": FD(nn=args.fd_order),
+        "xc": args.xc,
+        "gpts": (requested_axis_points + 1, requested_axis_points + 1, requested_axis_points + 1),
+        "nbands": nbands,
+        "convergence": {"energy": args.energy_convergence_ev, "density": args.density_convergence},
+        "maxiter": args.maxiter,
+        "mixer": Mixer(0.05, 5, 50.0),
+        "txt": txt,
+    }
+    if args.setups:
+        gpaw_kwargs["setups"] = args.setups
+    calc = GPAW(**gpaw_kwargs)
     atoms.calc = calc
     energy_ev = float(atoms.get_potential_energy())
 
