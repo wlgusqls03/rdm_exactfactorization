@@ -11,12 +11,105 @@ from pyscf import dft, gto
 
 from build_qm9_pyscf_npz import (
     ANGSTROM_TO_BOHR,
+    ALLOWED_ELEMENTS,
     ELEMENT_Z,
-    build_local_features,
     normalized_density_on_grid,
 )
 
-LOCAL_FEATURE_SCHEMA = "sad_vectors_v1"
+LOCAL_FEATURE_SCHEMA = "sad_vectors_lapv_v1"
+POTENTIAL_LAPLACIAN_CLIP = 8.0
+
+
+def signed_log_scaled_np(values: np.ndarray, clip: float) -> np.ndarray:
+    clip = max(float(clip), 1.0)
+    clipped = np.clip(values, -clip, clip)
+    return np.sign(clipped) * np.log1p(np.abs(clipped)) / np.log1p(clip)
+
+
+def richardson_laplacian_np(grid_values: np.ndarray, n_axis: int, h: float) -> np.ndarray:
+    vol = np.reshape(grid_values, (n_axis, n_axis, n_axis))
+    padded = np.pad(vol, ((2, 2), (2, 2), (2, 2)), mode="symmetric")
+    center = padded[2 : n_axis + 2, 2 : n_axis + 2, 2 : n_axis + 2]
+
+    def second_derivative(axis: int) -> np.ndarray:
+        slices = [slice(2, n_axis + 2), slice(2, n_axis + 2), slice(2, n_axis + 2)]
+        values = []
+        for offset in (0, 1, 3, 4):
+            shifted = list(slices)
+            shifted[axis] = slice(offset, offset + n_axis)
+            values.append(padded[tuple(shifted)])
+        return (-values[0] + 16.0 * values[1] - 30.0 * center + 16.0 * values[2] - values[3]) / (
+            12.0 * h * h
+        )
+
+    return np.reshape(second_derivative(0) + second_derivative(1) + second_derivative(2), (-1, 1))
+
+
+def potential_laplacian_feature(potential: np.ndarray, n_axis: int, step: float, clip: float) -> np.ndarray:
+    lap = richardson_laplacian_np(potential, n_axis, step)
+    pot_scale = max(float(np.std(potential)), 1.0)
+    return signed_log_scaled_np(lap * (step**2) / pot_scale, clip).astype(np.float32)
+
+
+def build_local_features_with_lapv(
+    points_bohr: np.ndarray,
+    coords_bohr_centered: np.ndarray,
+    atomic_numbers: np.ndarray,
+    potential: np.ndarray,
+    grad: np.ndarray,
+    electron_count: int,
+    rho_sad: np.ndarray,
+    step: float,
+    laplacian_clip: float = POTENTIAL_LAPLACIAN_CLIP,
+) -> np.ndarray:
+    radius = max(float(np.max(np.abs(points_bohr))), 1e-6)
+    coords_norm = points_bohr / radius
+    pot_scale = max(float(np.std(potential)), 1.0)
+    pot_feat = potential / pot_scale
+    grad_feat = grad / pot_scale
+    n_axis = round(len(points_bohr) ** (1.0 / 3.0))
+    if n_axis**3 != len(points_bohr):
+        raise ValueError(f"Expected cubic grid, got {len(points_bohr)} points.")
+    lap_feat = potential_laplacian_feature(potential, n_axis, step, laplacian_clip)
+    radial = np.linalg.norm(points_bohr, axis=1, keepdims=True) / radius
+
+    gaussian_by_element = []
+    vector_by_element = []
+    for symbol in ALLOWED_ELEMENTS:
+        z = ELEMENT_Z[symbol]
+        centers = coords_bohr_centered[atomic_numbers == z]
+        if len(centers) == 0:
+            gaussian_by_element.append(np.zeros((len(points_bohr), 1), dtype=np.float32))
+            vector_by_element.append(np.zeros((len(points_bohr), 3), dtype=np.float32))
+            continue
+        diff = points_bohr[:, None, :] - centers[None, :, :]
+        dist2 = np.sum(diff**2, axis=2)
+        weights = np.exp(-0.45 * dist2)
+        gaussian_by_element.append(np.sum(weights, axis=1, keepdims=True).astype(np.float32))
+        vector_by_element.append((np.sum(diff * weights[:, :, None], axis=1) / radius).astype(np.float32))
+
+    nearest_z = np.zeros((len(points_bohr), 1), dtype=np.float32)
+    if len(coords_bohr_centered):
+        dist2_all = np.sum((points_bohr[:, None, :] - coords_bohr_centered[None, :, :]) ** 2, axis=2)
+        nearest_z[:, 0] = atomic_numbers[np.argmin(dist2_all, axis=1)] / 10.0
+    electron_col = np.full((len(points_bohr), 1), electron_count / 30.0, dtype=np.float32)
+    return np.concatenate(
+        [
+            coords_norm,
+            pot_feat,
+            grad_feat,
+            lap_feat,
+            radial,
+        ]
+        + gaussian_by_element
+        + [
+            nearest_z,
+            electron_col,
+            np.log1p(np.maximum(rho_sad, 0.0)).astype(np.float32),
+        ]
+        + vector_by_element,
+        axis=1,
+    ).astype(np.float32)
 
 
 def get_sad_density(symbols: list[str], coords_bohr: np.ndarray, basis: str, absolute_grid_bohr: np.ndarray, cell_volume: float) -> np.ndarray:
@@ -48,7 +141,7 @@ def is_patched_archive(path: Path) -> bool:
             local_features = payload["local_features"]
             if "local_feature_schema" in payload.files:
                 return str(payload["local_feature_schema"]) == LOCAL_FEATURE_SCHEMA
-            return local_features.shape[1] == 31
+            return local_features.shape[1] == 32
     except Exception:
         return False
 
@@ -108,7 +201,7 @@ def patch_npz_file(path_str: str) -> bool:
                 step**3
             )
             
-            new_local_features = build_local_features(
+            new_local_features = build_local_features_with_lapv(
                 points_bohr,
                 coords_bohr_centered,
                 atomic_numbers,
@@ -116,7 +209,7 @@ def patch_npz_file(path_str: str) -> bool:
                 grad,
                 electron_count=electron_count,
                 rho_sad=rho_sad,
-                include_vectors=True,
+                step=step,
             )
             
             # Copy all data to a new dictionary
@@ -124,6 +217,7 @@ def patch_npz_file(path_str: str) -> bool:
             new_data["local_features"] = new_local_features
             new_data["rho_sad"] = np.asarray(rho_sad, dtype=np.float32)
             new_data["local_feature_schema"] = np.asarray(LOCAL_FEATURE_SCHEMA)
+            new_data["potential_laplacian_clip"] = np.asarray(POTENTIAL_LAPLACIAN_CLIP, dtype=np.float32)
             
         # Save to a temporary file first, then replace to avoid corruption
         temp_path = Path(str(path) + ".tmp")

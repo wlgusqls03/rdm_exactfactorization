@@ -398,6 +398,31 @@ def nuclear_potential_and_grad(
     return potential.reshape(-1, 1).astype(np.float32), grad.astype(np.float32)
 
 
+def signed_log_scaled_np(values: np.ndarray, clip: float) -> np.ndarray:
+    clip = max(float(clip), 1.0)
+    clipped = np.clip(values, -clip, clip)
+    return np.sign(clipped) * np.log1p(np.abs(clipped)) / np.log1p(clip)
+
+
+def richardson_laplacian_np(grid_values: np.ndarray, n_axis: int, h: float) -> np.ndarray:
+    vol = np.reshape(grid_values, (n_axis, n_axis, n_axis))
+    padded = np.pad(vol, ((2, 2), (2, 2), (2, 2)), mode="symmetric")
+    center = padded[2 : n_axis + 2, 2 : n_axis + 2, 2 : n_axis + 2]
+
+    def second_derivative(axis: int) -> np.ndarray:
+        slices = [slice(2, n_axis + 2), slice(2, n_axis + 2), slice(2, n_axis + 2)]
+        values = []
+        for offset in (0, 1, 3, 4):
+            shifted = list(slices)
+            shifted[axis] = slice(offset, offset + n_axis)
+            values.append(padded[tuple(shifted)])
+        return (-values[0] + 16.0 * values[1] - 30.0 * center + 16.0 * values[2] - values[3]) / (
+            12.0 * h * h
+        )
+
+    return np.reshape(second_derivative(0) + second_derivative(1) + second_derivative(2), (-1, 1))
+
+
 def build_local_features(
     points_bohr: np.ndarray,
     coords_bohr_centered: np.ndarray,
@@ -405,12 +430,21 @@ def build_local_features(
     potential: np.ndarray,
     grad: np.ndarray,
     electron_count: float,
+    spacing_bohr: float,
+    laplacian_clip: float = 8.0,
 ) -> np.ndarray:
     radius = max(float(np.max(np.abs(points_bohr))), 1e-6)
     pot_scale = max(float(np.std(potential)), 1.0)
     coords_norm = points_bohr / radius
     pot_feat = potential / pot_scale
     grad_feat = grad / pot_scale
+    n_axis = round(len(points_bohr) ** (1.0 / 3.0))
+    if n_axis**3 != len(points_bohr):
+        raise ValueError(f"Expected cubic grid, got {len(points_bohr)} points.")
+    lap_feat = signed_log_scaled_np(
+        richardson_laplacian_np(potential, n_axis, spacing_bohr) * (spacing_bohr**2) / pot_scale,
+        laplacian_clip,
+    ).astype(np.float32)
     radial = np.linalg.norm(points_bohr, axis=1, keepdims=True) / radius
     gaussian_by_element = []
     for symbol in ALLOWED_ELEMENTS:
@@ -427,7 +461,7 @@ def build_local_features(
         nearest_z[:, 0] = atomic_numbers[np.argmin(dist2_all, axis=1)] / 10.0
     electron_col = np.full((len(points_bohr), 1), electron_count / 30.0, dtype=np.float32)
     return np.concatenate(
-        [coords_norm, pot_feat, grad_feat, radial] + gaussian_by_element + [nearest_z, electron_col],
+        [coords_norm, pot_feat, grad_feat, lap_feat, radial] + gaussian_by_element + [nearest_z, electron_col],
         axis=1,
     ).astype(np.float32)
 
@@ -585,7 +619,15 @@ def run_gpaw(record: Qm9Record, args: argparse.Namespace) -> dict[str, object]:
 
     atomic_numbers = np.asarray([ELEMENT_Z[symbol] for symbol in record.symbols], dtype=np.float64)
     potential, grad = nuclear_potential_and_grad(points_bohr, coords_bohr_centered, atomic_numbers)
-    local_features = build_local_features(points_bohr, coords_bohr_centered, atomic_numbers, potential, grad, electron_count)
+    local_features = build_local_features(
+        points_bohr,
+        coords_bohr_centered,
+        atomic_numbers,
+        potential,
+        grad,
+        electron_count,
+        args.grid_spacing_bohr,
+    )
     global_context = build_global_context(record.symbols, coords_bohr_centered, electron_count)
     gamma_matrix = np.empty((0, 0), dtype=np.float32)
     if args.store_full_gamma:
@@ -664,7 +706,7 @@ def write_npz(record: Qm9Record, args: argparse.Namespace, output_path: Path) ->
         gpaw_fd_order=np.asarray(args.fd_order, dtype=np.int32),
         tau_fd_orbital_vs_gamma_mae=np.asarray(result["tau_consistency_mae"], dtype=np.float32),
         tau_fd_gamma_over_orbital_rms=np.asarray(result["tau_consistency_rms_ratio"], dtype=np.float32),
-        local_feature_schema=np.asarray("gpaw_fd_legacy_v1"),
+        local_feature_schema=np.asarray("gpaw_fd_legacy_lapv_v1"),
     )
     return {
         "system_id": output_path.stem,
