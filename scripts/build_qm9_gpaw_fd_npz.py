@@ -4,6 +4,7 @@ import argparse
 import csv
 import glob
 import json
+import os
 import sys
 import tarfile
 from dataclasses import dataclass
@@ -72,6 +73,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--maxiter", type=int, default=180)
     parser.add_argument("--energy-convergence-ev", type=float, default=5e-4)
     parser.add_argument("--density-convergence", type=float, default=1e-4)
+    parser.add_argument(
+        "--cpu-threads",
+        type=int,
+        default=0,
+        help=(
+            "Limit CPU threads used by BLAS/OpenMP-style libraries in this process. "
+            "Use 0 to leave the environment unchanged."
+        ),
+    )
     parser.add_argument("--tau-stencil", choices=["central2", "richardson"], default="richardson")
     parser.add_argument(
         "--store-full-gamma",
@@ -81,8 +91,24 @@ def parse_args() -> argparse.Namespace:
             "lazy psi_occ format is required for fine grids."
         ),
     )
+    parser.add_argument("--debug-tracebacks", action="store_true", help="Print full tracebacks for skipped GPAW records.")
     parser.add_argument("--dry-run", action="store_true", help="Select molecules and print grid sizes without running GPAW.")
     return parser.parse_args()
+
+
+def configure_cpu_threads(num_threads: int) -> None:
+    if num_threads <= 0:
+        return
+    value = str(int(num_threads))
+    for name in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "BLIS_NUM_THREADS",
+    ):
+        os.environ[name] = value
 
 
 def require_gpaw() -> tuple[object, object, object]:
@@ -491,6 +517,7 @@ def run_gpaw(record: Qm9Record, args: argparse.Namespace) -> dict[str, object]:
         "convergence": {"energy": args.energy_convergence_ev, "density": args.density_convergence},
         "maxiter": args.maxiter,
         "mixer": Mixer(0.05, 5, 50.0),
+        "parallel": {},
         "txt": txt,
     }
     if args.setups:
@@ -711,6 +738,7 @@ def select_records(args: argparse.Namespace) -> list[Qm9Record]:
 
 def main() -> None:
     args = parse_args()
+    configure_cpu_threads(args.cpu_threads)
     records = select_records(args)
     if len(records) < args.num_systems:
         raise RuntimeError(f"Only found {len(records)} suitable records.")
@@ -771,6 +799,10 @@ def main() -> None:
                 row = write_npz(record, args, output_path)
             except Exception as exc:
                 print(f"[skip] {record.qm9_id}: {exc}")
+                if args.debug_tracebacks:
+                    import traceback
+
+                    traceback.print_exc()
                 skipped.append({"qm9_id": record.qm9_id, "reason": str(exc)})
                 continue
         row.update({"index": idx, "npz_file": output_path.name, "xyz_file": f"xyz/{output_path.stem}.xyz"})
