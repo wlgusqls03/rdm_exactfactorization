@@ -963,7 +963,13 @@ def load_npz_system(path: str | Path, config: ExperimentConfig) -> SystemRecord:
             "chemical_potential_hartree": float(scalar_payload(payload, "chemical_potential_hartree", np.nan)),
             "kinetic_potential_center": float(scalar_payload(payload, "kinetic_potential_center", np.nan)),
             "kinetic_potential_reference": scalar_payload(payload, "kinetic_potential_reference", "not_computed"),
-            "tau_reference": "ao_gradient" if tau_true_grid is not None else f"finite_difference_{config.tau_stencil}",
+            "tau_reference": scalar_payload(
+                payload,
+                "tau_reference",
+                "ao_gradient" if tau_true_grid is not None else f"finite_difference_{config.tau_stencil}",
+            ),
+            "gamma_reference": scalar_payload(payload, "gamma_reference", ""),
+            "reference_backend": scalar_payload(payload, "reference_backend", ""),
             "charged_density_oracles": rho_cation is not None and rho_anion is not None,
             "local_feature_schema": local_feature_schema,
         }

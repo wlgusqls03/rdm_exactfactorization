@@ -668,8 +668,13 @@ def local_curvature_basis_scale(system: SystemRecord, config: ExperimentConfig) 
     return (domain_scale / step) ** 2
 
 
-def kinetic_energy_loss_from_tau(system: SystemRecord, tau_pred: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor, float]:
-    kinetic_pred = tf.reduce_sum(tau_pred) * system.cell_volume
+def kinetic_energy_loss_from_tau(
+    system: SystemRecord,
+    tau_pred: tf.Tensor,
+    *,
+    integration_multiplier: float = 1.0,
+) -> tuple[tf.Tensor, tf.Tensor, float]:
+    kinetic_pred = tf.reduce_sum(tau_pred) * float(integration_multiplier) * system.cell_volume
     kinetic_ref = kinetic_energy_reference(system)
     scale = max(abs(kinetic_ref), 1.0)
     loss = tf.square((kinetic_pred - kinetic_ref) / scale)
@@ -1517,6 +1522,9 @@ def make_compiled_train_step(
         step_size: tf.Tensor,
         cell_volume: tf.Tensor,
         electron_count: tf.Tensor,
+        kinetic_ref: tf.Tensor,
+        kinetic_scale: tf.Tensor,
+        kinetic_multiplier: tf.Tensor,
         stencil_order: int,
         gamma_weight: tf.Tensor,
         rho_weight: tf.Tensor,
@@ -1606,8 +1614,8 @@ def make_compiled_train_step(
                     scale_floor=config.tau_scale_floor,
                     delta=config.physics_huber_delta,
                 )
-                kinetic_pred = tf.reduce_sum(tau_pred) * cell_volume
-                kinetic_loss_t = tf.square(kinetic_pred / tf.maximum(electron_count, 1.0))
+                kinetic_pred = tf.reduce_sum(tau_pred) * kinetic_multiplier * cell_volume
+                kinetic_loss_t = tf.square((kinetic_pred - kinetic_ref) / kinetic_scale)
                 return deriv_loss_t, tau_loss_t, kinetic_loss_t
 
             deriv_loss, tau_loss, kinetic_loss = tf.cond(
@@ -1720,7 +1728,19 @@ def compute_training_losses(
             scale_floor=config.tau_scale_floor,
             delta=config.physics_huber_delta,
         )
-        kinetic_loss, _, _ = kinetic_energy_loss_from_tau(system, tau_pred)
+        if stencil_center_indices is not None:
+            n_sampled_centers = max(int(len(stencil_center_indices)), 1)
+            kinetic_multiplier = float(system.stencil_left.shape[0]) / float(n_sampled_centers)
+        elif stencil_center_limit is not None and int(stencil_center_limit) > 0:
+            n_sampled_centers = max(min(int(stencil_center_limit), int(system.stencil_left.shape[0])), 1)
+            kinetic_multiplier = float(system.stencil_left.shape[0]) / float(n_sampled_centers)
+        else:
+            kinetic_multiplier = 1.0
+        kinetic_loss, _, _ = kinetic_energy_loss_from_tau(
+            system,
+            tau_pred,
+            integration_multiplier=kinetic_multiplier,
+        )
     else:
         deriv_loss = zero
         tau_loss = zero
@@ -2044,14 +2064,17 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
                     derivative_target, tau_target = physics_stencil_targets(system, config)
                     derivative_target = derivative_target[stencil_idx]
                     tau_target = tau_target[stencil_idx]
+                    kinetic_multiplier = float(system.stencil_left.shape[0]) / max(float(len(stencil_idx)), 1.0)
                 else:
                     stencil_left = np.zeros((0,), dtype=np.int64)
                     stencil_right = np.zeros((0,), dtype=np.int64)
                     stencil_pair_feat = np.zeros((0, batch.pair_feat.shape[1]), dtype=np.float32)
                     derivative_target = np.zeros((0, 3), dtype=np.float32)
                     tau_target = np.zeros((0, 1), dtype=np.float32)
+                    kinetic_multiplier = 1.0
                 stencil_left_t = tf.convert_to_tensor(stencil_left, dtype=tf.int64)
                 stencil_right_t = tf.convert_to_tensor(stencil_right, dtype=tf.int64)
+                kinetic_ref = kinetic_energy_reference(system)
 
                 loss_values = compiled_train_step(
                     tf.gather(system_t.local_features, left_idx_t),
@@ -2081,6 +2104,9 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
                     tf.constant(float(system.step), dtype=tf.float32),
                     tf.constant(float(system.cell_volume), dtype=tf.float32),
                     tf.constant(float(system.electron_count), dtype=tf.float32),
+                    tf.constant(float(kinetic_ref), dtype=tf.float32),
+                    tf.constant(float(max(abs(kinetic_ref), 1.0)), dtype=tf.float32),
+                    tf.constant(float(kinetic_multiplier), dtype=tf.float32),
                     int(system.stencil_left.shape[2]),
                     tf.constant(float(weights["gamma"]), dtype=tf.float32),
                     tf.constant(float(weights["rho"]), dtype=tf.float32),
