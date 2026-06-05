@@ -383,9 +383,9 @@ def predict_from_features(
     residual_kernel = tf.reduce_sum(unit_r * unit_rp, axis=1, keepdims=True)      # (batch, 1)
 
     basis_scale = (
-        float(getattr(models, "_local_curvature_basis_scale", 1.0))
+        tf.constant(float(getattr(models, "_local_curvature_basis_scale", 1.0)), dtype=tf.float32)
         if local_curvature_basis_scale is None
-        else float(local_curvature_basis_scale)
+        else tf.cast(local_curvature_basis_scale, tf.float32)
     )
     sep_sq_components = pair_feat_t[:, 6:9] * basis_scale                         # (batch, 3)
     sep_sq = pair_feat_t[:, 10:11]                                                # (batch, 1)

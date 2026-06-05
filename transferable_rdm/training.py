@@ -101,6 +101,7 @@ EVAL_OBJECTIVE_TERMS = (
 PHYSICS_TARGET_MODES = ("ao", "fd")
 _TRUE_GAMMA_STENCIL_TARGET_CACHE: dict[int, tuple[np.ndarray, np.ndarray]] = {}
 _STENCIL_PAIR_FEATURE_CACHE: OrderedDict[tuple[int, int], np.ndarray] = OrderedDict()
+_SYSTEM_TENSOR_CACHE: OrderedDict[int, "SystemTensorState"] = OrderedDict()
 
 
 @dataclass
@@ -124,6 +125,38 @@ class PointPretrainHistory:
     train_loss: list[float] = field(default_factory=list)
     val_loss: list[float] = field(default_factory=list)
     learning_rate: list[float] = field(default_factory=list)
+
+
+@dataclass
+class SystemTensorState:
+    local_features: tf.Tensor
+    global_context: tf.Tensor
+    rho_diag: tf.Tensor
+
+
+def active_system_tensors(system: SystemRecord, config: ExperimentConfig) -> SystemTensorState:
+    """Small active-system tensor cache; never scales with full dataset size."""
+    max_entries = int(config.active_system_tensor_cache_size)
+    if max_entries <= 0:
+        return SystemTensorState(
+            to_tensor(system.local_features),
+            to_tensor(system.global_context),
+            to_tensor(system.rho_diag),
+        )
+    key = id(system)
+    cached = _SYSTEM_TENSOR_CACHE.get(key)
+    if cached is not None:
+        _SYSTEM_TENSOR_CACHE.move_to_end(key)
+        return cached
+    state = SystemTensorState(
+        to_tensor(system.local_features),
+        to_tensor(system.global_context),
+        to_tensor(system.rho_diag),
+    )
+    _SYSTEM_TENSOR_CACHE[key] = state
+    while len(_SYSTEM_TENSOR_CACHE) > max_entries:
+        _SYSTEM_TENSOR_CACHE.popitem(last=False)
+    return state
 
 
 def weighted_mse(y_true: tf.Tensor, y_pred: tf.Tensor, weights: tf.Tensor) -> tf.Tensor:
@@ -1443,6 +1476,180 @@ def weighted_training_objective(losses: dict[str, tf.Tensor], weights: dict[str,
     return total
 
 
+def make_compiled_train_step(
+    models: ModelBundle,
+    optimizer: tf.keras.optimizers.Optimizer,
+    vars_all: list[tf.Variable],
+    config: ExperimentConfig,
+):
+    """Compile the dense TF part of one training step.
+
+    Python still samples indices and prepares immutable features, but the model
+    forward/loss/backward/update path runs as one graph call.
+    """
+
+    @tf.function(reduce_retracing=True)
+    def train_step(
+        pair_point_r: tf.Tensor,
+        pair_point_rp: tf.Tensor,
+        pair_feat: tf.Tensor,
+        pair_density_feat: tf.Tensor,
+        pair_rho_r: tf.Tensor,
+        pair_rho_rp: tf.Tensor,
+        gamma_true: tf.Tensor,
+        pair_weights: tf.Tensor,
+        diag_point_feat: tf.Tensor,
+        diag_pair_feat: tf.Tensor,
+        diag_density_feat: tf.Tensor,
+        diag_rho: tf.Tensor,
+        rho_target: tf.Tensor,
+        trace_multiplier: tf.Tensor,
+        stencil_point_l: tf.Tensor,
+        stencil_point_r: tf.Tensor,
+        stencil_pair_feat: tf.Tensor,
+        stencil_density_feat: tf.Tensor,
+        stencil_rho_l: tf.Tensor,
+        stencil_rho_r: tf.Tensor,
+        derivative_target: tf.Tensor,
+        tau_target: tf.Tensor,
+        global_context: tf.Tensor,
+        basis_scale: tf.Tensor,
+        step_size: tf.Tensor,
+        cell_volume: tf.Tensor,
+        electron_count: tf.Tensor,
+        stencil_order: int,
+        gamma_weight: tf.Tensor,
+        rho_weight: tf.Tensor,
+        kernel_weight: tf.Tensor,
+        deriv_weight: tf.Tensor,
+        tau_weight: tf.Tensor,
+        trace_weight: tf.Tensor,
+        occ_weight: tf.Tensor,
+        mode_weight: tf.Tensor,
+        kinetic_weight: tf.Tensor,
+    ) -> tuple[tf.Tensor, ...]:
+        del occ_weight
+        with tf.GradientTape() as tape:
+            pair_outputs = predict_from_features(
+                pair_point_r,
+                pair_point_rp,
+                pair_feat,
+                global_context,
+                models,
+                rho_r_override=pair_rho_r,
+                rho_rp_override=pair_rho_rp,
+                pair_density_feat_t=pair_density_feat,
+                local_curvature_basis_scale=basis_scale,
+            )
+            pair_loss = weighted_mse(gamma_true, pair_outputs["gamma"], pair_weights)
+
+            diag_outputs = predict_from_features(
+                diag_point_feat,
+                diag_point_feat,
+                diag_pair_feat,
+                global_context,
+                models,
+                rho_r_override=diag_rho,
+                rho_rp_override=diag_rho,
+                pair_density_feat_t=diag_density_feat,
+                local_curvature_basis_scale=basis_scale,
+            )
+            gamma_diag = diag_outputs["gamma"]
+            rho_loss = tf.reduce_mean(tf.square(gamma_diag - rho_target))
+            kernel_loss = tf.reduce_mean(tf.square(diag_outputs["kernel"] - 1.0))
+            trace_pred = tf.reduce_sum(gamma_diag) * trace_multiplier * cell_volume
+            trace_scale = tf.maximum(electron_count, 1.0)
+            trace_loss = tf.square((trace_pred - electron_count) / trace_scale)
+
+            zero = tf.constant(0.0, dtype=tf.float32)
+
+            def physics_losses() -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+                stencil_outputs = predict_from_features(
+                    stencil_point_l,
+                    stencil_point_r,
+                    stencil_pair_feat,
+                    global_context,
+                    models,
+                    rho_r_override=stencil_rho_l,
+                    rho_rp_override=stencil_rho_r,
+                    pair_density_feat_t=stencil_density_feat,
+                    local_curvature_basis_scale=basis_scale,
+                )
+                n_centers = tf.shape(derivative_target)[0]
+                gamma_stencil = tf.reshape(stencil_outputs["gamma"], (n_centers, 3, stencil_order))
+                d_h = (
+                    gamma_stencil[:, :, 0]
+                    - gamma_stencil[:, :, 1]
+                    - gamma_stencil[:, :, 2]
+                    + gamma_stencil[:, :, 3]
+                ) / (4.0 * step_size * step_size)
+                if stencil_order >= 8:
+                    d_2h = (
+                        gamma_stencil[:, :, 4]
+                        - gamma_stencil[:, :, 5]
+                        - gamma_stencil[:, :, 6]
+                        + gamma_stencil[:, :, 7]
+                    ) / (16.0 * step_size * step_size)
+                    derivative_pred = (4.0 * d_h - d_2h) / 3.0
+                else:
+                    derivative_pred = d_h
+                tau_pred = 0.5 * tf.reduce_sum(derivative_pred, axis=1, keepdims=True)
+                deriv_loss_t = rms_normalized_huber(
+                    derivative_target,
+                    derivative_pred,
+                    scale_floor=config.deriv_scale_floor,
+                    delta=config.physics_huber_delta,
+                )
+                tau_loss_t = rms_normalized_huber(
+                    tau_target,
+                    tau_pred,
+                    scale_floor=config.tau_scale_floor,
+                    delta=config.physics_huber_delta,
+                )
+                kinetic_pred = tf.reduce_sum(tau_pred) * cell_volume
+                kinetic_loss_t = tf.square(kinetic_pred / tf.maximum(electron_count, 1.0))
+                return deriv_loss_t, tau_loss_t, kinetic_loss_t
+
+            deriv_loss, tau_loss, kinetic_loss = tf.cond(
+                tf.shape(derivative_target)[0] > 0,
+                physics_losses,
+                lambda: (zero, zero, zero),
+            )
+            mode_reg = tf.reduce_mean(pair_outputs["mode_weights"])
+
+            total_loss = (
+                gamma_weight * pair_loss
+                + rho_weight * rho_loss
+                + kernel_weight * kernel_loss
+                + deriv_weight * deriv_loss
+                + tau_weight * tau_loss
+                + trace_weight * trace_loss
+                + mode_weight * mode_reg
+                + kinetic_weight * kinetic_loss
+            )
+
+        grads = tape.gradient(total_loss, vars_all)
+        grads_and_vars = [(grad, var) for grad, var in zip(grads, vars_all) if grad is not None]
+        grads_filtered = [grad for grad, _ in grads_and_vars]
+        vars_filtered = [var for _, var in grads_and_vars]
+        grads_filtered, _ = tf.clip_by_global_norm(grads_filtered, 5.0)
+        optimizer.apply_gradients(zip(grads_filtered, vars_filtered))
+        return (
+            total_loss,
+            pair_loss,
+            rho_loss,
+            kernel_loss,
+            deriv_loss,
+            tau_loss,
+            trace_loss,
+            tf.constant(0.0, dtype=tf.float32),
+            mode_reg,
+            kinetic_loss,
+        )
+
+    return train_step
+
+
 def compute_training_losses(
     system: SystemRecord,
     batch: PairBatch,
@@ -1728,6 +1935,11 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
     best_val_for_lr = np.inf
 
     vars_all = trainable_variables(models)
+    compiled_train_step = (
+        make_compiled_train_step(models, optimizer, vars_all, config)
+        if config.compile_train_step
+        else None
+    )
     diagnostic_system = split.train_systems[0]
     diagnostic_batch = (
         sample_pair_batch(
@@ -1750,6 +1962,8 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
             ("deriv/tau loss", "target-RMS normalized Huber"),
             ("Huber delta", f"{config.physics_huber_delta:.6g}"),
             ("deriv/tau scale floor", f"{config.deriv_scale_floor:.6g} / {config.tau_scale_floor:.6g}"),
+            ("compiled train step", config.compile_train_step),
+            ("active system tensor cache", config.active_system_tensor_cache_size),
             ("train diagonal points", "full" if config.train_diagonal_points <= 0 else config.train_diagonal_points),
             ("train stencil centers", "full" if config.train_stencil_centers <= 0 else config.train_stencil_centers),
             (
@@ -1803,28 +2017,107 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
             )
             diagonal_indices = select_diagonal_indices(system, config.train_diagonal_points, rng)
 
-            with tf.GradientTape() as tape:
-                losses = compute_training_losses(
-                    system,
-                    batch,
-                    models,
-                    config,
-                    weights,
-                    stencil_center_limit=config.train_stencil_centers,
-                    stencil_center_indices=stencil_center_indices,
-                    diagonal_indices=diagonal_indices,
-                )
-                total_loss = weighted_training_objective(losses, weights)
+            if compiled_train_step is not None:
+                _, density_state = point_output_and_state(system, models, config)
+                system_t = active_system_tensors(system, config)
+                left_idx_t = tf.convert_to_tensor(batch.left_idx, dtype=tf.int64)
+                right_idx_t = tf.convert_to_tensor(batch.right_idx, dtype=tf.int64)
 
-            grads = tape.gradient(total_loss, vars_all)
-            grads_and_vars = [(g, v) for g, v in zip(grads, vars_all) if g is not None]
-            grads_filtered = [g for g, _ in grads_and_vars]
-            vars_filtered = [v for _, v in grads_and_vars]
-            grads_filtered, _ = tf.clip_by_global_norm(grads_filtered, 5.0)
-            optimizer.apply_gradients(zip(grads_filtered, vars_filtered))
-            running_total += float(total_loss.numpy())
-            for key in TRAIN_HISTORY_KEYS:
-                running_components[key] += float(losses[key].numpy())
+                diag_idx = (
+                    np.arange(len(system.points), dtype=np.int64)
+                    if diagonal_indices is None
+                    else np.asarray(diagonal_indices, dtype=np.int64)
+                )
+                diag_idx_t = tf.convert_to_tensor(diag_idx, dtype=tf.int64)
+                trace_multiplier = float(len(system.points)) / max(float(len(diag_idx)), 1.0)
+
+                physics_active = weights["deriv"] != 0.0 or weights["tau"] != 0.0 or weights["kinetic"] != 0.0
+                if physics_active:
+                    stencil_idx = (
+                        np.arange(int(system.stencil_left.shape[0]), dtype=np.int64)
+                        if stencil_center_indices is None
+                        else np.asarray(stencil_center_indices, dtype=np.int64)
+                    )
+                    stencil_left = system.stencil_left[stencil_idx].reshape(-1)
+                    stencil_right = system.stencil_right[stencil_idx].reshape(-1)
+                    stencil_pair_feat = stencil_pair_features_for_centers(system, stencil_idx, config)
+                    derivative_target, tau_target = physics_stencil_targets(system, config)
+                    derivative_target = derivative_target[stencil_idx]
+                    tau_target = tau_target[stencil_idx]
+                else:
+                    stencil_left = np.zeros((0,), dtype=np.int64)
+                    stencil_right = np.zeros((0,), dtype=np.int64)
+                    stencil_pair_feat = np.zeros((0, batch.pair_feat.shape[1]), dtype=np.float32)
+                    derivative_target = np.zeros((0, 3), dtype=np.float32)
+                    tau_target = np.zeros((0, 1), dtype=np.float32)
+                stencil_left_t = tf.convert_to_tensor(stencil_left, dtype=tf.int64)
+                stencil_right_t = tf.convert_to_tensor(stencil_right, dtype=tf.int64)
+
+                loss_values = compiled_train_step(
+                    tf.gather(system_t.local_features, left_idx_t),
+                    tf.gather(system_t.local_features, right_idx_t),
+                    to_tensor(batch.pair_feat),
+                    pair_density_features(system, density_state, batch.left_idx, batch.right_idx, config),
+                    tf.gather(density_state.rho_neutral, left_idx_t),
+                    tf.gather(density_state.rho_neutral, right_idx_t),
+                    to_tensor(batch.gamma_true),
+                    to_tensor(batch.weights),
+                    tf.gather(system_t.local_features, diag_idx_t),
+                    to_tensor(build_pair_features(system, diag_idx, diag_idx)),
+                    pair_density_features(system, density_state, diag_idx, diag_idx, config),
+                    tf.gather(density_state.rho_neutral, diag_idx_t),
+                    tf.gather(system_t.rho_diag, diag_idx_t),
+                    tf.constant(trace_multiplier, dtype=tf.float32),
+                    tf.gather(system_t.local_features, stencil_left_t),
+                    tf.gather(system_t.local_features, stencil_right_t),
+                    to_tensor(stencil_pair_feat),
+                    pair_density_features(system, density_state, stencil_left, stencil_right, config),
+                    tf.gather(density_state.rho_neutral, stencil_left_t),
+                    tf.gather(density_state.rho_neutral, stencil_right_t),
+                    to_tensor(derivative_target),
+                    to_tensor(tau_target),
+                    system_t.global_context,
+                    tf.constant(local_curvature_basis_scale(system, config), dtype=tf.float32),
+                    tf.constant(float(system.step), dtype=tf.float32),
+                    tf.constant(float(system.cell_volume), dtype=tf.float32),
+                    tf.constant(float(system.electron_count), dtype=tf.float32),
+                    int(system.stencil_left.shape[2]),
+                    tf.constant(float(weights["gamma"]), dtype=tf.float32),
+                    tf.constant(float(weights["rho"]), dtype=tf.float32),
+                    tf.constant(float(weights["kernel"]), dtype=tf.float32),
+                    tf.constant(float(weights["deriv"]), dtype=tf.float32),
+                    tf.constant(float(weights["tau"]), dtype=tf.float32),
+                    tf.constant(float(weights["trace"]), dtype=tf.float32),
+                    tf.constant(float(weights["occ"]), dtype=tf.float32),
+                    tf.constant(float(weights["mode"]), dtype=tf.float32),
+                    tf.constant(float(weights["kinetic"]), dtype=tf.float32),
+                )
+                running_total += float(loss_values[0].numpy())
+                for key, value in zip(TRAIN_HISTORY_KEYS, loss_values[1:]):
+                    running_components[key] += float(value.numpy())
+            else:
+                with tf.GradientTape() as tape:
+                    losses = compute_training_losses(
+                        system,
+                        batch,
+                        models,
+                        config,
+                        weights,
+                        stencil_center_limit=config.train_stencil_centers,
+                        stencil_center_indices=stencil_center_indices,
+                        diagonal_indices=diagonal_indices,
+                    )
+                    total_loss = weighted_training_objective(losses, weights)
+
+                grads = tape.gradient(total_loss, vars_all)
+                grads_and_vars = [(g, v) for g, v in zip(grads, vars_all) if g is not None]
+                grads_filtered = [g for g, _ in grads_and_vars]
+                vars_filtered = [v for _, v in grads_and_vars]
+                grads_filtered, _ = tf.clip_by_global_norm(grads_filtered, 5.0)
+                optimizer.apply_gradients(zip(grads_filtered, vars_filtered))
+                running_total += float(total_loss.numpy())
+                for key in TRAIN_HISTORY_KEYS:
+                    running_components[key] += float(losses[key].numpy())
 
         train_objective = running_total / max(config.steps_per_epoch, 1)
         history.train_objective.append(train_objective)

@@ -100,6 +100,8 @@ class ExperimentConfig:
     val_every: int = int(os.environ.get("RDM_VAL_EVERY", 5))
     log_every: int = int(os.environ.get("RDM_LOG_EVERY", 1))
     early_stopping_patience: int = int(os.environ.get("RDM_PATIENCE", 40))
+    compile_train_step: bool = env_flag("RDM_COMPILE_TRAIN_STEP", True)
+    active_system_tensor_cache_size: int = int(os.environ.get("RDM_ACTIVE_SYSTEM_TENSOR_CACHE_SIZE", 2))
     gradient_diagnostics: bool = env_flag("RDM_GRADIENT_DIAGNOSTICS", False)
     gradient_diagnostics_every: int = int(os.environ.get("RDM_GRADIENT_DIAGNOSTICS_EVERY", 5))
     gradient_diagnostic_mode: str = os.environ.get("RDM_GRADIENT_DIAGNOSTIC_MODE", "fast")
