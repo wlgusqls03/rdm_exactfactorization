@@ -832,6 +832,16 @@ def energy_diagnostics(
     return out
 
 
+def energy_component_summary(metrics: dict[str, object], suffix: str) -> str:
+    return (
+        f"T={float(metrics[f'energy_kinetic_{suffix}']):.6e}, "
+        f"Vext={float(metrics[f'energy_external_{suffix}']):.6e}, "
+        f"J={float(metrics[f'energy_hartree_{suffix}']):.6e}, "
+        f"Exc={float(metrics[f'energy_xc_lda_{suffix}']):.6e}, "
+        f"Enn={float(metrics[f'energy_ion_ion_{suffix}']):.6e}"
+    )
+
+
 def gather_density(rho_all: tf.Tensor, indices: np.ndarray) -> tf.Tensor:
     return tf.gather(rho_all, tf.convert_to_tensor(indices, dtype=tf.int64))
 
@@ -2451,6 +2461,22 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
                     + f"J={val_metrics['energy_hartree_ref_minus_pred']:.3e} "
                     + f"Exc={val_metrics['energy_xc_lda_ref_minus_pred']:.3e}"
                 )
+                print(
+                    " " * 14
+                    + f"held-out E ref components T={val_metrics['energy_kinetic_ref']:.3e} "
+                    + f"Vext={val_metrics['energy_external_ref']:.3e} "
+                    + f"J={val_metrics['energy_hartree_ref']:.3e} "
+                    + f"Exc={val_metrics['energy_xc_lda_ref']:.3e} "
+                    + f"Enn={val_metrics['energy_ion_ion_ref']:.3e}"
+                )
+                print(
+                    " " * 14
+                    + f"held-out E pred components T={val_metrics['energy_kinetic_pred']:.3e} "
+                    + f"Vext={val_metrics['energy_external_pred']:.3e} "
+                    + f"J={val_metrics['energy_hartree_pred']:.3e} "
+                    + f"Exc={val_metrics['energy_xc_lda_pred']:.3e} "
+                    + f"Enn={val_metrics['energy_ion_ion_pred']:.3e}"
+                )
 
         if validation_ran and epochs_without_improvement >= config.early_stopping_patience:
             print(f"Early stopping at epoch {epoch}.")
@@ -2479,6 +2505,8 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
         ("held-out total E MAE", f"{final_val['energy_total_abs_error']:.6e}"),
         ("held-out total E RMSE", f"{final_val['energy_total_rmse']:.6e}"),
         ("held-out grid E ref-pred", f"{final_val['energy_total_grid_ref_minus_pred']:.6e}"),
+        ("held-out E ref T/Vext/J/Exc/Enn", energy_component_summary(final_val, "ref")),
+        ("held-out E pred T/Vext/J/Exc/Enn", energy_component_summary(final_val, "pred")),
         ("held-out trace rel err", f"{final_val['trace_abs_rel_error']:.6e}"),
         ("held-out tau MAE", f"{final_val['tau_mae']:.6e}"),
         ("held-out tau FD-vs-AO MAE", f"{final_val['tau_fd_ao_mae']:.6e}"),
@@ -2500,6 +2528,8 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
                 ("test total E MAE", f"{final_test['energy_total_abs_error']:.6e}"),
                 ("test total E RMSE", f"{final_test['energy_total_rmse']:.6e}"),
                 ("test grid E ref-pred", f"{final_test['energy_total_grid_ref_minus_pred']:.6e}"),
+                ("test E ref T/Vext/J/Exc/Enn", energy_component_summary(final_test, "ref")),
+                ("test E pred T/Vext/J/Exc/Enn", energy_component_summary(final_test, "pred")),
                 ("test tau MAE", f"{final_test['tau_mae']:.6e}"),
                 ("test tau FD-vs-AO MAE", f"{final_test['tau_fd_ao_mae']:.6e}"),
                 ("test tau pred-vs-FD MAE", f"{final_test['tau_pred_fd_mae']:.6e}"),
