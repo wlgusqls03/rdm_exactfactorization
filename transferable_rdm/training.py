@@ -1690,6 +1690,9 @@ def evaluate_systems(
 
     scalar_keys = [
         "objective",
+        "stencil_eval_centers",
+        "stencil_eval_total_centers",
+        "stencil_eval_sampled",
         "pair_loss",
         "pair_mae",
         "rho_loss",
