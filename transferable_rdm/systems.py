@@ -959,6 +959,7 @@ def load_npz_system(path: str | Path, config: ExperimentConfig) -> SystemRecord:
             "grid_spacing_bohr": float(scalar_payload(payload, "grid_spacing_bohr", axis[1] - axis[0])),
             "grid_radius_bohr": float(scalar_payload(payload, "grid_radius_bohr", np.max(np.abs(axis)))),
             "box_length_bohr": float(scalar_payload(payload, "box_length_bohr", axis[-1] - axis[0])),
+            "total_energy_hartree": float(scalar_payload(payload, "total_energy_hartree", np.nan)),
             "kinetic_energy_hartree": float(scalar_payload(payload, "kinetic_energy_hartree", np.nan)),
             "chemical_potential_hartree": float(scalar_payload(payload, "chemical_potential_hartree", np.nan)),
             "kinetic_potential_center": float(scalar_payload(payload, "kinetic_potential_center", np.nan)),

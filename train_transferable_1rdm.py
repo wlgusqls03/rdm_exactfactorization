@@ -106,6 +106,9 @@ CSV_METRIC_KEYS = [
     "ked_pred_integral",
     "kinetic_energy_ref",
     "kinetic_energy_ref_error",
+    "total_energy_ref",
+    "total_energy_pred_kinetic_corrected",
+    "total_energy_ref_minus_pred_kinetic_corrected",
     "occ_penalty",
     "symmetry_mae",
     "near_diag_mae",
@@ -452,6 +455,11 @@ def summarize_for_json(summary: dict[str, object]) -> dict[str, object]:
         "tau_pred_integral": representative["tau_pred_integral"],
         "kinetic_energy_ref": representative["kinetic_energy_ref"],
         "kinetic_energy_ref_error": representative["kinetic_energy_ref_error"],
+        "total_energy_ref": representative["total_energy_ref"],
+        "total_energy_pred_kinetic_corrected": representative["total_energy_pred_kinetic_corrected"],
+        "total_energy_ref_minus_pred_kinetic_corrected": representative[
+            "total_energy_ref_minus_pred_kinetic_corrected"
+        ],
         "top_mo_occ_true": representative.get("top_mo_occ_true", np.array([])).tolist(),
         "top_subset_eigs_true": representative.get("top_subset_eigs_true", representative["top_occ_true"]).tolist(),
         "top_subset_eigs_pred": representative.get("top_subset_eigs_pred", representative["top_occ_pred"]).tolist(),

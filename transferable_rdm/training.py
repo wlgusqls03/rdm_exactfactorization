@@ -1260,6 +1260,15 @@ def evaluate_system(
     kinetic_ref_error = float(kinetic_pred - kinetic_ref)
     kinetic_energy_ref = float(system.metadata.get("kinetic_energy_hartree", np.nan))
     kinetic_energy_ref_error = float(kinetic_pred - kinetic_energy_ref) if np.isfinite(kinetic_energy_ref) else float("nan")
+    total_energy_ref = float(system.metadata.get("total_energy_hartree", np.nan))
+    total_energy_pred_kinetic_corrected = (
+        float(total_energy_ref + kinetic_ref_error) if np.isfinite(total_energy_ref) else float("nan")
+    )
+    total_energy_ref_minus_pred_kinetic_corrected = (
+        float(total_energy_ref - total_energy_pred_kinetic_corrected)
+        if np.isfinite(total_energy_pred_kinetic_corrected)
+        else float("nan")
+    )
     trace_pred = float(np.sum(gamma_diag) * system.cell_volume)
     trace_true = float(system.electron_count)
     trace_scale = max(trace_true, 1.0)
@@ -1359,6 +1368,9 @@ def evaluate_system(
         "ked_pred_integral": tau_pred_integral,
         "kinetic_energy_ref": kinetic_energy_ref,
         "kinetic_energy_ref_error": kinetic_energy_ref_error,
+        "total_energy_ref": total_energy_ref,
+        "total_energy_pred_kinetic_corrected": total_energy_pred_kinetic_corrected,
+        "total_energy_ref_minus_pred_kinetic_corrected": total_energy_ref_minus_pred_kinetic_corrected,
         "physics_target": physics_target_mode(config),
         **curvature_stats,
         "rho_true_diag": system.rho_diag,
@@ -2267,6 +2279,10 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
         ("held-out density MAE", f"{final_val['density_mae']:.6e}"),
         ("held-out kinetic loss", f"{final_val['kinetic_loss']:.6e}"),
         ("held-out kinetic abs err", f"{final_val['kinetic_abs_error']:.6e}"),
+        (
+            "held-out total E ref-pred",
+            f"{final_val['total_energy_ref_minus_pred_kinetic_corrected']:.6e}",
+        ),
         ("held-out trace rel err", f"{final_val['trace_abs_rel_error']:.6e}"),
         ("held-out tau MAE", f"{final_val['tau_mae']:.6e}"),
         ("held-out tau FD-vs-AO MAE", f"{final_val['tau_fd_ao_mae']:.6e}"),
@@ -2284,6 +2300,10 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
                 ("test density MAE", f"{final_test['density_mae']:.6e}"),
                 ("test kinetic loss", f"{final_test['kinetic_loss']:.6e}"),
                 ("test kinetic abs err", f"{final_test['kinetic_abs_error']:.6e}"),
+                (
+                    "test total E ref-pred",
+                    f"{final_test['total_energy_ref_minus_pred_kinetic_corrected']:.6e}",
+                ),
                 ("test tau MAE", f"{final_test['tau_mae']:.6e}"),
                 ("test tau FD-vs-AO MAE", f"{final_test['tau_fd_ao_mae']:.6e}"),
                 ("test tau pred-vs-FD MAE", f"{final_test['tau_pred_fd_mae']:.6e}"),
