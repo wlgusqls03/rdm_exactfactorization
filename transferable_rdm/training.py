@@ -1100,12 +1100,18 @@ def curvature_target_diagnostics(
     system: SystemRecord,
     derivative_target: np.ndarray,
     *,
+    center_indices: np.ndarray | None = None,
     rho_cut_fraction: float = 1e-4,
 ) -> dict[str, float]:
     """Estimate axis-resolved effective kernel curvature target statistics."""
     rho = np.asarray(system.rho_diag, dtype=np.float32)
     rho_scale = max(float(np.max(rho)), 1e-30)
-    mask = rho[system.interior_point_indices, 0] > rho_cut_fraction * rho_scale
+    interior_indices = (
+        system.interior_point_indices
+        if center_indices is None
+        else system.interior_point_indices[np.asarray(center_indices, dtype=np.int64)]
+    )
+    mask = rho[interior_indices, 0] > rho_cut_fraction * rho_scale
     if not np.any(mask):
         return {
             "curvature_target_min": float("nan"),
@@ -1116,8 +1122,8 @@ def curvature_target_diagnostics(
             "curvature_target_neg_frac": float("nan"),
         }
     grad_rho = richardson_gradient_3d(to_tensor(rho), len(system.axis), system.step).numpy()
-    rho_interior = np.maximum(rho[system.interior_point_indices], 1e-30)
-    grad_term = grad_rho[system.interior_point_indices] ** 2 / (4.0 * rho_interior)
+    rho_interior = np.maximum(rho[interior_indices], 1e-30)
+    grad_term = grad_rho[interior_indices] ** 2 / (4.0 * rho_interior)
     curvature_target = (derivative_target - grad_term) / rho_interior
     values = curvature_target[mask].reshape(-1)
     return {
@@ -1451,7 +1457,11 @@ def evaluate_system(
     )
     deriv_mae = float(np.mean(np.abs(derivative_pred - derivative_target)))
     tau_mae = float(np.mean(np.abs(tau_pred - tau_target)))
-    curvature_stats = curvature_target_diagnostics(system, derivative_target)
+    curvature_stats = curvature_target_diagnostics(
+        system,
+        derivative_target,
+        center_indices=eval_center_indices,
+    )
     kinetic_loss_t, kinetic_pred_t, kinetic_ref = kinetic_energy_loss_from_tau(
         system,
         tau_pred_t,
