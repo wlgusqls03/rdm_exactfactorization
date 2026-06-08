@@ -893,6 +893,12 @@ def load_npz_system(path: str | Path, config: ExperimentConfig) -> SystemRecord:
         occupancies = np.asarray(payload["occupancies"], dtype=np.float32) if "occupancies" in payload else np.array([], dtype=np.float32)
         psi_occ = np.asarray(payload["psi_occ"], dtype=np.float32) if "psi_occ" in payload else None
         orbital_energies = np.asarray(payload["orbital_energies"], dtype=np.float32) if "orbital_energies" in payload else np.array([], dtype=np.float32)
+        atom_symbols = np.asarray(payload["atom_symbols"]).astype(str).tolist() if "atom_symbols" in payload else []
+        atom_coords_bohr = (
+            np.asarray(payload["atom_coords_bohr"], dtype=np.float32)
+            if "atom_coords_bohr" in payload
+            else np.empty((0, 3), dtype=np.float32)
+        )
         derivative_true_grid = (
             np.asarray(payload["derivative_true_ao"], dtype=np.float32)
             if "derivative_true_ao" in payload
@@ -955,6 +961,8 @@ def load_npz_system(path: str | Path, config: ExperimentConfig) -> SystemRecord:
             "smiles_relaxed": scalar_payload(payload, "smiles_relaxed", ""),
             "inchi_gdb": scalar_payload(payload, "inchi_gdb", ""),
             "inchi_relaxed": scalar_payload(payload, "inchi_relaxed", ""),
+            "atom_symbols": atom_symbols,
+            "atom_coords_bohr": atom_coords_bohr,
             "axis_points": int(scalar_payload(payload, "axis_points", len(axis))),
             "grid_spacing_bohr": float(scalar_payload(payload, "grid_spacing_bohr", axis[1] - axis[0])),
             "grid_radius_bohr": float(scalar_payload(payload, "grid_radius_bohr", np.max(np.abs(axis)))),

@@ -69,6 +69,10 @@ VAL_HISTORY_KEYS = (
     "tau_pred_fd_mae",
     "kinetic_loss",
     "kinetic_abs_error",
+    "energy_total_abs_error",
+    "energy_total_rmse",
+    "energy_grid_total_abs_error",
+    "energy_grid_total_rmse",
     "trace_loss",
     "trace_abs_rel_error",
     "occ_penalty",
@@ -102,6 +106,8 @@ PHYSICS_TARGET_MODES = ("ao", "fd")
 _TRUE_GAMMA_STENCIL_TARGET_CACHE: dict[int, tuple[np.ndarray, np.ndarray]] = {}
 _STENCIL_PAIR_FEATURE_CACHE: OrderedDict[tuple[int, int], np.ndarray] = OrderedDict()
 _SYSTEM_TENSOR_CACHE: OrderedDict[int, "SystemTensorState"] = OrderedDict()
+_COULOMB_KERNEL_FFT_CACHE: OrderedDict[tuple[int, float], np.ndarray] = OrderedDict()
+_ELEMENT_Z = {"H": 1, "C": 6, "N": 7, "O": 8, "F": 9}
 
 
 @dataclass
@@ -679,6 +685,151 @@ def kinetic_energy_loss_from_tau(
     scale = max(abs(kinetic_ref), 1.0)
     loss = tf.square((kinetic_pred - kinetic_ref) / scale)
     return loss, kinetic_pred, kinetic_ref
+
+
+def ion_ion_energy_hartree(system: SystemRecord) -> float:
+    symbols = system.metadata.get("atom_symbols", [])
+    coords = np.asarray(system.metadata.get("atom_coords_bohr", np.empty((0, 3))), dtype=np.float64)
+    if coords.ndim != 2 or coords.shape[1] != 3 or len(symbols) != len(coords):
+        return float("nan")
+    charges = np.asarray([_ELEMENT_Z.get(str(symbol), 0) for symbol in symbols], dtype=np.float64)
+    if len(charges) == 0 or np.any(charges <= 0):
+        return float("nan")
+    energy = 0.0
+    for i in range(len(charges)):
+        delta = coords[i + 1 :] - coords[i]
+        distances = np.linalg.norm(delta, axis=1)
+        valid = distances > 1e-12
+        if np.any(valid):
+            energy += float(np.sum(charges[i] * charges[i + 1 :][valid] / distances[valid]))
+    return energy
+
+
+def coulomb_kernel_fft(n_axis: int, step: float) -> np.ndarray:
+    key = (int(n_axis), float(step))
+    cached = _COULOMB_KERNEL_FFT_CACHE.get(key)
+    if cached is not None:
+        _COULOMB_KERNEL_FFT_CACHE.move_to_end(key)
+        return cached
+
+    shape = (2 * n_axis - 1, 2 * n_axis - 1, 2 * n_axis - 1)
+    axes = []
+    for size in shape:
+        idx = np.arange(size, dtype=np.float64)
+        idx[idx >= n_axis] -= size
+        axes.append(idx * float(step))
+    dx, dy, dz = np.meshgrid(axes[0], axes[1], axes[2], indexing="ij")
+    radius = np.sqrt(dx * dx + dy * dy + dz * dz)
+    kernel = np.zeros(shape, dtype=np.float64)
+    mask = radius > 1e-12
+    kernel[mask] = 1.0 / radius[mask]
+    kernel_fft = np.fft.fftn(kernel)
+
+    while len(_COULOMB_KERNEL_FFT_CACHE) >= 2:
+        _COULOMB_KERNEL_FFT_CACHE.popitem(last=False)
+    _COULOMB_KERNEL_FFT_CACHE[key] = kernel_fft
+    return kernel_fft
+
+
+def hartree_energy_from_density(system: SystemRecord, rho: np.ndarray) -> float:
+    n_axis = len(system.axis)
+    rho_grid = np.asarray(rho, dtype=np.float64).reshape(n_axis, n_axis, n_axis)
+    rho_grid = np.maximum(rho_grid, 0.0)
+    shape = (2 * n_axis - 1, 2 * n_axis - 1, 2 * n_axis - 1)
+    padded = np.zeros(shape, dtype=np.float64)
+    padded[:n_axis, :n_axis, :n_axis] = rho_grid
+    potential = np.fft.ifftn(np.fft.fftn(padded) * coulomb_kernel_fft(n_axis, system.step)).real
+    potential = potential[:n_axis, :n_axis, :n_axis] * system.cell_volume
+    return float(0.5 * np.sum(rho_grid * potential) * system.cell_volume)
+
+
+def lda_xc_energy_from_density(system: SystemRecord, rho: np.ndarray) -> float:
+    rho_clipped = np.maximum(np.asarray(rho, dtype=np.float64).reshape(-1), 0.0)
+    nonzero = rho_clipped > 1e-14
+    if not np.any(nonzero):
+        return 0.0
+
+    rho_nz = rho_clipped[nonzero]
+    exchange_eps = -0.75 * (3.0 / np.pi) ** (1.0 / 3.0) * rho_nz ** (1.0 / 3.0)
+
+    rs = (3.0 / (4.0 * np.pi * rho_nz)) ** (1.0 / 3.0)
+    corr_eps = np.empty_like(rs)
+    high_density = rs < 1.0
+    if np.any(high_density):
+        rs_h = rs[high_density]
+        corr_eps[high_density] = (
+            0.0311 * np.log(rs_h)
+            - 0.048
+            + 0.0020 * rs_h * np.log(rs_h)
+            - 0.0116 * rs_h
+        )
+    if np.any(~high_density):
+        rs_l = rs[~high_density]
+        corr_eps[~high_density] = -0.1423 / (1.0 + 1.0529 * np.sqrt(rs_l) + 0.3334 * rs_l)
+
+    return float(np.sum(rho_nz * (exchange_eps + corr_eps)) * system.cell_volume)
+
+
+def external_energy_from_density(system: SystemRecord, rho: np.ndarray) -> float:
+    rho_clipped = np.maximum(np.asarray(rho, dtype=np.float64).reshape(-1, 1), 0.0)
+    potential = np.asarray(system.potential, dtype=np.float64).reshape(-1, 1)
+    return float(np.sum(rho_clipped * potential) * system.cell_volume)
+
+
+def dft_component_energies(
+    system: SystemRecord,
+    rho: np.ndarray,
+    kinetic: float,
+    *,
+    ion_ion: float | None = None,
+) -> dict[str, float]:
+    ion = ion_ion_energy_hartree(system) if ion_ion is None else float(ion_ion)
+    external = external_energy_from_density(system, rho)
+    hartree = hartree_energy_from_density(system, rho)
+    xc = lda_xc_energy_from_density(system, rho)
+    total = float(kinetic + external + hartree + xc + ion) if np.isfinite(ion) else float("nan")
+    return {
+        "kinetic": float(kinetic),
+        "external": external,
+        "hartree": hartree,
+        "xc_lda": xc,
+        "ion_ion": ion,
+        "total": total,
+    }
+
+
+def energy_diagnostics(
+    system: SystemRecord,
+    rho_ref: np.ndarray,
+    rho_pred: np.ndarray,
+    kinetic_ref: float,
+    kinetic_pred: float,
+) -> dict[str, float]:
+    ion = ion_ion_energy_hartree(system)
+    ref = dft_component_energies(system, rho_ref, kinetic_ref, ion_ion=ion)
+    pred = dft_component_energies(system, rho_pred, kinetic_pred, ion_ion=ion)
+    stored_total_ref = float(system.metadata.get("total_energy_hartree", np.nan))
+    total_ref_for_error = stored_total_ref if np.isfinite(stored_total_ref) else ref["total"]
+    total_error = float(total_ref_for_error - pred["total"])
+    grid_total_error = float(ref["total"] - pred["total"])
+    out: dict[str, float] = {
+        "energy_total_ref": total_ref_for_error,
+        "energy_total_grid_ref": ref["total"],
+        "energy_total_pred": pred["total"],
+        "energy_total_ref_minus_pred": total_error,
+        "energy_total_grid_ref_minus_pred": grid_total_error,
+        "energy_total_abs_error": abs(total_error),
+        "energy_total_sq_error": total_error**2,
+        "energy_grid_total_abs_error": abs(grid_total_error),
+        "energy_grid_total_sq_error": grid_total_error**2,
+    }
+    for name in ("kinetic", "external", "hartree", "xc_lda", "ion_ion"):
+        component_error = float(ref[name] - pred[name])
+        out[f"energy_{name}_ref"] = ref[name]
+        out[f"energy_{name}_pred"] = pred[name]
+        out[f"energy_{name}_ref_minus_pred"] = component_error
+        out[f"energy_{name}_abs_error"] = abs(component_error)
+    return out
 
 
 def gather_density(rho_all: tf.Tensor, indices: np.ndarray) -> tf.Tensor:
@@ -1260,14 +1411,12 @@ def evaluate_system(
     kinetic_ref_error = float(kinetic_pred - kinetic_ref)
     kinetic_energy_ref = float(system.metadata.get("kinetic_energy_hartree", np.nan))
     kinetic_energy_ref_error = float(kinetic_pred - kinetic_energy_ref) if np.isfinite(kinetic_energy_ref) else float("nan")
-    total_energy_ref = float(system.metadata.get("total_energy_hartree", np.nan))
-    total_energy_pred_kinetic_corrected = (
-        float(total_energy_ref + kinetic_ref_error) if np.isfinite(total_energy_ref) else float("nan")
-    )
-    total_energy_ref_minus_pred_kinetic_corrected = (
-        float(total_energy_ref - total_energy_pred_kinetic_corrected)
-        if np.isfinite(total_energy_pred_kinetic_corrected)
-        else float("nan")
+    energy_stats = energy_diagnostics(
+        system,
+        system.rho_diag,
+        rho_all.numpy(),
+        kinetic_ref,
+        kinetic_pred,
     )
     trace_pred = float(np.sum(gamma_diag) * system.cell_volume)
     trace_true = float(system.electron_count)
@@ -1368,9 +1517,7 @@ def evaluate_system(
         "ked_pred_integral": tau_pred_integral,
         "kinetic_energy_ref": kinetic_energy_ref,
         "kinetic_energy_ref_error": kinetic_energy_ref_error,
-        "total_energy_ref": total_energy_ref,
-        "total_energy_pred_kinetic_corrected": total_energy_pred_kinetic_corrected,
-        "total_energy_ref_minus_pred_kinetic_corrected": total_energy_ref_minus_pred_kinetic_corrected,
+        **energy_stats,
         "physics_target": physics_target_mode(config),
         **curvature_stats,
         "rho_true_diag": system.rho_diag,
@@ -1458,6 +1605,35 @@ def evaluate_systems(
         "ked_pred_integral",
         "kinetic_energy_ref",
         "kinetic_energy_ref_error",
+        "energy_total_ref",
+        "energy_total_grid_ref",
+        "energy_total_pred",
+        "energy_total_ref_minus_pred",
+        "energy_total_grid_ref_minus_pred",
+        "energy_total_abs_error",
+        "energy_total_sq_error",
+        "energy_grid_total_abs_error",
+        "energy_grid_total_sq_error",
+        "energy_kinetic_ref",
+        "energy_kinetic_pred",
+        "energy_kinetic_ref_minus_pred",
+        "energy_kinetic_abs_error",
+        "energy_external_ref",
+        "energy_external_pred",
+        "energy_external_ref_minus_pred",
+        "energy_external_abs_error",
+        "energy_hartree_ref",
+        "energy_hartree_pred",
+        "energy_hartree_ref_minus_pred",
+        "energy_hartree_abs_error",
+        "energy_xc_lda_ref",
+        "energy_xc_lda_pred",
+        "energy_xc_lda_ref_minus_pred",
+        "energy_xc_lda_abs_error",
+        "energy_ion_ion_ref",
+        "energy_ion_ion_pred",
+        "energy_ion_ion_ref_minus_pred",
+        "energy_ion_ion_abs_error",
         "occ_penalty",
         "symmetry_mae",
         "near_diag_mae",
@@ -1478,6 +1654,12 @@ def evaluate_systems(
     for key in scalar_keys:
         values = np.asarray([entry[key] for entry in per_system], dtype=np.float64)
         averages[key] = float(np.nan) if np.all(np.isnan(values)) else float(np.nanmean(values))
+    for src_key, dst_key in (
+        ("energy_total_sq_error", "energy_total_rmse"),
+        ("energy_grid_total_sq_error", "energy_grid_total_rmse"),
+    ):
+        values = np.asarray([entry[src_key] for entry in per_system], dtype=np.float64)
+        averages[dst_key] = float(np.nan) if np.all(np.isnan(values)) else float(np.sqrt(np.nanmean(values)))
     averages["per_system"] = per_system
     return averages
 
@@ -2255,6 +2437,20 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
                     + f"pred-vs-FD tau_mae={val_metrics['tau_pred_fd_mae']:.3e} "
                     + f"tau_fd/ao_rms={val_metrics['tau_fd_ao_rms_ratio']:.3e}"
                 )
+                print(
+                    " " * 14
+                    + f"held-out E stored ref-pred={val_metrics['energy_total_ref_minus_pred']:.3e} "
+                    + f"MAE={val_metrics['energy_total_abs_error']:.3e} "
+                    + f"RMSE={val_metrics['energy_total_rmse']:.3e}"
+                )
+                print(
+                    " " * 14
+                    + f"held-out E grid ref-pred={val_metrics['energy_total_grid_ref_minus_pred']:.3e} "
+                    + f"T={val_metrics['energy_kinetic_ref_minus_pred']:.3e} "
+                    + f"Vext={val_metrics['energy_external_ref_minus_pred']:.3e} "
+                    + f"J={val_metrics['energy_hartree_ref_minus_pred']:.3e} "
+                    + f"Exc={val_metrics['energy_xc_lda_ref_minus_pred']:.3e}"
+                )
 
         if validation_ran and epochs_without_improvement >= config.early_stopping_patience:
             print(f"Early stopping at epoch {epoch}.")
@@ -2279,10 +2475,10 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
         ("held-out density MAE", f"{final_val['density_mae']:.6e}"),
         ("held-out kinetic loss", f"{final_val['kinetic_loss']:.6e}"),
         ("held-out kinetic abs err", f"{final_val['kinetic_abs_error']:.6e}"),
-        (
-            "held-out total E ref-pred",
-            f"{final_val['total_energy_ref_minus_pred_kinetic_corrected']:.6e}",
-        ),
+        ("held-out total E ref-pred", f"{final_val['energy_total_ref_minus_pred']:.6e}"),
+        ("held-out total E MAE", f"{final_val['energy_total_abs_error']:.6e}"),
+        ("held-out total E RMSE", f"{final_val['energy_total_rmse']:.6e}"),
+        ("held-out grid E ref-pred", f"{final_val['energy_total_grid_ref_minus_pred']:.6e}"),
         ("held-out trace rel err", f"{final_val['trace_abs_rel_error']:.6e}"),
         ("held-out tau MAE", f"{final_val['tau_mae']:.6e}"),
         ("held-out tau FD-vs-AO MAE", f"{final_val['tau_fd_ao_mae']:.6e}"),
@@ -2300,10 +2496,10 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
                 ("test density MAE", f"{final_test['density_mae']:.6e}"),
                 ("test kinetic loss", f"{final_test['kinetic_loss']:.6e}"),
                 ("test kinetic abs err", f"{final_test['kinetic_abs_error']:.6e}"),
-                (
-                    "test total E ref-pred",
-                    f"{final_test['total_energy_ref_minus_pred_kinetic_corrected']:.6e}",
-                ),
+                ("test total E ref-pred", f"{final_test['energy_total_ref_minus_pred']:.6e}"),
+                ("test total E MAE", f"{final_test['energy_total_abs_error']:.6e}"),
+                ("test total E RMSE", f"{final_test['energy_total_rmse']:.6e}"),
+                ("test grid E ref-pred", f"{final_test['energy_total_grid_ref_minus_pred']:.6e}"),
                 ("test tau MAE", f"{final_test['tau_mae']:.6e}"),
                 ("test tau FD-vs-AO MAE", f"{final_test['tau_fd_ao_mae']:.6e}"),
                 ("test tau pred-vs-FD MAE", f"{final_test['tau_pred_fd_mae']:.6e}"),
