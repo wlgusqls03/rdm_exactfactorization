@@ -364,6 +364,49 @@ def density_field_loss(
     return density_field_loss_components(y_true, y_pred, config, include_log=include_log)["total"]
 
 
+def normalized_sad_density(system: SystemRecord, config: ExperimentConfig) -> tf.Tensor:
+    if system.rho_sad is None:
+        raise ValueError(f"System {system.system_id} has no SAD density baseline.")
+    sad = tf.maximum(to_tensor(system.rho_sad), max(float(config.sad_density_floor), 1e-30))
+    normalizer = tf.reduce_sum(sad) * system.cell_volume
+    return sad * (float(system.electron_count) / tf.maximum(normalizer, 1e-12))
+
+
+def sad_density_relative_l1(system: SystemRecord, config: ExperimentConfig) -> float:
+    sad = normalized_sad_density(system, config).numpy()
+    return float(
+        np.sum(np.abs(sad - system.rho_diag))
+        * system.cell_volume
+        / max(system.electron_count, 1e-12)
+    )
+
+
+def sad_delta_residual_loss(
+    system: SystemRecord,
+    raw_delta: tf.Tensor,
+    config: ExperimentConfig,
+) -> tf.Tensor:
+    """Centered log-residual target for sad-multiplicative density heads."""
+    if density_baseline_mode(config) != "sad-multiplicative" or config.point_delta_weight <= 0.0:
+        return tf.constant(0.0, dtype=tf.float32)
+    if system.rho_sad is None:
+        raise ValueError(f"System {system.system_id} has no SAD density baseline.")
+
+    rho_true = tf.maximum(to_tensor(system.rho_diag), max(float(config.point_delta_eps), 1e-30))
+    rho_sad = tf.maximum(to_tensor(system.rho_sad), max(float(config.point_delta_eps), 1e-30))
+    delta_target = tf.math.log(rho_true / rho_sad)
+    weights = rho_true / tf.maximum(tf.reduce_sum(rho_true), 1e-12)
+
+    target_center = tf.reduce_sum(weights * delta_target)
+    pred_center = tf.reduce_sum(weights * raw_delta[:, 0:1])
+    residual = (raw_delta[:, 0:1] - pred_center) - (delta_target - target_center)
+    abs_residual = tf.abs(residual)
+    delta = max(float(config.point_delta_huber), 1e-12)
+    quadratic = tf.minimum(abs_residual, delta)
+    linear = abs_residual - quadratic
+    return tf.reduce_mean(0.5 * tf.square(quadratic) + delta * linear)
+
+
 def point_fukui_weight_at_epoch(config: ExperimentConfig, epoch: int) -> float:
     if pair_density_feature_mode(config) != "fukui" or epoch < config.point_fukui_start_epoch:
         return 0.0
@@ -394,6 +437,7 @@ def point_pretrain_losses(
     zero = tf.constant(0.0, dtype=tf.float32)
     neutral_components = density_field_loss_components(to_tensor(system.rho_diag), pred["rho_neutral"], config)
     neutral_loss = neutral_components["total"]
+    delta_loss = sad_delta_residual_loss(system, pred["delta_raw"], config)
     charged_loss = zero
     fukui_loss = zero
     if pair_density_feature_mode(config) == "fukui":
@@ -411,10 +455,16 @@ def point_pretrain_losses(
                 + density_field_loss(rho_neutral - true_cation, pred["fukui_minus"], config, include_log=False)
             )
     fukui_weight = point_fukui_weight_at_epoch(config, epoch)
-    total = neutral_loss + config.point_charged_weight * charged_loss + fukui_weight * fukui_loss
+    total = (
+        neutral_loss
+        + config.point_delta_weight * delta_loss
+        + config.point_charged_weight * charged_loss
+        + fukui_weight * fukui_loss
+    )
     return {
         "total": total,
         "neutral": neutral_loss,
+        "delta": delta_loss,
         "charged": charged_loss,
         "fukui": fukui_loss,
         "neutral_scaled_mse": neutral_components["scaled_mse"],
@@ -440,6 +490,9 @@ def evaluate_point_model(
             if delta_diagnostics is None:
                 delta_diagnostics = empty_delta_diagnostics(int(pred["delta_raw"].shape[1]))
             update_delta_diagnostics(delta_diagnostics, pred["delta_raw"], config.sad_residual_clip)
+            sad_rel_l1 = sad_density_relative_l1(system, config)
+        else:
+            sad_rel_l1 = float("nan")
         entry: dict[str, object] = {
             "system_id": system.system_id,
             "rho_neutral_mae": float(np.mean(np.abs(pred["rho_neutral"].numpy() - system.rho_diag))),
@@ -448,6 +501,7 @@ def evaluate_point_model(
                 * system.cell_volume
                 / max(system.electron_count, 1e-12)
             ),
+            "rho_sad_rel_l1": sad_rel_l1,
         }
         if pair_density_feature_mode(config) == "fukui":
             fukui_plus_true = system.rho_anion - system.rho_diag
@@ -515,6 +569,10 @@ def pretrain_point_model(
                 f"relative-L1={config.point_density_rel_l1_weight:g}, "
                 f"log-rho-MSE={config.point_density_log_weight:g}",
             ),
+            (
+                "SAD delta residual loss",
+                f"weight={config.point_delta_weight:g}, Huber={config.point_delta_huber:g}, eps={config.point_delta_eps:g}",
+            ),
             ("density log epsilon", f"{config.point_density_log_eps:g}"),
             (
                 "lr decay",
@@ -550,6 +608,7 @@ def pretrain_point_model(
         running = 0.0
         running_components = {
             "neutral": 0.0,
+            "delta": 0.0,
             "charged": 0.0,
             "fukui": 0.0,
             "neutral_scaled_mse": 0.0,
@@ -614,6 +673,7 @@ def pretrain_point_model(
             print(
                 f"Point epoch {epoch:4d} | train={train_loss:.6e} val={val_loss:.6e} "
                 f"rho_N={running_components['neutral'] / denom:.3e} "
+                f"delta={running_components['delta'] / denom:.3e} "
                 f"charged={running_components['charged'] / denom:.3e} "
                 f"fukui={running_components['fukui'] / denom:.3e} "
                 f"w(fukui)={point_fukui_weight_at_epoch(config, epoch):.3e} "
@@ -646,6 +706,11 @@ def pretrain_point_model(
         [
             ("val rho_N MAE", f"{summary['val']['rho_neutral_mae']:.6e}"),
             ("val rho_N relative L1", f"{summary['val']['rho_neutral_rel_l1']:.6e}"),
+            ("val SAD relative L1", f"{summary['val'].get('rho_sad_rel_l1', float('nan')):.6e}"),
+            (
+                "val rho_N relL1 improvement",
+                f"{summary['val'].get('rho_sad_rel_l1', float('nan')) - summary['val']['rho_neutral_rel_l1']:.6e}",
+            ),
             ("val Fukui+ MAE", f"{summary['val'].get('fukui_plus_mae', float('nan')):.6e}"),
             ("val Fukui- MAE", f"{summary['val'].get('fukui_minus_mae', float('nan')):.6e}"),
             ("point trainable in pair stage", models.point_model.trainable),
