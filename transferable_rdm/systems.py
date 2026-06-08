@@ -3,6 +3,7 @@ from __future__ import annotations
 import glob
 import hashlib
 import os
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,11 +16,24 @@ from .utils import flat_index, make_uniform_grid, print_block
 
 _GAMMA_CACHE: OrderedDict[str, np.ndarray] = OrderedDict()
 _GAMMA_CACHE_BYTES = 0
+_PSI_OCC_CACHE: OrderedDict[str, np.ndarray] = OrderedDict()
+_PSI_OCC_CACHE_BYTES = 0
 _LIGHT_NPZ_CACHE_VERSION = 1
+
+
+def env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "off", "no", "n"}
 
 
 def gamma_cache_limit_bytes() -> int:
     return int(float(os.environ.get("RDM_GAMMA_CACHE_GB", "1.0")) * (1024**3))
+
+
+def psi_occ_cache_limit_bytes() -> int:
+    return int(float(os.environ.get("RDM_PSI_OCC_CACHE_GB", "2.0")) * (1024**3))
 
 
 def load_gamma_matrix_cached(path: str | Path) -> np.ndarray:
@@ -45,6 +59,31 @@ def load_gamma_matrix_cached(path: str | Path) -> np.ndarray:
         _GAMMA_CACHE[key] = gamma
         _GAMMA_CACHE_BYTES += gamma.nbytes
     return gamma
+
+
+def load_psi_occ_cached(path: str | Path) -> np.ndarray:
+    """Load occupied pseudo-orbitals from NPZ with a process-local LRU cache."""
+    global _PSI_OCC_CACHE_BYTES
+    key = str(path)
+    cached = _PSI_OCC_CACHE.get(key)
+    if cached is not None:
+        _PSI_OCC_CACHE.move_to_end(key)
+        return cached
+
+    with np.load(key, allow_pickle=True) as payload:
+        psi_occ = np.asarray(payload["psi_occ"], dtype=np.float32)
+
+    limit = psi_occ_cache_limit_bytes()
+    if limit <= 0:
+        return psi_occ
+
+    while _PSI_OCC_CACHE and _PSI_OCC_CACHE_BYTES + psi_occ.nbytes > limit:
+        _, old = _PSI_OCC_CACHE.popitem(last=False)
+        _PSI_OCC_CACHE_BYTES -= old.nbytes
+    if psi_occ.nbytes <= limit:
+        _PSI_OCC_CACHE[key] = psi_occ
+        _PSI_OCC_CACHE_BYTES += psi_occ.nbytes
+    return psi_occ
 
 
 def npz_light_cache_dir() -> Path | None:
@@ -114,6 +153,47 @@ def write_npz_light_cache(path: str | Path, rho_diag: np.ndarray, electron_count
     except OSError:
         # Cache failures should never stop training.
         return
+
+
+def system_resident_nbytes(system: "SystemRecord") -> int:
+    total = 0
+    for value in (
+        system.points,
+        system.local_features,
+        system.potential,
+        system.grad_potential,
+        system.hartree_potential,
+        system.xc_potential_local,
+        system.ks_potential,
+        system.kinetic_potential,
+        system.kinetic_potential_centered,
+        system.global_context,
+        system.gamma_matrix,
+        system.gamma_pairs,
+        system.rho_diag,
+        system.psi_occ,
+        system.rho_sad,
+        system.rho_cation,
+        system.rho_anion,
+        system.pair_left,
+        system.pair_right,
+        system.pair_distance,
+        system.pair_weights,
+        system.diagonal_pair_indices,
+        system.interior_point_indices,
+        system.stencil_left,
+        system.stencil_right,
+        system.derivative_true,
+        system.tau_true,
+        system.derivative_true_fd,
+        system.tau_true_fd,
+        system.occupancies,
+        system.orbital_energies,
+        system.spectral_subset,
+    ):
+        if isinstance(value, np.ndarray):
+            total += int(value.nbytes)
+    return total
 
 
 @dataclass
@@ -195,8 +275,12 @@ class SystemRecord:
         return load_gamma_matrix_cached(str(source_path))
 
     def gamma_values(self, left_idx: np.ndarray, right_idx: np.ndarray) -> np.ndarray:
-        if self.psi_occ is not None and self.psi_occ.size:
-            psi = np.asarray(self.psi_occ, dtype=np.float32)
+        if (self.psi_occ is not None and self.psi_occ.size) or self.metadata.get("has_psi_occ", False):
+            psi = (
+                np.asarray(self.psi_occ, dtype=np.float32)
+                if self.psi_occ is not None and self.psi_occ.size
+                else load_psi_occ_cached(str(self.metadata["source_path"]))
+            )
             occ = np.asarray(self.occupancies, dtype=np.float32)
             if psi.shape[1] != occ.shape[0]:
                 raise RuntimeError(
@@ -209,8 +293,13 @@ class SystemRecord:
         return gamma[left_idx, right_idx].reshape(-1, 1).astype(np.float32)
 
     def gamma_submatrix(self, indices: np.ndarray) -> np.ndarray:
-        if self.psi_occ is not None and self.psi_occ.size:
-            psi = np.asarray(self.psi_occ[indices], dtype=np.float32)
+        if (self.psi_occ is not None and self.psi_occ.size) or self.metadata.get("has_psi_occ", False):
+            psi_all = (
+                np.asarray(self.psi_occ, dtype=np.float32)
+                if self.psi_occ is not None and self.psi_occ.size
+                else load_psi_occ_cached(str(self.metadata["source_path"]))
+            )
+            psi = np.asarray(psi_all[indices], dtype=np.float32)
             occ = np.asarray(self.occupancies, dtype=np.float32)
             weighted = psi * occ[None, :]
             gamma = weighted @ psi.T
@@ -678,27 +767,27 @@ def finalize_system_record(
         hartree_potential=(
             np.asarray(hartree_potential, dtype=np.float32)
             if hartree_potential is not None
-            else np.full((n_points, 1), np.nan, dtype=np.float32)
+            else np.empty((0, 1), dtype=np.float32)
         ),
         xc_potential_local=(
             np.asarray(xc_potential_local, dtype=np.float32)
             if xc_potential_local is not None
-            else np.full((n_points, 1), np.nan, dtype=np.float32)
+            else np.empty((0, 1), dtype=np.float32)
         ),
         ks_potential=(
             np.asarray(ks_potential, dtype=np.float32)
             if ks_potential is not None
-            else np.full((n_points, 1), np.nan, dtype=np.float32)
+            else np.empty((0, 1), dtype=np.float32)
         ),
         kinetic_potential=(
             np.asarray(kinetic_potential, dtype=np.float32)
             if kinetic_potential is not None
-            else np.full((n_points, 1), np.nan, dtype=np.float32)
+            else np.empty((0, 1), dtype=np.float32)
         ),
         kinetic_potential_centered=(
             np.asarray(kinetic_potential_centered, dtype=np.float32)
             if kinetic_potential_centered is not None
-            else np.full((n_points, 1), np.nan, dtype=np.float32)
+            else np.empty((0, 1), dtype=np.float32)
         ),
         global_context=global_context.astype(np.float32),
         gamma_matrix=gamma_matrix.astype(np.float32) if keep_gamma_matrix else np.empty((0, 0), dtype=np.float32),
@@ -730,9 +819,9 @@ def finalize_system_record(
         pair_weights=np.empty((0, 1), dtype=np.float32),
         diagonal_pair_indices=np.arange(n_points, dtype=np.int64) * (n_points + 1),
         category_indices={},
-        interior_point_indices=interior_idx.astype(np.int64),
-        stencil_left=stencil_left.astype(np.int64),
-        stencil_right=stencil_right.astype(np.int64),
+        interior_point_indices=interior_idx.astype(np.int32),
+        stencil_left=stencil_left.astype(np.int32),
+        stencil_right=stencil_right.astype(np.int32),
         derivative_true=derivative_true.astype(np.float32),
         tau_true=tau_true.astype(np.float32),
         derivative_true_fd=(
@@ -891,7 +980,19 @@ def load_npz_system(path: str | Path, config: ExperimentConfig) -> SystemRecord:
             else None
         )
         occupancies = np.asarray(payload["occupancies"], dtype=np.float32) if "occupancies" in payload else np.array([], dtype=np.float32)
-        psi_occ = np.asarray(payload["psi_occ"], dtype=np.float32) if "psi_occ" in payload else None
+        has_psi_occ = "psi_occ" in payload
+        lazy_psi_occ = os.environ.get("RDM_LAZY_PSI_OCC", "1").strip().lower() not in {
+            "0",
+            "false",
+            "off",
+            "no",
+            "n",
+        }
+        psi_occ = (
+            np.asarray(payload["psi_occ"], dtype=np.float32)
+            if has_psi_occ and not lazy_psi_occ
+            else None
+        )
         orbital_energies = np.asarray(payload["orbital_energies"], dtype=np.float32) if "orbital_energies" in payload else np.array([], dtype=np.float32)
         atom_symbols = np.asarray(payload["atom_symbols"]).astype(str).tolist() if "atom_symbols" in payload else []
         atom_coords_bohr = (
@@ -979,6 +1080,8 @@ def load_npz_system(path: str | Path, config: ExperimentConfig) -> SystemRecord:
             ),
             "gamma_reference": scalar_payload(payload, "gamma_reference", ""),
             "reference_backend": scalar_payload(payload, "reference_backend", ""),
+            "has_psi_occ": has_psi_occ,
+            "lazy_psi_occ": bool(has_psi_occ and lazy_psi_occ),
             "charged_density_oracles": rho_cation is not None and rho_anion is not None,
             "local_feature_schema": local_feature_schema,
         }
@@ -1031,8 +1134,22 @@ def build_system_corpus(config: ExperimentConfig) -> list[SystemRecord]:
             paths = paths[: config.num_systems]
         if config.dataset_mode == "npz" and not paths:
             raise FileNotFoundError("dataset_mode='npz' but RDM_NPZ_GLOB did not match any files.")
-        for path in paths:
-            systems.append(load_npz_system(path, config))
+        progress_every = int(os.environ.get("RDM_LOAD_PROGRESS_EVERY", "25"))
+        progress_enabled = env_flag("RDM_LOAD_PROGRESS", True) and progress_every > 0
+        start_time = time.perf_counter()
+        resident_bytes = 0
+        for idx, path in enumerate(paths, start=1):
+            system = load_npz_system(path, config)
+            systems.append(system)
+            resident_bytes += system_resident_nbytes(system)
+            if progress_enabled and (idx == 1 or idx % progress_every == 0 or idx == len(paths)):
+                elapsed = time.perf_counter() - start_time
+                print(
+                    "[NPZ load] "
+                    f"{idx}/{len(paths)} systems | "
+                    f"resident arrays ~{resident_bytes / (1024**3):.2f} GiB | "
+                    f"elapsed {elapsed:.1f}s"
+                )
 
     if not systems:
         raise RuntimeError("No systems were generated or loaded.")

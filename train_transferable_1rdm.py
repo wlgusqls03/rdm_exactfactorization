@@ -652,6 +652,8 @@ def main() -> None:
         "fukui": 12,
     }[pair_density_feature_mode(config)]
     gamma_cache_gib = float(os.environ.get("RDM_GAMMA_CACHE_GB", "1.0"))
+    psi_cache_gib = float(os.environ.get("RDM_PSI_OCC_CACHE_GB", "2.0"))
+    lazy_psi_occ = env_flag("RDM_LAZY_PSI_OCC", True)
     expanded_gamma_gib = sum(len(system.points) ** 2 * 4 for system in systems) / (1024**3)
     frozen_density_cache_mib = (
         sum(len(system.points) for system in systems) * density_cache_floats_per_point * 4 / (1024**2)
@@ -660,6 +662,8 @@ def main() -> None:
         "Runtime cache estimate",
         [
             ("gamma LRU limit (CPU RAM)", f"{gamma_cache_gib:.2f} GiB"),
+            ("psi_occ lazy load", lazy_psi_occ),
+            ("psi_occ LRU limit (CPU RAM)", f"{psi_cache_gib:.2f} GiB"),
             ("full corpus gamma expanded", f"{expanded_gamma_gib:.2f} GiB"),
             ("frozen density cache (GPU, approx)", f"{frozen_density_cache_mib:.1f} MiB"),
         ],

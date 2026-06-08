@@ -1343,7 +1343,8 @@ def evaluate_system(
 
     Large spacing-based grids make full G^2 evaluation too expensive. Scalar
     pair metrics are therefore estimated from a deterministic category-balanced
-    sample, while diagonal density and stencil tau are still evaluated exactly.
+    sample. Stencil physics metrics are sampled during training epochs and run
+    exactly for final summaries unless disabled by config.
     """
     eval_epoch = max(config.epochs - 1 if epoch is None else epoch, 0)
     left, right, categories = sample_pair_indices(
@@ -1373,27 +1374,63 @@ def evaluate_system(
     kernel_loss = float(np.mean((kernel_diag - 1.0) ** 2))
     kernel_diag_error = float(np.mean(np.abs(kernel_diag - 1.0)))
 
+    total_stencil_centers = int(system.stencil_left.shape[0])
+    final_epoch = epoch is None or int(epoch) >= int(config.epochs) - 1
+    full_stencil_eval = config.eval_stencil_centers <= 0 or (
+        final_epoch and bool(config.eval_full_final)
+    )
+    eval_center_indices = None
+    if not full_stencil_eval:
+        eval_center_indices = select_stencil_center_indices(
+            system,
+            config.eval_stencil_centers,
+            rng,
+        )
     derivative_pred_t, tau_pred_t = stencil_predictions(
-        system, models, config, rho_all=rho_all, density_state=density_state
+        system,
+        models,
+        config,
+        rho_all=rho_all,
+        density_state=density_state,
+        max_centers=None if full_stencil_eval else config.eval_stencil_centers,
+        center_indices=eval_center_indices,
     )
     derivative_pred = derivative_pred_t.numpy()
     tau_pred = tau_pred_t.numpy()
-    derivative_true_fd, tau_true_fd = true_gamma_stencil_targets(system)
-    derivative_target, tau_target = physics_stencil_targets(system, config)
+    full_derivative_true_fd, full_tau_true_fd = true_gamma_stencil_targets(system)
+    full_derivative_target, full_tau_target = physics_stencil_targets(system, config)
+    if eval_center_indices is None:
+        derivative_true_fd = full_derivative_true_fd
+        tau_true_fd = full_tau_true_fd
+        derivative_target = full_derivative_target
+        tau_target = full_tau_target
+        derivative_true_ao = system.derivative_true
+        tau_true_ao = system.tau_true
+        stencil_integration_multiplier = 1.0
+        stencil_eval_centers = total_stencil_centers
+    else:
+        derivative_true_fd = full_derivative_true_fd[eval_center_indices]
+        tau_true_fd = full_tau_true_fd[eval_center_indices]
+        derivative_target = full_derivative_target[eval_center_indices]
+        tau_target = full_tau_target[eval_center_indices]
+        derivative_true_ao = system.derivative_true[eval_center_indices]
+        tau_true_ao = system.tau_true[eval_center_indices]
+        stencil_eval_centers = int(len(eval_center_indices))
+        stencil_integration_multiplier = float(total_stencil_centers) / max(float(stencil_eval_centers), 1.0)
     deriv_raw_mse = float(np.mean((derivative_pred - derivative_target) ** 2))
     tau_raw_mse = float(np.mean((tau_pred - tau_target) ** 2))
-    deriv_pred_ao_raw_mse = float(np.mean((derivative_pred - system.derivative_true) ** 2))
-    deriv_pred_ao_mae = float(np.mean(np.abs(derivative_pred - system.derivative_true)))
-    deriv_fd_ao_raw_mse = float(np.mean((derivative_true_fd - system.derivative_true) ** 2))
-    deriv_fd_ao_mae = float(np.mean(np.abs(derivative_true_fd - system.derivative_true)))
-    deriv_fd_ao_rms_ratio = safe_rms_ratio(derivative_true_fd, system.derivative_true)
+    deriv_pred_ao_raw_mse = float(np.mean((derivative_pred - derivative_true_ao) ** 2))
+    deriv_pred_ao_mae = float(np.mean(np.abs(derivative_pred - derivative_true_ao)))
+    deriv_fd_ao_raw_mse = float(np.mean((derivative_true_fd - derivative_true_ao) ** 2))
+    deriv_fd_ao_mae = float(np.mean(np.abs(derivative_true_fd - derivative_true_ao)))
+    deriv_fd_ao_rms_ratio = safe_rms_ratio(derivative_true_fd, derivative_true_ao)
     deriv_pred_fd_raw_mse = float(np.mean((derivative_pred - derivative_true_fd) ** 2))
     deriv_pred_fd_mae = float(np.mean(np.abs(derivative_pred - derivative_true_fd)))
-    tau_pred_ao_raw_mse = float(np.mean((tau_pred - system.tau_true) ** 2))
-    tau_pred_ao_mae = float(np.mean(np.abs(tau_pred - system.tau_true)))
-    tau_fd_ao_raw_mse = float(np.mean((tau_true_fd - system.tau_true) ** 2))
-    tau_fd_ao_mae = float(np.mean(np.abs(tau_true_fd - system.tau_true)))
-    tau_fd_ao_rms_ratio = safe_rms_ratio(tau_true_fd, system.tau_true)
+    tau_pred_ao_raw_mse = float(np.mean((tau_pred - tau_true_ao) ** 2))
+    tau_pred_ao_mae = float(np.mean(np.abs(tau_pred - tau_true_ao)))
+    tau_fd_ao_raw_mse = float(np.mean((tau_true_fd - tau_true_ao) ** 2))
+    tau_fd_ao_mae = float(np.mean(np.abs(tau_true_fd - tau_true_ao)))
+    tau_fd_ao_rms_ratio = safe_rms_ratio(tau_true_fd, tau_true_ao)
     tau_pred_fd_raw_mse = float(np.mean((tau_pred - tau_true_fd) ** 2))
     tau_pred_fd_mae = float(np.mean(np.abs(tau_pred - tau_true_fd)))
     deriv_loss = float(
@@ -1415,7 +1452,11 @@ def evaluate_system(
     deriv_mae = float(np.mean(np.abs(derivative_pred - derivative_target)))
     tau_mae = float(np.mean(np.abs(tau_pred - tau_target)))
     curvature_stats = curvature_target_diagnostics(system, derivative_target)
-    kinetic_loss_t, kinetic_pred_t, kinetic_ref = kinetic_energy_loss_from_tau(system, tau_pred_t)
+    kinetic_loss_t, kinetic_pred_t, kinetic_ref = kinetic_energy_loss_from_tau(
+        system,
+        tau_pred_t,
+        integration_multiplier=stencil_integration_multiplier,
+    )
     kinetic_loss = float(kinetic_loss_t.numpy())
     kinetic_pred = float(kinetic_pred_t.numpy())
     kinetic_ref_error = float(kinetic_pred - kinetic_ref)
@@ -1455,8 +1496,8 @@ def evaluate_system(
     min_eig_pred = float(np.min(occ_eigs_t.numpy()))
     top_mo_occ_true = topk_descending(system.occupancies, 6) if len(system.occupancies) else np.array([], dtype=np.float32)
     tau_true_integral = float(np.sum(system.tau_true) * system.cell_volume)
-    tau_true_fd_integral = float(np.sum(tau_true_fd) * system.cell_volume)
-    tau_pred_integral = float(np.sum(tau_pred) * system.cell_volume)
+    tau_true_fd_integral = float(np.sum(full_tau_true_fd) * system.cell_volume)
+    tau_pred_integral = float(kinetic_pred)
 
     metrics = {
         "system_id": system.system_id,
@@ -1465,6 +1506,9 @@ def evaluate_system(
         "n_points": int(len(system.points)),
         "grid_spacing_bohr": float(system.step),
         "electron_count": float(system.electron_count),
+        "stencil_eval_centers": float(stencil_eval_centers),
+        "stencil_eval_total_centers": float(total_stencil_centers),
+        "stencil_eval_sampled": float(eval_center_indices is not None),
         "pair_loss": pair_loss,
         "pair_mae": pair_mae,
         "rho_loss": rho_loss,
@@ -2190,6 +2234,8 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
             ("active system tensor cache", config.active_system_tensor_cache_size),
             ("train diagonal points", "full" if config.train_diagonal_points <= 0 else config.train_diagonal_points),
             ("train stencil centers", "full" if config.train_stencil_centers <= 0 else config.train_stencil_centers),
+            ("eval stencil centers", "full" if config.eval_stencil_centers <= 0 else config.eval_stencil_centers),
+            ("full final eval", config.eval_full_final),
             (
                 "stencil feature cache centers",
                 "disabled" if config.stencil_feature_cache_max_centers <= 0 else config.stencil_feature_cache_max_centers,
@@ -2209,6 +2255,7 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
         [
             ("enabled", config.gradient_diagnostics),
             ("every epochs", max(config.gradient_diagnostics_every, 1)),
+            ("start epoch", max(config.gradient_diagnostics_start_epoch, 0)),
             ("mode", config.gradient_diagnostic_mode),
             ("fixed train system", diagnostic_system.system_id),
             ("stencil centers", config.gradient_diagnostic_stencil_centers),
@@ -2377,6 +2424,7 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
         if (
             validation_ran
             and config.gradient_diagnostics
+            and epoch >= max(config.gradient_diagnostics_start_epoch, 0)
             and epoch % max(config.gradient_diagnostics_every, 1) == 0
         ):
             assert diagnostic_batch is not None
@@ -2419,6 +2467,12 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
                 f"w(T)={weights['kinetic']:.3g}"
             )
             if val_metrics:
+                print(
+                    " " * 14
+                    + f"held-out stencil eval centers={val_metrics['stencil_eval_centers']:.0f}/"
+                    + f"{val_metrics['stencil_eval_total_centers']:.0f} "
+                    + f"sampled={bool(val_metrics['stencil_eval_sampled'])}"
+                )
                 print(
                     " " * 14
                     + f"held-out mae gamma_pair={val_metrics['pair_mae']:.3e} "
