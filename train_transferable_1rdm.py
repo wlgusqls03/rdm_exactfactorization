@@ -702,14 +702,6 @@ def main() -> None:
     pair_ckpt = out_dir / f"{config.run_name}_pair.weights.h5"
     context_ckpt = out_dir / f"{config.run_name}_context.weights.h5"
 
-    plot_training_summary(
-        history=history,
-        summary=summary,
-        axis_points=config.axis_points,
-        output_png=png_path,
-    )
-    plot_point_pretrain_summary(point_summary, point_png_path)
-
     models.point_model.save_weights(point_ckpt)
     models.mode_model.save_weights(mode_ckpt)
     models.pair_model.save_weights(pair_ckpt)
@@ -742,6 +734,14 @@ def main() -> None:
     save_point_pretrain_history_csv(point_history_csv_path, point_history)
     save_split_metrics_csv(split_csv_path, summary)
     save_per_system_metrics_csv(per_system_csv_path, summary)
+
+    plot_training_summary(
+        history=history,
+        summary=summary,
+        axis_points=config.axis_points,
+        output_png=png_path,
+    )
+    plot_point_pretrain_summary(point_summary, point_png_path)
 
     print_block(
         "Saved artifacts",

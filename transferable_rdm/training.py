@@ -1656,6 +1656,7 @@ def evaluate_system(
         "rho_true_diag": system.rho_diag,
         "rho_pred_diag": rho_all.numpy(),
         "tau_true": system.tau_true,
+        "tau_target_eval": tau_target,
         "tau_true_fd": tau_true_fd,
         "tau_pred": tau_pred,
         "gamma_true_sample": gamma_true_pairs,

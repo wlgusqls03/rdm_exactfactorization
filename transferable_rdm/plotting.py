@@ -86,6 +86,27 @@ def add_imshow(
     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
 
+def add_parity_plot(
+    ax,
+    true_values: np.ndarray,
+    pred_values: np.ndarray,
+    title: str,
+) -> None:
+    true_flat = np.asarray(true_values).reshape(-1)
+    pred_flat = np.asarray(pred_values).reshape(-1)
+    if true_flat.shape != pred_flat.shape:
+        raise ValueError(
+            f"Parity arrays must have matching shapes, got {true_flat.shape} and {pred_flat.shape}."
+        )
+    ax.scatter(true_flat, pred_flat, s=4, alpha=0.35)
+    lower = float(min(np.min(true_flat), np.min(pred_flat)))
+    upper = float(max(np.max(true_flat), np.max(pred_flat)))
+    ax.plot([lower, upper], [lower, upper], "k--", linewidth=1.0)
+    ax.set_title(title)
+    ax.set_xlabel("True")
+    ax.set_ylabel("Pred")
+
+
 def add_integral_ratio_plot(ax, representative: dict[str, object]) -> None:
     trace_true = float(representative["trace_true"])
     trace_pred = float(representative["trace_pred"])
@@ -199,23 +220,34 @@ def plot_training_summary(
         vmin=rho_vmin,
         vmax=rho_vmax,
     )
-    tau_true_slice = reshape_tau_slice(representative["tau_true"], representative_axis_points)
-    tau_pred_slice = reshape_tau_slice(representative["tau_pred"], representative_axis_points)
-    tau_vmin, tau_vmax = shared_limits(tau_true_slice, tau_pred_slice, include_zero=True)
-    add_imshow(
-        axes[1, 0],
-        tau_true_slice,
-        r"True $\tau$ Slice",
-        vmin=tau_vmin,
-        vmax=tau_vmax,
-    )
-    add_imshow(
-        axes[1, 1],
-        tau_pred_slice,
-        r"Pred $\tau$ Slice",
-        vmin=tau_vmin,
-        vmax=tau_vmax,
-    )
+    tau_target = np.asarray(representative.get("tau_target_eval", representative["tau_true"]))
+    tau_pred = np.asarray(representative["tau_pred"])
+    sampled_tau = bool(representative.get("stencil_eval_sampled", 0.0))
+    if not sampled_tau and tau_target.size == tau_pred.size:
+        tau_true_slice = reshape_tau_slice(tau_target, representative_axis_points)
+        tau_pred_slice = reshape_tau_slice(tau_pred, representative_axis_points)
+        tau_vmin, tau_vmax = shared_limits(tau_true_slice, tau_pred_slice, include_zero=True)
+        add_imshow(
+            axes[1, 0],
+            tau_true_slice,
+            r"True $\tau$ Slice",
+            vmin=tau_vmin,
+            vmax=tau_vmax,
+        )
+        add_imshow(
+            axes[1, 1],
+            tau_pred_slice,
+            r"Pred $\tau$ Slice",
+            vmin=tau_vmin,
+            vmax=tau_vmax,
+        )
+    else:
+        add_parity_plot(axes[1, 0], tau_target, tau_pred, r"Sampled $\tau$ Parity")
+        tau_abs_error = np.abs(tau_pred.reshape(-1) - tau_target.reshape(-1))
+        axes[1, 1].hist(tau_abs_error, bins=40, color="tab:red", alpha=0.8)
+        axes[1, 1].set_title(r"Sampled $|\Delta\tau|$")
+        axes[1, 1].set_xlabel("Absolute error")
+        axes[1, 1].set_ylabel("Count")
 
     has_full_gamma = "gamma_true_matrix" in representative and "gamma_pred_matrix" in representative
     if has_full_gamma:
@@ -274,9 +306,27 @@ def plot_training_summary(
     rho_err_slice = np.abs(rho_pred_slice - rho_true_slice)
     rho_err_vmin, rho_err_vmax = shared_limits(rho_err_slice, include_zero=True)
     add_imshow(axes[2, 1], rho_err_slice, r"$|\Delta\rho|$ Slice", vmin=rho_err_vmin, vmax=rho_err_vmax, cmap="Reds")
-    tau_err_slice = np.abs(tau_pred_slice - tau_true_slice)
-    tau_err_vmin, tau_err_vmax = shared_limits(tau_err_slice, include_zero=True)
-    add_imshow(axes[2, 2], tau_err_slice, r"$|\Delta\tau|$ Slice", vmin=tau_err_vmin, vmax=tau_err_vmax, cmap="Reds")
+    if not sampled_tau and tau_target.size == tau_pred.size:
+        tau_err_slice = np.abs(tau_pred_slice - tau_true_slice)
+        tau_err_vmin, tau_err_vmax = shared_limits(tau_err_slice, include_zero=True)
+        add_imshow(
+            axes[2, 2],
+            tau_err_slice,
+            r"$|\Delta\tau|$ Slice",
+            vmin=tau_err_vmin,
+            vmax=tau_err_vmax,
+            cmap="Reds",
+        )
+    else:
+        axes[2, 2].axis("off")
+        axes[2, 2].text(
+            0.0,
+            0.5,
+            "Spatial tau slice skipped\n(sampled stencil centers)",
+            va="center",
+            ha="left",
+            family="monospace",
+        )
     axes[2, 3].axis("off")
 
     add_integral_ratio_plot(axes[3, 0], representative)
