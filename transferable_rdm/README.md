@@ -31,24 +31,46 @@ RDM_AXIS_POINTS=5 \
 python train_transferable_1rdm.py
 ```
 
-1D/2D/3D dimensional toy를 같은 3D grid 모델로 학습:
+1D, 2D, 3D toy는 각각 독립 실험으로 실행한다. 예를 들어 1D 400/50/50:
 
 ```bash
 python train_transferable_1rdm.py \
   --dataset-mode toy \
-  --toy-dimensions 1,2,3 \
-  --num-systems 120 \
-  --train-system-count 90 \
-  --val-system-count 15 \
-  --test-system-count 15 \
+  --toy-dimensions 1 \
+  --num-systems 500 \
+  --train-system-count 400 \
+  --val-system-count 50 \
+  --test-system-count 50 \
   --axis-points 9 \
-  --density-baseline-mode learned
+  --pair-density-feature-mode rho-derivatives \
+  --pair-density-hessian \
+  --density-baseline-mode sad-multiplicative
 ```
+
+2D와 3D는 각각 `--toy-dimensions 2`, `--toy-dimensions 3`으로 실행한다.
+`--toy-dimensions 1,2,3`은 세 차원을 한 corpus에서 비교하는 추가 실험용이다.
 
 1D와 2D toy는 현재 3D 모델과 동일한 입력 및 물리 loss를 사용하기 위해 3D
 cubic grid에 임베딩된다. 활성 축에는 무작위 multi-well potential을 사용하고,
 나머지 축은 고정 harmonic ground-state confinement를 사용한다. Toy split은
 요청한 차원들이 train/validation/test에 가능한 한 균등하게 포함되도록 구성된다.
+
+Toy generator와 feature adapter는 `transferable_rdm/toy/`에 분리되어 있고,
+공통 `model.py`와 `training.py`는 QM9과 동일하게 사용한다. Toy feature schema는
+QM9 patched NPZ와 같은 `local=32`, `global=11` 크기를 사용한다.
+
+- 공통 물리 채널: 좌표, potential, potential gradient, potential Laplacian,
+  radial distance, electron count
+- QM9 원소별 Gaussian/vector 채널: toy potential-source Gaussian/vector로 대응
+- 원자번호 채널: toy에는 원자가 없으므로 0
+- SAD 대응 채널: 외부 potential의 정규화된 최저 product-orbital density
+- global atom summary: source count, active dimension, source strength/radius summary
+
+따라서 `rho-derivatives + Hessian` 설정에서는 QM9과 동일하게 point input 43,
+pair input 43이 된다. 기존 QM9 NPZ 생성 및 로딩 경로는 toy adapter를 사용하지
+않는다. Toy baseline은 target density 복사가 아니라 potential만으로 만든 초기
+추정치이며, baseline 영향 자체를 제거하려면 `--density-baseline-mode learned`를
+사용한다.
 
 QMugs에서 변환한 NPZ subset을 쓰는 Phase 1 preset:
 
