@@ -423,6 +423,141 @@ def sample_ks_like_parameters(config: ExperimentConfig, rng: np.random.Generator
     }
 
 
+def parse_toy_dimensions(value: str) -> tuple[int, ...]:
+    """Parse and validate the active dimensions used by toy systems."""
+    try:
+        dimensions = tuple(dict.fromkeys(int(part.strip()) for part in value.split(",") if part.strip()))
+    except ValueError as exc:
+        raise ValueError("RDM_TOY_DIMENSIONS must be a comma-separated subset of 1,2,3.") from exc
+    if not dimensions or any(dimension not in {1, 2, 3} for dimension in dimensions):
+        raise ValueError("RDM_TOY_DIMENSIONS must be a comma-separated subset of 1,2,3.")
+    return dimensions
+
+
+def sample_toy_axis_parameters(
+    config: ExperimentConfig,
+    rng: np.random.Generator,
+    *,
+    active: bool,
+) -> dict[str, object]:
+    """Sample one separable axis of a dimensional toy Hamiltonian."""
+    if not active:
+        return {
+            "num_wells": 0,
+            "centers": np.empty((0,), dtype=np.float32),
+            "depths": np.empty((0,), dtype=np.float32),
+            "widths": np.empty((0,), dtype=np.float32),
+            "omega": float(config.toy_inactive_omega),
+            "quartic": 0.0,
+        }
+
+    num_wells = int(rng.integers(1, config.max_wells + 1))
+    if num_wells == 1:
+        centers = np.array([rng.uniform(-1.2, 1.2)], dtype=np.float32)
+    else:
+        separation = rng.uniform(1.0, 2.4)
+        shift = rng.uniform(-0.3, 0.3)
+        centers = np.sort(
+            np.array([shift - 0.5 * separation, shift + 0.5 * separation], dtype=np.float32)
+        )
+    return {
+        "num_wells": num_wells,
+        "centers": centers,
+        "depths": rng.uniform(0.9, 2.2, size=num_wells).astype(np.float32),
+        "widths": rng.uniform(0.45, 1.05, size=num_wells).astype(np.float32),
+        "omega": float(rng.uniform(0.06, 0.20)),
+        "quartic": float(rng.uniform(0.0, 0.012)),
+    }
+
+
+def evaluate_toy_axis_potential(
+    coordinate: np.ndarray,
+    params: dict[str, object],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Evaluate one active or confined toy axis and its gradient."""
+    omega = float(params["omega"])
+    quartic = float(params["quartic"])
+    potential = 0.5 * omega**2 * coordinate**2 + quartic * coordinate**4
+    gradient = omega**2 * coordinate + 4.0 * quartic * coordinate**3
+    for center, depth, width in zip(params["centers"], params["depths"], params["widths"]):
+        displacement = coordinate - float(center)
+        gaussian = np.exp(-((displacement / float(width)) ** 2))
+        potential -= float(depth) * gaussian
+        gradient += float(depth) * 2.0 * displacement / float(width) ** 2 * gaussian
+    return potential.astype(np.float32), gradient.astype(np.float32)
+
+
+def build_dimensional_toy_features(
+    points: np.ndarray,
+    potential: np.ndarray,
+    gradient: np.ndarray,
+    axis_params: list[dict[str, object]],
+    active_dimension: int,
+    electron_count: float,
+    temperature: float,
+    config: ExperimentConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build fixed-width local and global descriptors for 1D/2D/3D toys."""
+    domain_scale = max(float(config.domain_radius), 1e-6)
+    potential_scale = max(float(np.std(potential)), 1.0)
+    active_mask = np.array(
+        [1.0 if axis_index < active_dimension else 0.0 for axis_index in range(3)],
+        dtype=np.float32,
+    )
+    local_columns = [
+        points / domain_scale,
+        potential / potential_scale,
+        gradient / potential_scale,
+        np.broadcast_to(active_mask, (len(points), 3)),
+        np.full((len(points), 1), electron_count / max(config.max_orbitals, 1), dtype=np.float32),
+        np.full((len(points), 1), temperature, dtype=np.float32),
+    ]
+    context_values: list[float] = [
+        electron_count / max(config.max_orbitals, 1),
+        temperature,
+        active_dimension / 3.0,
+        *active_mask.tolist(),
+    ]
+    for axis_index, params in enumerate(axis_params):
+        coordinate = points[:, axis_index]
+        centers = np.zeros(config.max_wells, dtype=np.float32)
+        depths = np.zeros(config.max_wells, dtype=np.float32)
+        widths = np.zeros(config.max_wells, dtype=np.float32)
+        count = int(params["num_wells"])
+        centers[:count] = np.asarray(params["centers"], dtype=np.float32)
+        depths[:count] = np.asarray(params["depths"], dtype=np.float32)
+        widths[:count] = np.asarray(params["widths"], dtype=np.float32)
+        for slot in range(config.max_wells):
+            displacement = coordinate - centers[slot]
+            if slot < count:
+                width = max(float(widths[slot]), 1e-6)
+                local_columns.extend(
+                    [
+                        (displacement / domain_scale).reshape(-1, 1),
+                        np.exp(-((displacement / width) ** 2)).reshape(-1, 1),
+                        np.full((len(points), 1), depths[slot] / 3.0, dtype=np.float32),
+                    ]
+                )
+            else:
+                local_columns.extend(
+                    [np.zeros((len(points), 1), dtype=np.float32) for _ in range(3)]
+                )
+        context_values.extend(
+            [
+                float(params["omega"]),
+                float(params["quartic"]),
+                count / max(config.max_wells, 1),
+                *(centers / domain_scale).tolist(),
+                *(depths / 3.0).tolist(),
+                *(widths / domain_scale).tolist(),
+            ]
+        )
+    return (
+        np.concatenate(local_columns, axis=1).astype(np.float32),
+        np.asarray(context_values, dtype=np.float32),
+    )
+
+
 def enumerate_3d_states(
     eig_x: np.ndarray,
     eig_y: np.ndarray,
@@ -439,6 +574,34 @@ def enumerate_3d_states(
             for iz in range(nz_keep):
                 energy = float(eig_x[ix] + eig_y[iy] + eig_z[iz])
                 states.append((energy, (ix, iy, iz)))
+    states.sort(key=lambda item: item[0])
+    return states[:max_orbitals]
+
+
+def enumerate_dimensional_states(
+    eig_x: np.ndarray,
+    eig_y: np.ndarray,
+    eig_z: np.ndarray,
+    active_dimension: int,
+    max_orbitals: int,
+) -> list[tuple[float, tuple[int, int, int]]]:
+    """Enumerate product states while freezing inactive axes in their ground state."""
+    eigenvalues = (eig_x, eig_y, eig_z)
+    index_ranges = [
+        range(min(len(eigenvalues[axis_index]), max_orbitals))
+        if axis_index < active_dimension
+        else range(1)
+        for axis_index in range(3)
+    ]
+    states = [
+        (
+            float(eig_x[ix] + eig_y[iy] + eig_z[iz]),
+            (ix, iy, iz),
+        )
+        for ix in index_ranges[0]
+        for iy in index_ranges[1]
+        for iz in index_ranges[2]
+    ]
     states.sort(key=lambda item: item[0])
     return states[:max_orbitals]
 
@@ -905,6 +1068,91 @@ def build_ks_like_system(config: ExperimentConfig, system_index: int, rng: np.ra
     )
 
 
+def build_dimensional_toy_system(
+    config: ExperimentConfig,
+    system_index: int,
+    active_dimension: int,
+    rng: np.random.Generator,
+) -> SystemRecord:
+    """Generate a random 1D/2D/3D toy embedded in the common 3D grid."""
+    axis = np.linspace(-config.domain_radius, config.domain_radius, config.axis_points, dtype=np.float32)
+    points = make_uniform_grid(axis)
+    axis_params = [
+        sample_toy_axis_parameters(config, rng, active=axis_index < active_dimension)
+        for axis_index in range(3)
+    ]
+    axis_solutions = []
+    keep_1d = max(4, min(config.axis_points, config.max_orbitals))
+    for params in axis_params:
+        axis_potential, _ = evaluate_toy_axis_potential(axis, params)
+        axis_solutions.append(solve_1d_schrodinger(axis, axis_potential, keep_1d))
+
+    eig_x, vec_x = axis_solutions[0]
+    eig_y, vec_y = axis_solutions[1]
+    eig_z, vec_z = axis_solutions[2]
+    states = enumerate_dimensional_states(
+        eig_x,
+        eig_y,
+        eig_z,
+        active_dimension,
+        config.max_orbitals,
+    )
+    energies = np.asarray([state[0] for state in states], dtype=np.float32)
+    electron_count = float(rng.uniform(1.0, min(4.8, config.max_orbitals - 0.2)))
+    temperature = float(rng.uniform(0.03, 0.12))
+    occupancies = fermi_occupations(energies, electron_count, temperature)
+
+    orbitals = [
+        np.einsum("i,j,k->ijk", vec_x[:, ix], vec_y[:, iy], vec_z[:, iz]).reshape(-1).astype(np.float32)
+        for _, (ix, iy, iz) in states
+    ]
+    orbital_matrix = np.stack(orbitals, axis=1).astype(np.float32)
+    gamma_matrix = (orbital_matrix * occupancies[None, :]) @ orbital_matrix.T
+
+    potential_parts = []
+    gradient_parts = []
+    for axis_index, params in enumerate(axis_params):
+        axis_potential, axis_gradient = evaluate_toy_axis_potential(points[:, axis_index], params)
+        potential_parts.append(axis_potential)
+        gradient_parts.append(axis_gradient)
+    potential = np.sum(np.stack(potential_parts, axis=1), axis=1, keepdims=True).astype(np.float32)
+    gradient = np.stack(gradient_parts, axis=1).astype(np.float32)
+    local_features, global_context = build_dimensional_toy_features(
+        points,
+        potential,
+        gradient,
+        axis_params,
+        active_dimension,
+        electron_count,
+        temperature,
+        config,
+    )
+    metadata = {
+        "toy_dimension": active_dimension,
+        "toy_embedding": "active_axes_in_3d_grid",
+        "electron_count": electron_count,
+        "temperature": temperature,
+        "tau_reference": f"finite_difference_{config.tau_stencil}",
+    }
+    return finalize_system_record(
+        system_id=f"toy_{active_dimension}d_{system_index:04d}",
+        family="toy_dimensional",
+        axis=axis,
+        points=points,
+        local_features=local_features,
+        potential=potential,
+        grad_potential=gradient,
+        global_context=global_context,
+        gamma_matrix=np.asarray(gamma_matrix, dtype=np.float32),
+        electron_count=electron_count,
+        occupancies=occupancies,
+        orbital_energies=energies,
+        metadata=metadata,
+        config=config,
+        psi_occ=orbital_matrix,
+    )
+
+
 def infer_uniform_axis(points: np.ndarray) -> np.ndarray:
     """uniform Cartesian grid axis 복원."""
     unique_x = np.unique(np.round(points[:, 0], decimals=8))
@@ -1127,6 +1375,12 @@ def build_system_corpus(config: ExperimentConfig) -> list[SystemRecord]:
     if config.dataset_mode in {"ks_like", "mixed"}:
         for idx in range(config.num_systems):
             systems.append(build_ks_like_system(config, idx, rng))
+
+    if config.dataset_mode == "toy":
+        dimensions = parse_toy_dimensions(config.toy_dimensions)
+        for idx in range(config.num_systems):
+            dimension = dimensions[idx % len(dimensions)]
+            systems.append(build_dimensional_toy_system(config, idx, dimension, rng))
 
     if config.dataset_mode in {"npz", "mixed"}:
         paths = sorted(glob.glob(config.npz_glob)) if config.npz_glob else []

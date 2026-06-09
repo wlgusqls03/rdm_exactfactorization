@@ -33,9 +33,11 @@ class ExperimentConfig:
     # ------------------------------------------------------------------
     dataset_mode: str = os.environ.get("RDM_DATASET_MODE", "ks_like")
     # "ks_like"  : synthetic separable KS-like systems 생성
+    # "toy"      : 1D/2D/3D active-axis toy systems 생성
     # "npz"      : 외부 NPZ dataset 로드
     # "mixed"    : npz가 있으면 같이 섞고, 없으면 ks_like만 사용
     npz_glob: str = os.environ.get("RDM_NPZ_GLOB", "")
+    toy_dimensions: str = os.environ.get("RDM_TOY_DIMENSIONS", "1,2,3")
     phase: str = os.environ.get("RDM_PHASE", "none")
     # "none"    : 기존 설정 사용
     # "phase1a" : QMugs-NPZ prototype, 300 train / 100 val
@@ -55,6 +57,7 @@ class ExperimentConfig:
     domain_radius: float = float(os.environ.get("RDM_DOMAIN_RADIUS", 4.0))
     max_wells: int = int(os.environ.get("RDM_MAX_WELLS", 2))
     max_orbitals: int = int(os.environ.get("RDM_MAX_ORBITALS", 8))
+    toy_inactive_omega: float = float(os.environ.get("RDM_TOY_INACTIVE_OMEGA", 0.8))
     spectral_subset_points: int = int(os.environ.get("RDM_SPECTRAL_SUBSET_POINTS", 64))
     eval_pair_count: int = int(os.environ.get("RDM_EVAL_PAIR_COUNT", 32768))
     full_eval_max_points: int = int(os.environ.get("RDM_FULL_EVAL_MAX_POINTS", 2500))

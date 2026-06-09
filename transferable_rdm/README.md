@@ -31,6 +31,25 @@ RDM_AXIS_POINTS=5 \
 python train_transferable_1rdm.py
 ```
 
+1D/2D/3D dimensional toy를 같은 3D grid 모델로 학습:
+
+```bash
+python train_transferable_1rdm.py \
+  --dataset-mode toy \
+  --toy-dimensions 1,2,3 \
+  --num-systems 120 \
+  --train-system-count 90 \
+  --val-system-count 15 \
+  --test-system-count 15 \
+  --axis-points 9 \
+  --density-baseline-mode learned
+```
+
+1D와 2D toy는 현재 3D 모델과 동일한 입력 및 물리 loss를 사용하기 위해 3D
+cubic grid에 임베딩된다. 활성 축에는 무작위 multi-well potential을 사용하고,
+나머지 축은 고정 harmonic ground-state confinement를 사용한다. Toy split은
+요청한 차원들이 train/validation/test에 가능한 한 균등하게 포함되도록 구성된다.
+
 QMugs에서 변환한 NPZ subset을 쓰는 Phase 1 preset:
 
 ```bash

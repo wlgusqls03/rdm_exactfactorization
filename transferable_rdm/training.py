@@ -753,6 +753,8 @@ def kinetic_energy_loss_from_tau(
 
 
 def ion_ion_energy_hartree(system: SystemRecord) -> float:
+    if system.family in {"ks_like", "toy_dimensional"}:
+        return 0.0
     symbols = system.metadata.get("atom_symbols", [])
     coords = np.asarray(system.metadata.get("atom_coords_bohr", np.empty((0, 3))), dtype=np.float64)
     if coords.ndim != 2 or coords.shape[1] != 3 or len(symbols) != len(coords):
@@ -1576,6 +1578,8 @@ def evaluate_system(
 
     metrics = {
         "system_id": system.system_id,
+        "family": system.family,
+        "toy_dimension": system.metadata.get("toy_dimension", ""),
         "formula": str(system.metadata.get("formula", "")),
         "axis_points": int(len(system.axis)),
         "n_points": int(len(system.points)),

@@ -150,6 +150,8 @@ CSV_METRIC_KEYS = [
 CSV_SYSTEM_KEYS = [
     "split",
     "system_id",
+    "family",
+    "toy_dimension",
     "formula",
     "axis_points",
     "n_points",
@@ -160,7 +162,7 @@ CSV_SYSTEM_KEYS = [
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a transferable 3D 1-RDM surrogate.")
-    parser.add_argument("--dataset-mode", choices=["ks_like", "npz", "mixed"], default=None)
+    parser.add_argument("--dataset-mode", choices=["ks_like", "toy", "npz", "mixed"], default=None)
     parser.add_argument("--phase", choices=["none", "phase1a", "phase1b"], default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
@@ -216,6 +218,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--npz-glob", type=str, default=None)
+    parser.add_argument(
+        "--toy-dimensions",
+        type=str,
+        default=None,
+        help="Comma-separated active dimensions for synthetic toy systems, e.g. 1,2,3.",
+    )
     parser.add_argument("--auto-run-dir", dest="auto_run_dir", action="store_true", default=None)
     parser.add_argument("--no-auto-run-dir", dest="auto_run_dir", action="store_false")
     parser.add_argument("--overfit-one-system", dest="overfit_one_system", action="store_true", default=None)
@@ -304,6 +312,7 @@ def apply_overrides(config: ExperimentConfig, args: argparse.Namespace) -> Exper
         ("run_name", "run_name"),
         ("output_dir", "output_dir"),
         ("npz_glob", "npz_glob"),
+        ("toy_dimensions", "toy_dimensions"),
         ("auto_run_dir", "auto_run_dir"),
         ("overfit_one_system", "overfit_one_system"),
         ("overfit_system_index", "overfit_system_index"),

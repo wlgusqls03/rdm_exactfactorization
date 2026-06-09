@@ -58,7 +58,24 @@ def split_systems(systems: list[SystemRecord], config: ExperimentConfig) -> Data
 
     rng = np.random.default_rng(config.seed)
     indices = np.arange(len(systems))
-    rng.shuffle(indices)
+    if all(system.family == "toy_dimensional" for system in systems):
+        grouped: dict[int, list[int]] = {}
+        for index, system in enumerate(systems):
+            dimension = int(system.metadata.get("toy_dimension", 3))
+            grouped.setdefault(dimension, []).append(index)
+        for group_indices in grouped.values():
+            rng.shuffle(group_indices)
+        indices = np.asarray(
+            [
+                index
+                for offset in range(max(len(group) for group in grouped.values()))
+                for dimension in sorted(grouped)
+                for index in grouped[dimension][offset : offset + 1]
+            ],
+            dtype=np.int64,
+        )
+    else:
+        rng.shuffle(indices)
 
     exact_counts_requested = (
         config.train_system_count > 0
