@@ -1855,6 +1855,17 @@ def evaluate_systems(
     return averages
 
 
+def select_evaluation_systems(
+    systems: list[SystemRecord],
+    count: int,
+) -> list[SystemRecord]:
+    """Select a deterministic subset spanning the full split."""
+    if count <= 0 or count >= len(systems):
+        return systems
+    indices = np.linspace(0, len(systems) - 1, num=count, dtype=np.int64)
+    return [systems[int(index)] for index in indices]
+
+
 def epoch_loss_weights(config: ExperimentConfig, epoch: int) -> dict[str, float]:
     return {name: scheduled_loss_weight(config, name, epoch) for name in LOSS_NAMES}
 
@@ -2377,8 +2388,25 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
             ("active system tensor cache", config.active_system_tensor_cache_size),
             ("train diagonal points", "full" if config.train_diagonal_points <= 0 else config.train_diagonal_points),
             ("train stencil centers", "full" if config.train_stencil_centers <= 0 else config.train_stencil_centers),
+            ("validation every epochs", max(config.val_every, 1)),
+            ("eval pair samples/system", config.eval_pair_count),
             ("eval stencil centers", "full" if config.eval_stencil_centers <= 0 else config.eval_stencil_centers),
             ("full final eval", config.eval_full_final),
+            (
+                "periodic val systems",
+                "full" if config.val_eval_system_count <= 0 else config.val_eval_system_count,
+            ),
+            (
+                "final train/val/test systems",
+                " / ".join(
+                    "full" if count <= 0 else str(count)
+                    for count in (
+                        config.final_train_eval_system_count,
+                        config.final_val_eval_system_count,
+                        config.final_test_eval_system_count,
+                    )
+                ),
+            ),
             (
                 "stencil feature cache centers",
                 "disabled" if config.stencil_feature_cache_max_centers <= 0 else config.stencil_feature_cache_max_centers,
@@ -2552,7 +2580,11 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
 
         validation_ran = epoch % config.val_every == 0 or epoch == config.epochs - 1
         if validation_ran:
-            val_metrics = evaluate_systems(split.val_systems, models, config, epoch=epoch)
+            periodic_val_systems = select_evaluation_systems(
+                split.val_systems,
+                config.val_eval_system_count,
+            )
+            val_metrics = evaluate_systems(periodic_val_systems, models, config, epoch=epoch)
             val_objective = float(val_metrics["objective"])
             history.validation_ran[-1] = 1
             for key in VAL_HISTORY_KEYS:
@@ -2613,7 +2645,8 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
             if val_metrics:
                 print(
                     " " * 14
-                    + f"held-out stencil eval centers={val_metrics['stencil_eval_centers']:.0f}/"
+                    + f"held-out systems={len(val_metrics['per_system'])} "
+                    + f"stencil eval centers={val_metrics['stencil_eval_centers']:.0f}/"
                     + f"{val_metrics['stencil_eval_total_centers']:.0f} "
                     + f"sampled={bool(val_metrics['stencil_eval_sampled'])}"
                 )
@@ -2686,11 +2719,23 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
         models.pair_model.set_weights(best_weights["pair"])
         models.context_model.set_weights(best_weights["context"])
 
-    final_train = evaluate_systems(split.train_systems, models, config, epoch=last_epoch)
-    final_val = evaluate_systems(split.val_systems, models, config, epoch=last_epoch)
+    final_train_systems = select_evaluation_systems(
+        split.train_systems,
+        config.final_train_eval_system_count,
+    )
+    final_val_systems = select_evaluation_systems(
+        split.val_systems,
+        config.final_val_eval_system_count,
+    )
+    final_train = evaluate_systems(final_train_systems, models, config, epoch=last_epoch)
+    final_val = evaluate_systems(final_val_systems, models, config, epoch=last_epoch)
     summary = {"train": final_train, "val": final_val}
     if split.test_systems:
-        summary["test"] = evaluate_systems(split.test_systems, models, config, epoch=last_epoch)
+        final_test_systems = select_evaluation_systems(
+            split.test_systems,
+            config.final_test_eval_system_count,
+        )
+        summary["test"] = evaluate_systems(final_test_systems, models, config, epoch=last_epoch)
 
     rows = [
         ("train objective", f"{final_train['objective']:.6e}"),

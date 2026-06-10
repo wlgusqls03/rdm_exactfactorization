@@ -160,6 +160,25 @@ worker 수를 늘리면 압축 해제 시간은 줄지만 동시에 로딩 중�
 일시적인 RAM 사용량이 증가한다. 500-system corpus에서는 먼저 `4`, 여유가
 충분하면 `8`을 비교한다.
 
+큰 3D grid에서는 validation과 종료 summary도 오래 걸린다. 아래 설정은
+주기 validation을 고정된 10-system subset으로 제한하고, 종료 시 train은
+20개만 다시 평가하면서 val/test는 전체 50개를 유지한다.
+
+```bash
+RDM_VAL_EVAL_SYSTEM_COUNT=10 \
+RDM_FINAL_TRAIN_EVAL_SYSTEM_COUNT=20 \
+RDM_FINAL_VAL_EVAL_SYSTEM_COUNT=0 \
+RDM_FINAL_TEST_EVAL_SYSTEM_COUNT=0 \
+RDM_EVAL_PAIR_COUNT=8192 \
+RDM_EVAL_STENCIL_CENTERS=1024 \
+RDM_EVAL_FULL_FINAL=0 \
+python train_transferable_1rdm.py --dataset-mode npz ...
+```
+
+각 system-count 설정에서 `0`은 전체 split을 뜻한다. 빠른 sanity run에서는
+final val/test도 `10` 또는 `20`으로 제한할 수 있지만, 최종 비교 실험에서는
+val/test 전체 평가를 유지하는 편이 낫다.
+
 ## 파일 구조
 
 Point density pretrain은 기본적으로 scaled MSE, integrated relative L1,
