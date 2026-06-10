@@ -104,7 +104,7 @@ EVAL_OBJECTIVE_TERMS = (
     ("kinetic", "kinetic_loss"),
 )
 
-PHYSICS_TARGET_MODES = ("ao", "fd")
+PHYSICS_TARGET_MODES = ("orbital", "fd")
 _TRUE_GAMMA_STENCIL_TARGET_CACHE: dict[int, tuple[np.ndarray, np.ndarray]] = {}
 _PHYSICS_TAU_INTEGRAL_CACHE: dict[tuple[int, str], float] = {}
 _STENCIL_PAIR_FEATURE_CACHE: OrderedDict[tuple[int, int], np.ndarray] = OrderedDict()
@@ -770,7 +770,13 @@ def pretrain_point_model(
     return history, summary
 
 
-def kinetic_energy_reference(system: SystemRecord) -> float:
+def kinetic_energy_reference(
+    system: SystemRecord,
+    config: ExperimentConfig | None = None,
+) -> float:
+    if config is not None:
+        _, tau_target = physics_stencil_targets(system, config)
+        return float(np.sum(tau_target, dtype=np.float64) * system.cell_volume)
     kinetic_ref = float(system.metadata.get("kinetic_energy_hartree", np.nan))
     if np.isfinite(kinetic_ref):
         return kinetic_ref
@@ -802,6 +808,7 @@ def kinetic_energy_loss_from_tau(
     system: SystemRecord,
     tau_pred: tf.Tensor,
     *,
+    config: ExperimentConfig | None = None,
     integration_multiplier: float = 1.0,
     tau_target: tf.Tensor | None = None,
     target_integral: float | None = None,
@@ -816,7 +823,7 @@ def kinetic_energy_loss_from_tau(
         kinetic_pred = tf.cast(target_integral, tau_pred.dtype) + residual_integral
     else:
         kinetic_pred = tf.reduce_sum(tau_pred) * float(integration_multiplier) * system.cell_volume
-    kinetic_ref = kinetic_energy_reference(system)
+    kinetic_ref = kinetic_energy_reference(system, config)
     scale = max(abs(kinetic_ref), 1.0)
     loss = tf.square((kinetic_pred - kinetic_ref) / scale)
     return loss, kinetic_pred, kinetic_ref
@@ -1222,8 +1229,13 @@ def true_gamma_stencil_targets(system: SystemRecord) -> tuple[np.ndarray, np.nda
 
 def physics_target_mode(config: ExperimentConfig) -> str:
     mode = config.physics_target.strip().lower()
+    if mode == "ao":
+        mode = "orbital"
     if mode not in PHYSICS_TARGET_MODES:
-        raise ValueError(f"Unknown RDM_PHYSICS_TARGET: {config.physics_target!r}. Choose 'ao' or 'fd'.")
+        raise ValueError(
+            f"Unknown RDM_PHYSICS_TARGET: {config.physics_target!r}. "
+            "Choose 'orbital' (legacy alias: 'ao') or 'fd'."
+        )
     return mode
 
 
@@ -1553,8 +1565,8 @@ def evaluate_system(
         tau_true_fd = full_tau_true_fd
         derivative_target = full_derivative_target
         tau_target = full_tau_target
-        derivative_true_ao = system.derivative_true
-        tau_true_ao = system.tau_true
+        derivative_true_orbital = system.derivative_true
+        tau_true_orbital = system.tau_true
         stencil_integration_multiplier = 1.0
         stencil_eval_centers = total_stencil_centers
     else:
@@ -1562,24 +1574,24 @@ def evaluate_system(
         tau_true_fd = full_tau_true_fd[eval_center_indices]
         derivative_target = full_derivative_target[eval_center_indices]
         tau_target = full_tau_target[eval_center_indices]
-        derivative_true_ao = system.derivative_true[eval_center_indices]
-        tau_true_ao = system.tau_true[eval_center_indices]
+        derivative_true_orbital = system.derivative_true[eval_center_indices]
+        tau_true_orbital = system.tau_true[eval_center_indices]
         stencil_eval_centers = int(len(eval_center_indices))
         stencil_integration_multiplier = float(total_stencil_centers) / max(float(stencil_eval_centers), 1.0)
     deriv_raw_mse = float(np.mean((derivative_pred - derivative_target) ** 2))
     tau_raw_mse = float(np.mean((tau_pred - tau_target) ** 2))
-    deriv_pred_ao_raw_mse = float(np.mean((derivative_pred - derivative_true_ao) ** 2))
-    deriv_pred_ao_mae = float(np.mean(np.abs(derivative_pred - derivative_true_ao)))
-    deriv_fd_ao_raw_mse = float(np.mean((derivative_true_fd - derivative_true_ao) ** 2))
-    deriv_fd_ao_mae = float(np.mean(np.abs(derivative_true_fd - derivative_true_ao)))
-    deriv_fd_ao_rms_ratio = safe_rms_ratio(derivative_true_fd, derivative_true_ao)
+    deriv_pred_ao_raw_mse = float(np.mean((derivative_pred - derivative_true_orbital) ** 2))
+    deriv_pred_ao_mae = float(np.mean(np.abs(derivative_pred - derivative_true_orbital)))
+    deriv_fd_ao_raw_mse = float(np.mean((derivative_true_fd - derivative_true_orbital) ** 2))
+    deriv_fd_ao_mae = float(np.mean(np.abs(derivative_true_fd - derivative_true_orbital)))
+    deriv_fd_ao_rms_ratio = safe_rms_ratio(derivative_true_fd, derivative_true_orbital)
     deriv_pred_fd_raw_mse = float(np.mean((derivative_pred - derivative_true_fd) ** 2))
     deriv_pred_fd_mae = float(np.mean(np.abs(derivative_pred - derivative_true_fd)))
-    tau_pred_ao_raw_mse = float(np.mean((tau_pred - tau_true_ao) ** 2))
-    tau_pred_ao_mae = float(np.mean(np.abs(tau_pred - tau_true_ao)))
-    tau_fd_ao_raw_mse = float(np.mean((tau_true_fd - tau_true_ao) ** 2))
-    tau_fd_ao_mae = float(np.mean(np.abs(tau_true_fd - tau_true_ao)))
-    tau_fd_ao_rms_ratio = safe_rms_ratio(tau_true_fd, tau_true_ao)
+    tau_pred_ao_raw_mse = float(np.mean((tau_pred - tau_true_orbital) ** 2))
+    tau_pred_ao_mae = float(np.mean(np.abs(tau_pred - tau_true_orbital)))
+    tau_fd_ao_raw_mse = float(np.mean((tau_true_fd - tau_true_orbital) ** 2))
+    tau_fd_ao_mae = float(np.mean(np.abs(tau_true_fd - tau_true_orbital)))
+    tau_fd_ao_rms_ratio = safe_rms_ratio(tau_true_fd, tau_true_orbital)
     tau_pred_fd_raw_mse = float(np.mean((tau_pred - tau_true_fd) ** 2))
     tau_pred_fd_mae = float(np.mean(np.abs(tau_pred - tau_true_fd)))
     deriv_loss = float(
@@ -1608,6 +1620,7 @@ def evaluate_system(
     kinetic_loss_t, kinetic_pred_t, kinetic_ref = kinetic_energy_loss_from_tau(
         system,
         tau_pred_t,
+        config=config,
         integration_multiplier=stencil_integration_multiplier,
         tau_target=to_tensor(tau_target),
         target_integral=physics_tau_integral(system, config),
@@ -2166,6 +2179,7 @@ def compute_training_losses(
         kinetic_loss, _, _ = kinetic_energy_loss_from_tau(
             system,
             tau_pred,
+            config=config,
             integration_multiplier=kinetic_multiplier,
             tau_target=to_tensor(tau_target),
             target_integral=physics_tau_integral(system, config),
@@ -2285,9 +2299,9 @@ def print_gradient_diagnostics(
         ),
         ("kinetic control variate", config.kinetic_control_variate),
         (
-            "T reference stored/target/AO",
+            "T reference loss-target/physics-target/orbital",
             (
-                f"{kinetic_energy_reference(system):.6e} / "
+                f"{kinetic_energy_reference(system, config):.6e} / "
                 f"{physics_tau_integral(system, config):.6e} / "
                 f"{float(np.sum(system.tau_true, dtype=np.float64) * system.cell_volume):.6e}"
             ),
@@ -2373,7 +2387,7 @@ def print_gradient_diagnostics(
                 f"{np_rms(derivative_target):.6e} / {tensor_rms(derivative_pred):.6e}",
             ),
             (
-                "deriv RMS true-FD/target-AO",
+                "deriv RMS gamma-FD/orbital",
                 f"{np_rms(derivative_true_fd):.6e} / {np_rms(system.derivative_true):.6e}",
             ),
             (
@@ -2381,7 +2395,7 @@ def print_gradient_diagnostics(
                 f"{np_rms(tau_target):.6e} / {tensor_rms(tau_pred):.6e}",
             ),
             (
-                "tau RMS true-FD/target-AO",
+                "tau RMS gamma-FD/orbital",
                 f"{np_rms(tau_true_fd):.6e} / {np_rms(system.tau_true):.6e}",
             ),
         ]
@@ -2549,7 +2563,7 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
                     kinetic_multiplier = 1.0
                 stencil_left_t = tf.convert_to_tensor(stencil_left, dtype=tf.int64)
                 stencil_right_t = tf.convert_to_tensor(stencil_right, dtype=tf.int64)
-                kinetic_ref = kinetic_energy_reference(system)
+                kinetic_ref = kinetic_energy_reference(system, config)
 
                 loss_values = compiled_train_step(
                     tf.gather(system_t.local_features, left_idx_t),
@@ -2727,9 +2741,9 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
                 )
                 print(
                     " " * 14
-                    + f"held-out FD-vs-AO tau_mae={val_metrics['tau_fd_ao_mae']:.3e} "
+                    + f"held-out gamma-FD-vs-orbital tau_mae={val_metrics['tau_fd_ao_mae']:.3e} "
                     + f"pred-vs-FD tau_mae={val_metrics['tau_pred_fd_mae']:.3e} "
-                    + f"tau_fd/ao_rms={val_metrics['tau_fd_ao_rms_ratio']:.3e}"
+                    + f"tau_fd/orbital_rms={val_metrics['tau_fd_ao_rms_ratio']:.3e}"
                 )
                 print(
                     " " * 14
@@ -2805,9 +2819,9 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
         ("held-out E pred T/Vext/J/Exc/Enn", energy_component_summary(final_val, "pred")),
         ("held-out trace rel err", f"{final_val['trace_abs_rel_error']:.6e}"),
         ("held-out tau MAE", f"{final_val['tau_mae']:.6e}"),
-        ("held-out tau FD-vs-AO MAE", f"{final_val['tau_fd_ao_mae']:.6e}"),
+        ("held-out tau gamma-FD-vs-orbital MAE", f"{final_val['tau_fd_ao_mae']:.6e}"),
         ("held-out tau pred-vs-FD MAE", f"{final_val['tau_pred_fd_mae']:.6e}"),
-        ("held-out tau FD/AO RMS", f"{final_val['tau_fd_ao_rms_ratio']:.6e}"),
+        ("held-out tau gamma-FD/orbital RMS", f"{final_val['tau_fd_ao_rms_ratio']:.6e}"),
         ("held-out symmetry MAE", f"{final_val['symmetry_mae']:.6e}"),
         ("held-out kernel diag err", f"{final_val['kernel_diag_error']:.6e}"),
     ]
@@ -2827,7 +2841,7 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
                 ("test E ref T/Vext/J/Exc/Enn", energy_component_summary(final_test, "ref")),
                 ("test E pred T/Vext/J/Exc/Enn", energy_component_summary(final_test, "pred")),
                 ("test tau MAE", f"{final_test['tau_mae']:.6e}"),
-                ("test tau FD-vs-AO MAE", f"{final_test['tau_fd_ao_mae']:.6e}"),
+                ("test tau gamma-FD-vs-orbital MAE", f"{final_test['tau_fd_ao_mae']:.6e}"),
                 ("test tau pred-vs-FD MAE", f"{final_test['tau_pred_fd_mae']:.6e}"),
             ]
         )

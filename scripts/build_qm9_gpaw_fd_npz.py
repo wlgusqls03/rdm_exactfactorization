@@ -82,15 +82,16 @@ def parse_args() -> argparse.Namespace:
             "Use 0 to leave the environment unchanged."
         ),
     )
-    parser.add_argument("--tau-stencil", choices=["central2", "richardson"], default="richardson")
+    parser.add_argument("--tau-stencil", choices=["central2", "richardson"], default="central2")
     parser.add_argument(
         "--kinetic-reference",
-        choices=["gamma-stencil", "orbital-gradient"],
-        default="gamma-stencil",
+        choices=["orbital-interior", "orbital-full", "gamma-stencil"],
+        default="orbital-interior",
         help=(
-            "Reference stored in kinetic_energy_hartree. 'gamma-stencil' integrates the same "
-            "near-diagonal gamma stencil used by physics-target=fd; 'orbital-gradient' preserves "
-            "the legacy full-grid np.gradient reference."
+            "Reference stored in kinetic_energy_hartree. 'orbital-interior' is recommended with "
+            "--tau-stencil central2 because it uses the same derivative and interior domain as "
+            "the model. 'orbital-full' keeps the full-grid diagnostic integral. 'gamma-stencil' "
+            "integrates the selected gamma stencil."
         ),
     )
     parser.add_argument(
@@ -613,28 +614,58 @@ def run_gpaw(record: Qm9Record, args: argparse.Namespace) -> dict[str, object]:
         occupancies,
         args.grid_spacing_bohr,
     )
-    derivative_gamma_fd, tau_gamma_fd = prepare_stencil_targets_from_orbitals(
+    derivative_gamma_central2, tau_gamma_central2 = prepare_stencil_targets_from_orbitals(
         axis_points=axis_points,
         psi_occ=psi_matrix,
         occupancies=occupancies,
         step=args.grid_spacing_bohr,
-        tau_stencil=args.tau_stencil,
+        tau_stencil="central2",
     )
-    interior_idx = interior_indices(axis_points, args.tau_stencil)
-    interior_tau_orbital = tau_orbital_fd[interior_idx]
-    tau_consistency_mae = float(np.mean(np.abs(interior_tau_orbital - tau_gamma_fd)))
-    tau_consistency_rms_ratio = float(
-        np.sqrt(np.mean(tau_gamma_fd**2)) / max(np.sqrt(np.mean(interior_tau_orbital**2)), 1e-30)
+    derivative_gamma_richardson, tau_gamma_richardson = prepare_stencil_targets_from_orbitals(
+        axis_points=axis_points,
+        psi_occ=psi_matrix,
+        occupancies=occupancies,
+        step=args.grid_spacing_bohr,
+        tau_stencil="richardson",
+    )
+    central2_interior_idx = interior_indices(axis_points, "central2")
+    richardson_interior_idx = interior_indices(axis_points, "richardson")
+    tau_orbital_central2_interior = tau_orbital_fd[central2_interior_idx]
+    tau_orbital_richardson_interior = tau_orbital_fd[richardson_interior_idx]
+    tau_central2_consistency_mae = float(
+        np.mean(np.abs(tau_orbital_central2_interior - tau_gamma_central2))
+    )
+    tau_richardson_consistency_mae = float(
+        np.mean(np.abs(tau_orbital_richardson_interior - tau_gamma_richardson))
+    )
+    tau_central2_consistency_rms_ratio = float(
+        np.sqrt(np.mean(tau_gamma_central2**2))
+        / max(np.sqrt(np.mean(tau_orbital_central2_interior**2)), 1e-30)
+    )
+    tau_richardson_consistency_rms_ratio = float(
+        np.sqrt(np.mean(tau_gamma_richardson**2))
+        / max(np.sqrt(np.mean(tau_orbital_richardson_interior**2)), 1e-30)
     )
     kinetic_energy_orbital_fd = float(np.sum(tau_orbital_fd, dtype=np.float64) * args.grid_spacing_bohr**3)
-    kinetic_energy_gamma_stencil = float(
-        np.sum(tau_gamma_fd, dtype=np.float64) * args.grid_spacing_bohr**3
+    kinetic_energy_orbital_central2_interior = float(
+        np.sum(tau_orbital_central2_interior, dtype=np.float64) * args.grid_spacing_bohr**3
     )
-    kinetic_energy = (
-        kinetic_energy_gamma_stencil
-        if args.kinetic_reference == "gamma-stencil"
-        else kinetic_energy_orbital_fd
+    kinetic_energy_gamma_central2 = float(
+        np.sum(tau_gamma_central2, dtype=np.float64) * args.grid_spacing_bohr**3
     )
+    kinetic_energy_gamma_richardson = float(
+        np.sum(tau_gamma_richardson, dtype=np.float64) * args.grid_spacing_bohr**3
+    )
+    selected_gamma_energy = (
+        kinetic_energy_gamma_central2
+        if args.tau_stencil == "central2"
+        else kinetic_energy_gamma_richardson
+    )
+    kinetic_energy = {
+        "orbital-interior": kinetic_energy_orbital_central2_interior,
+        "orbital-full": kinetic_energy_orbital_fd,
+        "gamma-stencil": selected_gamma_energy,
+    }[args.kinetic_reference]
 
     atomic_numbers = np.asarray([ELEMENT_Z[symbol] for symbol in record.symbols], dtype=np.float64)
     potential, grad = nuclear_potential_and_grad(points_bohr, coords_bohr_centered, atomic_numbers)
@@ -666,17 +697,23 @@ def run_gpaw(record: Qm9Record, args: argparse.Namespace) -> dict[str, object]:
         "psi_occ": psi_matrix.astype(np.float32),
         "derivative_orbital_fd": derivative_orbital_fd,
         "tau_orbital_fd": tau_orbital_fd,
-        "derivative_gamma_fd_interior": derivative_gamma_fd.astype(np.float32),
-        "tau_gamma_fd_interior": tau_gamma_fd.astype(np.float32),
+        "derivative_gamma_central2_interior": derivative_gamma_central2.astype(np.float32),
+        "tau_gamma_central2_interior": tau_gamma_central2.astype(np.float32),
+        "derivative_gamma_richardson_interior": derivative_gamma_richardson.astype(np.float32),
+        "tau_gamma_richardson_interior": tau_gamma_richardson.astype(np.float32),
         "occupancies": occupancies.astype(np.float32),
         "orbital_energies": (eigenvalues_ev / 27.211386245988).astype(np.float32),
         "electron_count": electron_count,
         "total_energy_hartree": energy_ev / 27.211386245988,
         "kinetic_energy_hartree": kinetic_energy,
         "kinetic_energy_orbital_fd_hartree": kinetic_energy_orbital_fd,
-        "kinetic_energy_gamma_stencil_hartree": kinetic_energy_gamma_stencil,
-        "tau_consistency_mae": tau_consistency_mae,
-        "tau_consistency_rms_ratio": tau_consistency_rms_ratio,
+        "kinetic_energy_orbital_central2_interior_hartree": kinetic_energy_orbital_central2_interior,
+        "kinetic_energy_gamma_central2_interior_hartree": kinetic_energy_gamma_central2,
+        "kinetic_energy_gamma_richardson_interior_hartree": kinetic_energy_gamma_richardson,
+        "tau_central2_consistency_mae": tau_central2_consistency_mae,
+        "tau_richardson_consistency_mae": tau_richardson_consistency_mae,
+        "tau_central2_consistency_rms_ratio": tau_central2_consistency_rms_ratio,
+        "tau_richardson_consistency_rms_ratio": tau_richardson_consistency_rms_ratio,
     }
 
 
@@ -691,13 +728,39 @@ def write_npz(record: Qm9Record, args: argparse.Namespace, output_path: Path) ->
         gamma_matrix=np.asarray(result["gamma_matrix"], dtype=np.float32),
         rho_diag=np.asarray(result["rho_diag"], dtype=np.float32),
         psi_occ=np.asarray(result["psi_occ"], dtype=np.float32),
-        # Legacy training-loader names. In this dataset these are FD orbital-gradient references.
+        derivative_orbital_gradient=np.asarray(result["derivative_orbital_fd"], dtype=np.float32),
+        tau_orbital_gradient=np.asarray(result["tau_orbital_fd"], dtype=np.float32),
+        derivative_gamma_central2_interior=np.asarray(
+            result["derivative_gamma_central2_interior"], dtype=np.float32
+        ),
+        tau_gamma_central2_interior=np.asarray(result["tau_gamma_central2_interior"], dtype=np.float32),
+        derivative_gamma_richardson_interior=np.asarray(
+            result["derivative_gamma_richardson_interior"], dtype=np.float32
+        ),
+        tau_gamma_richardson_interior=np.asarray(
+            result["tau_gamma_richardson_interior"], dtype=np.float32
+        ),
+        # Backward-compatible aliases for existing loaders.
         derivative_true_ao=np.asarray(result["derivative_orbital_fd"], dtype=np.float32),
         tau_true_ao=np.asarray(result["tau_orbital_fd"], dtype=np.float32),
         derivative_true_fd_orbital=np.asarray(result["derivative_orbital_fd"], dtype=np.float32),
         tau_true_fd_orbital=np.asarray(result["tau_orbital_fd"], dtype=np.float32),
-        derivative_true_fd_gamma=np.asarray(result["derivative_gamma_fd_interior"], dtype=np.float32),
-        tau_true_fd_gamma=np.asarray(result["tau_gamma_fd_interior"], dtype=np.float32),
+        derivative_true_fd_gamma=np.asarray(
+            result[
+                "derivative_gamma_central2_interior"
+                if args.tau_stencil == "central2"
+                else "derivative_gamma_richardson_interior"
+            ],
+            dtype=np.float32,
+        ),
+        tau_true_fd_gamma=np.asarray(
+            result[
+                "tau_gamma_central2_interior"
+                if args.tau_stencil == "central2"
+                else "tau_gamma_richardson_interior"
+            ],
+            dtype=np.float32,
+        ),
         local_features=np.asarray(result["local_features"], dtype=np.float32),
         global_context=np.asarray(result["global_context"], dtype=np.float32),
         potential=np.asarray(result["potential"], dtype=np.float32),
@@ -721,20 +784,55 @@ def write_npz(record: Qm9Record, args: argparse.Namespace, output_path: Path) ->
         kinetic_energy_orbital_fd_hartree=np.asarray(
             result["kinetic_energy_orbital_fd_hartree"], dtype=np.float32
         ),
-        kinetic_energy_gamma_stencil_hartree=np.asarray(
-            result["kinetic_energy_gamma_stencil_hartree"], dtype=np.float32
+        kinetic_energy_orbital_central2_interior_hartree=np.asarray(
+            result["kinetic_energy_orbital_central2_interior_hartree"], dtype=np.float32
+        ),
+        kinetic_energy_gamma_central2_interior_hartree=np.asarray(
+            result["kinetic_energy_gamma_central2_interior_hartree"], dtype=np.float32
+        ),
+        kinetic_energy_gamma_richardson_interior_hartree=np.asarray(
+            result["kinetic_energy_gamma_richardson_interior_hartree"], dtype=np.float32
         ),
         kinetic_reference=np.asarray(args.kinetic_reference),
         total_energy_hartree=np.asarray(result["total_energy_hartree"], dtype=np.float32),
+        reference_schema=np.asarray("gpaw_fd_orbital_v2"),
+        tau_reference_primary=np.asarray("orbital_gradient_central2"),
         tau_reference=np.asarray("gpaw_fd_orbital_gradient"),
         gamma_reference=np.asarray("gpaw_fd_pseudo_wavefunctions"),
         reference_backend=np.asarray("gpaw_fd_pseudopotential"),
+        gpaw_mode=np.asarray("FD"),
         gpaw_xc=np.asarray(args.xc),
         gpaw_setups=np.asarray(args.setups if args.setups else "default"),
         gpaw_fd_order=np.asarray(args.fd_order, dtype=np.int32),
-        tau_fd_orbital_vs_gamma_mae=np.asarray(result["tau_consistency_mae"], dtype=np.float32),
-        tau_fd_gamma_over_orbital_rms=np.asarray(result["tau_consistency_rms_ratio"], dtype=np.float32),
-        local_feature_schema=np.asarray("gpaw_fd_legacy_lapv_v1"),
+        tau_orbital_vs_gamma_central2_mae=np.asarray(
+            result["tau_central2_consistency_mae"], dtype=np.float32
+        ),
+        tau_orbital_vs_gamma_richardson_mae=np.asarray(
+            result["tau_richardson_consistency_mae"], dtype=np.float32
+        ),
+        tau_gamma_central2_over_orbital_rms=np.asarray(
+            result["tau_central2_consistency_rms_ratio"], dtype=np.float32
+        ),
+        tau_gamma_richardson_over_orbital_rms=np.asarray(
+            result["tau_richardson_consistency_rms_ratio"], dtype=np.float32
+        ),
+        tau_fd_orbital_vs_gamma_mae=np.asarray(
+            result[
+                "tau_central2_consistency_mae"
+                if args.tau_stencil == "central2"
+                else "tau_richardson_consistency_mae"
+            ],
+            dtype=np.float32,
+        ),
+        tau_fd_gamma_over_orbital_rms=np.asarray(
+            result[
+                "tau_central2_consistency_rms_ratio"
+                if args.tau_stencil == "central2"
+                else "tau_richardson_consistency_rms_ratio"
+            ],
+            dtype=np.float32,
+        ),
+        local_feature_schema=np.asarray("gpaw_fd_lapv_v2"),
     )
     return {
         "system_id": output_path.stem,
@@ -745,10 +843,32 @@ def write_npz(record: Qm9Record, args: argparse.Namespace, output_path: Path) ->
         "total_energy_hartree": float(result["total_energy_hartree"]),
         "kinetic_energy_hartree": float(result["kinetic_energy_hartree"]),
         "kinetic_energy_orbital_fd_hartree": float(result["kinetic_energy_orbital_fd_hartree"]),
-        "kinetic_energy_gamma_stencil_hartree": float(result["kinetic_energy_gamma_stencil_hartree"]),
+        "kinetic_energy_orbital_central2_interior_hartree": float(
+            result["kinetic_energy_orbital_central2_interior_hartree"]
+        ),
+        "kinetic_energy_gamma_central2_interior_hartree": float(
+            result["kinetic_energy_gamma_central2_interior_hartree"]
+        ),
+        "kinetic_energy_gamma_richardson_interior_hartree": float(
+            result["kinetic_energy_gamma_richardson_interior_hartree"]
+        ),
         "kinetic_reference": args.kinetic_reference,
-        "tau_fd_orbital_vs_gamma_mae": float(result["tau_consistency_mae"]),
-        "tau_fd_gamma_over_orbital_rms": float(result["tau_consistency_rms_ratio"]),
+        "tau_orbital_vs_gamma_central2_mae": float(result["tau_central2_consistency_mae"]),
+        "tau_orbital_vs_gamma_richardson_mae": float(result["tau_richardson_consistency_mae"]),
+        "tau_fd_orbital_vs_gamma_mae": float(
+            result[
+                "tau_central2_consistency_mae"
+                if args.tau_stencil == "central2"
+                else "tau_richardson_consistency_mae"
+            ]
+        ),
+        "tau_fd_gamma_over_orbital_rms": float(
+            result[
+                "tau_central2_consistency_rms_ratio"
+                if args.tau_stencil == "central2"
+                else "tau_richardson_consistency_rms_ratio"
+            ]
+        ),
         "axis_points": axis_points,
         "grid_spacing_bohr": float(args.grid_spacing_bohr),
         "box_length_bohr": (axis_points + 1) * float(args.grid_spacing_bohr),
@@ -777,8 +897,12 @@ def write_indices(output_dir: Path, manifest: list[dict[str, object]]) -> None:
         "grid_spacing_bohr",
         "kinetic_energy_hartree",
         "kinetic_energy_orbital_fd_hartree",
-        "kinetic_energy_gamma_stencil_hartree",
+        "kinetic_energy_orbital_central2_interior_hartree",
+        "kinetic_energy_gamma_central2_interior_hartree",
+        "kinetic_energy_gamma_richardson_interior_hartree",
         "kinetic_reference",
+        "tau_orbital_vs_gamma_central2_mae",
+        "tau_orbital_vs_gamma_richardson_mae",
         "tau_fd_orbital_vs_gamma_mae",
         "tau_fd_gamma_over_orbital_rms",
         "npz_file",
@@ -814,6 +938,11 @@ def select_records(args: argparse.Namespace) -> list[Qm9Record]:
 
 def main() -> None:
     args = parse_args()
+    if args.kinetic_reference == "orbital-interior" and args.tau_stencil != "central2":
+        raise ValueError(
+            "--kinetic-reference orbital-interior requires --tau-stencil central2. "
+            "Use gamma-stencil for a Richardson primary target."
+        )
     configure_cpu_threads(args.cpu_threads)
     records = select_records(args)
     if len(records) < args.num_systems:
@@ -855,10 +984,37 @@ def main() -> None:
                     "kinetic_energy_orbital_fd_hartree": float(
                         payload.get("kinetic_energy_orbital_fd_hartree", payload["kinetic_energy_hartree"])
                     ),
-                    "kinetic_energy_gamma_stencil_hartree": float(
-                        payload.get("kinetic_energy_gamma_stencil_hartree", payload["kinetic_energy_hartree"])
+                    "kinetic_energy_orbital_central2_interior_hartree": float(
+                        payload.get(
+                            "kinetic_energy_orbital_central2_interior_hartree",
+                            payload["kinetic_energy_hartree"],
+                        )
+                    ),
+                    "kinetic_energy_gamma_central2_interior_hartree": float(
+                        payload.get(
+                            "kinetic_energy_gamma_central2_interior_hartree",
+                            payload["kinetic_energy_hartree"],
+                        )
+                    ),
+                    "kinetic_energy_gamma_richardson_interior_hartree": float(
+                        payload.get(
+                            "kinetic_energy_gamma_richardson_interior_hartree",
+                            payload["kinetic_energy_hartree"],
+                        )
                     ),
                     "kinetic_reference": str(np.asarray(payload.get("kinetic_reference", "legacy")).item()),
+                    "tau_orbital_vs_gamma_central2_mae": float(
+                        payload.get(
+                            "tau_orbital_vs_gamma_central2_mae",
+                            payload["tau_fd_orbital_vs_gamma_mae"],
+                        )
+                    ),
+                    "tau_orbital_vs_gamma_richardson_mae": float(
+                        payload.get(
+                            "tau_orbital_vs_gamma_richardson_mae",
+                            payload["tau_fd_orbital_vs_gamma_mae"],
+                        )
+                    ),
                     "tau_fd_orbital_vs_gamma_mae": float(payload["tau_fd_orbital_vs_gamma_mae"]),
                     "tau_fd_gamma_over_orbital_rms": float(payload["tau_fd_gamma_over_orbital_rms"]),
                 }
@@ -874,8 +1030,12 @@ def main() -> None:
                 "grid_spacing_bohr": float(args.grid_spacing_bohr),
                 "kinetic_energy_hartree": float("nan"),
                 "kinetic_energy_orbital_fd_hartree": float("nan"),
-                "kinetic_energy_gamma_stencil_hartree": float("nan"),
+                "kinetic_energy_orbital_central2_interior_hartree": float("nan"),
+                "kinetic_energy_gamma_central2_interior_hartree": float("nan"),
+                "kinetic_energy_gamma_richardson_interior_hartree": float("nan"),
                 "kinetic_reference": args.kinetic_reference,
+                "tau_orbital_vs_gamma_central2_mae": float("nan"),
+                "tau_orbital_vs_gamma_richardson_mae": float("nan"),
                 "tau_fd_orbital_vs_gamma_mae": float("nan"),
                 "tau_fd_gamma_over_orbital_rms": float("nan"),
             }

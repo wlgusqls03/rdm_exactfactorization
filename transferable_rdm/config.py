@@ -124,7 +124,7 @@ class ExperimentConfig:
     overfit_one_system: bool = env_flag("RDM_OVERFIT_ONE_SYSTEM", False)
     overfit_system_index: int = int(os.environ.get("RDM_OVERFIT_SYSTEM_INDEX", 0))
     overfit_system_id: str = os.environ.get("RDM_OVERFIT_SYSTEM_ID", "")
-    physics_target: str = os.environ.get("RDM_PHYSICS_TARGET", "ao")
+    physics_target: str = os.environ.get("RDM_PHYSICS_TARGET", "orbital")
 
     initial_lr: float = env_float_any(("RDM_LEARNING_RATE", "RDM_INITIAL_LR", "RDM_LR"), 3e-4)
     min_lr: float = float(os.environ.get("RDM_MIN_LR", 1e-5))

@@ -200,21 +200,19 @@ by default:
 - `occupancies`;
 - on-the-fly `gamma_ij = sum_n f_n psi_n(r_i) psi_n(r_j)`;
 - `rho_diag = diag(gamma_matrix)`;
-- `tau_true_fd_orbital = 1/2 sum_n f_n |grad_h psi_n|^2`;
-- `tau_true_fd_gamma`, the same-grid near-diagonal curvature diagnostic from
-  `gamma_matrix`;
-- `kinetic_energy_gamma_stencil_hartree`, the integral of that exact gamma
-  stencil target;
-- `kinetic_energy_orbital_fd_hartree`, the legacy full-grid orbital-gradient
-  integral;
-- loader-compatible `tau_true_ao` and `derivative_true_ao` aliases, which in
-  this dataset are FD orbital-gradient references rather than AO-gradient
-  references.
+- `tau_orbital_gradient` and `derivative_orbital_gradient`;
+- central2 and Richardson gamma-stencil targets stored under explicit
+  `tau_gamma_*` and `derivative_gamma_*` names;
+- full-grid orbital, central2-interior orbital, central2 gamma, and Richardson
+  gamma kinetic integrals under separate keys;
+- loader-compatible `tau_true_ao` and `derivative_true_ao` aliases only for
+  legacy readers.
 
-By default `kinetic_energy_hartree` selects the gamma-stencil integral so
-`--physics-target fd`, tau loss, and kinetic loss optimize one discrete
-definition. Use `--kinetic-reference orbital-gradient` only for a legacy
-comparison.
+The v2 schema is named `gpaw_fd_orbital_v2`. The recommended primary training
+configuration is `--tau-stencil central2 --kinetic-reference orbital-interior`
+with `--physics-target orbital`. This uses the same central difference and
+interior domain for local tau and integrated kinetic loss. Full-grid orbital
+and Richardson quantities remain diagnostics.
 
 The dense `gamma_matrix` is not stored unless `--store-full-gamma` is passed.
 This is required for fine grids such as `0.4` or `0.3` bohr, where dense gamma
@@ -258,7 +256,8 @@ python scripts/build_qm9_gpaw_fd_npz.py \
   --grid-spacing-bohr 0.4 \
   --padding-bohr 4.0 \
   --max-axis-points 55 \
-  --kinetic-reference gamma-stencil \
+  --tau-stencil central2 \
+  --kinetic-reference orbital-interior \
   --xc LDA
 ```
 

@@ -905,7 +905,10 @@ def finalize_system_record(
         derivative_true = np.zeros((len(interior_idx), 3), dtype=np.float32)
         tau_true = np.zeros((len(interior_idx), 1), dtype=np.float32)
     else:
-        raise ValueError("Lazy gamma loading requires stored derivative_true_ao and tau_true_ao grids.")
+        raise ValueError(
+            "Lazy gamma loading requires stored orbital-gradient derivative and tau grids "
+            "(legacy keys derivative_true_ao/tau_true_ao are also accepted)."
+        )
     if derivative_true_grid is not None:
         derivative_grid = np.asarray(derivative_true_grid, dtype=np.float32)
         if derivative_grid.shape != (n_points, 3):
@@ -1204,20 +1207,45 @@ def load_npz_system(path: str | Path, config: ExperimentConfig) -> SystemRecord:
             if "atom_coords_bohr" in payload
             else np.empty((0, 3), dtype=np.float32)
         )
+        orbital_derivative_key = (
+            "derivative_orbital_gradient"
+            if "derivative_orbital_gradient" in payload
+            else "derivative_true_ao"
+        )
+        orbital_tau_key = "tau_orbital_gradient" if "tau_orbital_gradient" in payload else "tau_true_ao"
         derivative_true_grid = (
-            np.asarray(payload["derivative_true_ao"], dtype=np.float32)
-            if "derivative_true_ao" in payload
+            np.asarray(payload[orbital_derivative_key], dtype=np.float32)
+            if orbital_derivative_key in payload
             else None
         )
-        tau_true_grid = np.asarray(payload["tau_true_ao"], dtype=np.float32) if "tau_true_ao" in payload else None
+        tau_true_grid = (
+            np.asarray(payload[orbital_tau_key], dtype=np.float32)
+            if orbital_tau_key in payload
+            else None
+        )
+        gamma_stencil = str(config.tau_stencil).strip().lower()
+        gamma_derivative_key = (
+            "derivative_gamma_central2_interior"
+            if gamma_stencil in {"central2", "second", "second_order", "legacy"}
+            else "derivative_gamma_richardson_interior"
+        )
+        gamma_tau_key = (
+            "tau_gamma_central2_interior"
+            if gamma_stencil in {"central2", "second", "second_order", "legacy"}
+            else "tau_gamma_richardson_interior"
+        )
+        if gamma_derivative_key not in payload:
+            gamma_derivative_key = "derivative_true_fd_gamma"
+        if gamma_tau_key not in payload:
+            gamma_tau_key = "tau_true_fd_gamma"
         derivative_true_fd = (
-            np.asarray(payload["derivative_true_fd_gamma"], dtype=np.float32)
-            if "derivative_true_fd_gamma" in payload
+            np.asarray(payload[gamma_derivative_key], dtype=np.float32)
+            if gamma_derivative_key in payload
             else None
         )
         tau_true_fd = (
-            np.asarray(payload["tau_true_fd_gamma"], dtype=np.float32)
-            if "tau_true_fd_gamma" in payload
+            np.asarray(payload[gamma_tau_key], dtype=np.float32)
+            if gamma_tau_key in payload
             else None
         )
         electron_count_from_payload = float(payload["electron_count"]) if "electron_count" in payload else None
@@ -1277,17 +1305,32 @@ def load_npz_system(path: str | Path, config: ExperimentConfig) -> SystemRecord:
             "kinetic_energy_orbital_fd_hartree": float(
                 scalar_payload(payload, "kinetic_energy_orbital_fd_hartree", np.nan)
             ),
+            "kinetic_energy_orbital_central2_interior_hartree": float(
+                scalar_payload(payload, "kinetic_energy_orbital_central2_interior_hartree", np.nan)
+            ),
             "kinetic_energy_gamma_stencil_hartree": float(
                 scalar_payload(payload, "kinetic_energy_gamma_stencil_hartree", np.nan)
             ),
+            "kinetic_energy_gamma_central2_interior_hartree": float(
+                scalar_payload(payload, "kinetic_energy_gamma_central2_interior_hartree", np.nan)
+            ),
+            "kinetic_energy_gamma_richardson_interior_hartree": float(
+                scalar_payload(payload, "kinetic_energy_gamma_richardson_interior_hartree", np.nan)
+            ),
             "kinetic_reference": scalar_payload(payload, "kinetic_reference", "legacy"),
+            "reference_schema": scalar_payload(payload, "reference_schema", "legacy"),
             "chemical_potential_hartree": float(scalar_payload(payload, "chemical_potential_hartree", np.nan)),
             "kinetic_potential_center": float(scalar_payload(payload, "kinetic_potential_center", np.nan)),
             "kinetic_potential_reference": scalar_payload(payload, "kinetic_potential_reference", "not_computed"),
             "tau_reference": scalar_payload(
                 payload,
                 "tau_reference",
-                "ao_gradient" if tau_true_grid is not None else f"finite_difference_{config.tau_stencil}",
+                "orbital_gradient" if tau_true_grid is not None else f"finite_difference_{config.tau_stencil}",
+            ),
+            "tau_reference_primary": scalar_payload(
+                payload,
+                "tau_reference_primary",
+                "orbital_gradient" if tau_true_grid is not None else f"finite_difference_{config.tau_stencil}",
             ),
             "gamma_reference": scalar_payload(payload, "gamma_reference", ""),
             "reference_backend": scalar_payload(payload, "reference_backend", ""),

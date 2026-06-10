@@ -217,7 +217,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-symmetrize-kernel-output", dest="symmetrize_kernel_output", action="store_false")
     parser.add_argument("--local-curvature-form", choices=["quadratic", "legacy"], default=None)
     parser.add_argument("--local-curvature-init-bias", type=float, default=None)
-    parser.add_argument("--physics-target", choices=["ao", "fd"], default=None)
+    parser.add_argument(
+        "--physics-target",
+        choices=["orbital", "ao", "fd"],
+        default=None,
+        help="'orbital' is the preferred name; legacy 'ao' is an exact alias.",
+    )
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--npz-glob", type=str, default=None)
