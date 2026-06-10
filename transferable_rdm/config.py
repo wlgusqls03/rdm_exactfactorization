@@ -72,6 +72,7 @@ class ExperimentConfig:
     rff_scale: float = float(os.environ.get("RDM_RFF_SCALE", 2.0))
     occ_max: float = float(os.environ.get("RDM_OCC_MAX", 1.0))
     normalize_rho: bool = env_flag("RDM_NORMALIZE_RHO", True)
+    density_source: str = os.environ.get("RDM_DENSITY_SOURCE", "predicted")
     tau_stencil: str = os.environ.get("RDM_TAU_STENCIL", "richardson")
     pair_density_feature_mode: str = os.environ.get("RDM_PAIR_DENSITY_FEATURE_MODE", "off")
     pair_density_symmetric: bool = env_flag("RDM_PAIR_DENSITY_SYMMETRIC", True)

@@ -10,6 +10,7 @@ from .systems import SystemRecord
 
 PAIR_DENSITY_FEATURE_MODES = ("off", "rho-derivatives", "fukui")
 DENSITY_BASELINE_MODES = ("learned", "sad-multiplicative")
+DENSITY_SOURCES = ("predicted", "true")
 
 
 @dataclass
@@ -49,6 +50,16 @@ def pair_density_feature_mode(config: ExperimentConfig) -> str:
 
 def density_head_count(config: ExperimentConfig) -> int:
     return 3 if pair_density_feature_mode(config) == "fukui" else 1
+
+
+def density_source_mode(config: ExperimentConfig) -> str:
+    mode = config.density_source.strip().lower()
+    if mode not in DENSITY_SOURCES:
+        raise ValueError(
+            f"Unknown density source: {config.density_source!r}. "
+            f"Choose one of: {', '.join(DENSITY_SOURCES)}."
+        )
+    return mode
 
 
 def pair_density_feature_dim(config: ExperimentConfig) -> int:
@@ -219,6 +230,44 @@ def build_density_feature_state(
             for name, values, grad, lap, hess_diag in fields
         ]
     return DensityFeatureState(neutral, cation, anion, tuple(fields))
+
+
+def build_true_density_feature_state(
+    system: SystemRecord,
+    config: ExperimentConfig,
+) -> DensityFeatureState:
+    """Build oracle density inputs from the stored reference density."""
+    neutral = tf.convert_to_tensor(system.rho_diag, dtype=tf.float32)
+    mode = pair_density_feature_mode(config)
+    cation = None
+    anion = None
+    fields: list[tuple[str, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]] = []
+    if mode != "off":
+        fields.append(normalized_descriptor_field(system, "rho_neutral", neutral, config))
+    if mode == "fukui":
+        if system.rho_cation is None or system.rho_anion is None:
+            raise ValueError(
+                f"True-density Fukui mode requires cation and anion densities for {system.system_id}."
+            )
+        cation = tf.convert_to_tensor(system.rho_cation, dtype=tf.float32)
+        anion = tf.convert_to_tensor(system.rho_anion, dtype=tf.float32)
+        fields.append(normalized_descriptor_field(system, "fukui_plus", anion - neutral, config))
+        fields.append(normalized_descriptor_field(system, "fukui_minus", neutral - cation, config))
+    return DensityFeatureState(
+        tf.stop_gradient(neutral),
+        tf.stop_gradient(cation) if cation is not None else None,
+        tf.stop_gradient(anion) if anion is not None else None,
+        tuple(
+            (
+                name,
+                tf.stop_gradient(values),
+                tf.stop_gradient(grad),
+                tf.stop_gradient(lap),
+                tf.stop_gradient(hess_diag),
+            )
+            for name, values, grad, lap, hess_diag in fields
+        ),
+    )
 
 
 def signed_log_scaled(values: tf.Tensor, clip: float) -> tf.Tensor:

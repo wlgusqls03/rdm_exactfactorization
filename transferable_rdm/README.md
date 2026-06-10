@@ -19,6 +19,21 @@
 python train_transferable_1rdm.py
 ```
 
+Reference density를 직접 넣어 density bottleneck을 제거하는 oracle 실험:
+
+```bash
+RDM_DENSITY_SOURCE=true \
+python train_transferable_1rdm.py \
+  --density-source true \
+  --pair-density-feature-mode rho-derivatives \
+  --pair-density-hessian
+```
+
+이 모드에서는 point-density pretrain을 건너뛰고 stored `rho_diag`와 동일한
+finite-difference gradient/Laplacian/Hessian descriptor를 pair 및 stencil
+예측에 사용한다. 따라서 density MAE는 0이어야 하며, 남는 gamma/tau/T 오차는
+kernel 및 physics 학습 경로의 한계를 나타낸다. 기본값은 `predicted`다.
+
 빠른 smoke test:
 
 ```bash

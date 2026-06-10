@@ -10,10 +10,12 @@ from .config import ExperimentConfig
 from .density_features import (
     DensityFeatureState,
     build_density_feature_state,
+    build_true_density_feature_state,
     cache_frozen_density_state,
     cached_frozen_density_state,
     clear_frozen_density_state_cache,
     density_baseline_mode,
+    density_source_mode,
     normalized_density_head,
     pair_density_features,
     pair_density_feature_mode,
@@ -205,6 +207,12 @@ def point_output_and_state(
     models: ModelBundle,
     config: ExperimentConfig,
 ) -> tuple[tf.Tensor, DensityFeatureState]:
+    if density_source_mode(config) == "true":
+        cached = cached_frozen_density_state(system)
+        if cached is None:
+            cached = build_true_density_feature_state(system, config)
+            cache_frozen_density_state(system, cached)
+        return tf.zeros((0, 0), dtype=tf.float32), cached
     if config.freeze_point_after_pretrain:
         cached = cached_frozen_density_state(system)
         if cached is not None:
@@ -219,6 +227,25 @@ def point_density_predictions(
     models: ModelBundle,
     config: ExperimentConfig,
 ) -> dict[str, tf.Tensor]:
+    if density_source_mode(config) == "true":
+        state = build_true_density_feature_state(system, config)
+        predictions = {
+            "delta_raw": tf.zeros(
+                (len(system.points), 3 if pair_density_feature_mode(config) == "fukui" else 1),
+                dtype=tf.float32,
+            ),
+            "rho_neutral": state.rho_neutral,
+        }
+        if pair_density_feature_mode(config) == "fukui":
+            predictions.update(
+                {
+                    "rho_cation": state.rho_cation,
+                    "rho_anion": state.rho_anion,
+                    "fukui_plus": state.rho_anion - state.rho_neutral,
+                    "fukui_minus": state.rho_neutral - state.rho_cation,
+                }
+            )
+        return predictions
     point_out = point_model_outputs(system, models)
     predictions = {
         "delta_raw": point_out,
@@ -540,6 +567,27 @@ def pretrain_point_model(
     models: ModelBundle,
 ) -> tuple[PointPretrainHistory, dict[str, object]]:
     """Fit density heads first, restore the best validation weights, then freeze them."""
+    if density_source_mode(config) == "true":
+        history = PointPretrainHistory()
+        models.point_model.trainable = False
+        clear_frozen_density_state_cache()
+        summary = {
+            "train": evaluate_point_model(split.train_systems, models, config),
+            "val": evaluate_point_model(split.val_systems, models, config, keep_arrays=True),
+        }
+        if split.test_systems:
+            summary["test"] = evaluate_point_model(split.test_systems, models, config)
+        print_block(
+            "Point density pretrain",
+            [
+                ("density source", "true (oracle)"),
+                ("pretraining", "skipped"),
+                ("val rho_N MAE", f"{summary['val']['rho_neutral_mae']:.6e}"),
+                ("val rho_N relative L1", f"{summary['val']['rho_neutral_rel_l1']:.6e}"),
+                ("point trainable in pair stage", models.point_model.trainable),
+            ],
+        )
+        return history, summary
     optimizer = tf.keras.optimizers.Adam(learning_rate=config.point_pretrain_lr)
     history = PointPretrainHistory()
     rng = np.random.default_rng(config.seed + 71)
@@ -1268,7 +1316,8 @@ def trainable_variables(models: ModelBundle) -> list[tf.Variable]:
 
 def use_compiled_train_step(config: ExperimentConfig) -> bool:
     """The compiled path receives detached density tensors from Python."""
-    return config.compile_train_step and config.freeze_point_after_pretrain
+    density_is_fixed = config.freeze_point_after_pretrain or density_source_mode(config) == "true"
+    return config.compile_train_step and density_is_fixed
 
 
 def loss_enabled(config: ExperimentConfig, name: str) -> bool:
@@ -2340,6 +2389,7 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
     print_block(
         "Density constraint",
         [
+            ("density source", density_source_mode(config)),
             ("normalize_rho", config.normalize_rho),
             ("frozen density-state cache", config.freeze_point_after_pretrain),
         ],

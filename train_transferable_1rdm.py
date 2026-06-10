@@ -44,8 +44,10 @@ from transferable_rdm.config import ExperimentConfig
 from transferable_rdm.data import DatasetSplit, build_pair_features, compact_system_ids, split_systems
 from transferable_rdm.density_features import (
     DENSITY_BASELINE_MODES,
+    DENSITY_SOURCES,
     PAIR_DENSITY_FEATURE_MODES,
     density_baseline_mode,
+    density_source_mode,
     pair_density_feature_dim,
     pair_density_feature_mode,
 )
@@ -193,6 +195,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--point-density-rel-l1-weight", type=float, default=None)
     parser.add_argument("--point-density-log-weight", type=float, default=None)
     parser.add_argument("--point-density-log-eps", type=float, default=None)
+    parser.add_argument("--density-source", choices=DENSITY_SOURCES, default=None)
     parser.add_argument("--pair-density-feature-mode", choices=PAIR_DENSITY_FEATURE_MODES, default=None)
     parser.add_argument("--pair-density-symmetric", dest="pair_density_symmetric", action="store_true", default=None)
     parser.add_argument("--no-pair-density-symmetric", dest="pair_density_symmetric", action="store_false")
@@ -296,6 +299,7 @@ def apply_overrides(config: ExperimentConfig, args: argparse.Namespace) -> Exper
         ("point_density_rel_l1_weight", "point_density_rel_l1_weight"),
         ("point_density_log_weight", "point_density_log_weight"),
         ("point_density_log_eps", "point_density_log_eps"),
+        ("density_source", "density_source"),
         ("pair_density_feature_mode", "pair_density_feature_mode"),
         ("pair_density_symmetric", "pair_density_symmetric"),
         ("pair_density_hessian", "pair_density_hessian"),
@@ -625,7 +629,7 @@ def main() -> None:
     systems = build_system_corpus(config)
     configure_system_feature_metadata(systems, config)
     split = make_overfit_split(systems, config) if config.overfit_one_system else split_systems(systems, config)
-    if density_baseline_mode(config) == "sad-multiplicative":
+    if density_source_mode(config) == "predicted" and density_baseline_mode(config) == "sad-multiplicative":
         missing_sad = [system.system_id for system in systems if system.rho_sad is None]
         if missing_sad:
             raise ValueError(
@@ -646,6 +650,7 @@ def main() -> None:
         "Density feature configuration",
         [
             ("mode", config.pair_density_feature_mode),
+            ("density source", density_source_mode(config)),
             ("base pair dim", base_pair_dim),
             ("density descriptor dim", pair_density_feature_dim(config)),
             ("symmetric pair descriptors", config.pair_density_symmetric),
@@ -678,12 +683,13 @@ def main() -> None:
         ],
     )
     models = build_models(config, point_dim, pair_dim, global_dim)
-    rho_mean = float(np.mean(np.concatenate([system.rho_diag for system in split.train_systems], axis=0)))
-    initialize_point_model_density_bias(
-        models.point_model,
-        rho_mean,
-        residual_baseline=density_baseline_mode(config) == "sad-multiplicative",
-    )
+    if density_source_mode(config) == "predicted":
+        rho_mean = float(np.mean(np.concatenate([system.rho_diag for system in split.train_systems], axis=0)))
+        initialize_point_model_density_bias(
+            models.point_model,
+            rho_mean,
+            residual_baseline=density_baseline_mode(config) == "sad-multiplicative",
+        )
 
     point_history, point_summary = pretrain_point_model(config, split, models)
     history, summary = train_models(config, split, models)
