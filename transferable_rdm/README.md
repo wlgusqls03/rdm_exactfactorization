@@ -161,6 +161,35 @@ worker 수를 늘리면 압축 해제 시간은 줄 수 있지만 저장장치 �
 최종 `rate`를 비교하고 더 빠른 값을 사용한다. worker 수만큼 일시적인 RAM
 사용량도 증가한다.
 
+반복 실험에서는 persistent mmap cache를 쓰는 편이 훨씬 빠르다. 첫 실행은
+압축 NPZ를 `.npy` 파일로 추출하므로 기존 로딩과 비슷하거나 더 오래 걸릴 수
+있지만, 이후 실행은 압축 해제 없이 cache를 memory-map한다.
+
+```bash
+RDM_NPZ_MMAP_CACHE=1 \
+RDM_NPZ_MMAP_CACHE_DIR=qmugs_npz/.rdm_mmap_cache \
+RDM_NPZ_LOAD_WORKERS=2 \
+python train_transferable_1rdm.py --dataset-mode npz ...
+```
+
+cache에는 NPZ loader의 일반 필드와 각 시스템에서 계산한 정확한 axis/stencil
+index가 저장된다. 서로 다른 시스템의 좌표를 같다고 가정하거나 공유하지
+않는다. `gamma_matrix`와 `psi_occ`는 초기 cache 생성에서 제외되고 실제로
+필요해지는 첫 시점에 개별적으로 추출된다. 원본 NPZ의 크기나 수정 시간이
+바뀌면 해당 cache는 자동으로 다시 생성된다.
+
+학습 전에 cache만 구축할 수도 있다.
+
+```bash
+python build_npz_mmap_cache.py \
+  --npz-glob 'qmugs_npz/qm9_gpaw_fd_h0p4_500_atoms10_axis56/*.npz' \
+  --cache-dir qmugs_npz/.rdm_mmap_cache \
+  --num-systems 500 \
+  --workers 2
+```
+
+cache 구축이 끝난 뒤 학습에서는 `RDM_NPZ_LOAD_WORKERS=1`을 권장한다.
+
 큰 3D grid에서는 validation과 종료 summary도 오래 걸린다. 아래 설정은
 주기 validation을 고정된 10-system subset으로 제한하고, 종료 시 train은
 20개만 다시 평가하면서 val/test는 전체 50개를 유지한다.

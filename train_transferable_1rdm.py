@@ -668,6 +668,8 @@ def main() -> None:
     gamma_cache_gib = float(os.environ.get("RDM_GAMMA_CACHE_GB", "1.0"))
     psi_cache_gib = float(os.environ.get("RDM_PSI_OCC_CACHE_GB", "2.0"))
     lazy_psi_occ = env_flag("RDM_LAZY_PSI_OCC", True)
+    mmap_cache_enabled = env_flag("RDM_NPZ_MMAP_CACHE", False)
+    mmap_cache_dir = os.environ.get("RDM_NPZ_MMAP_CACHE_DIR", "dataset-local .rdm_mmap_cache")
     expanded_gamma_gib = sum(len(system.points) ** 2 * 4 for system in systems) / (1024**3)
     frozen_density_cache_mib = (
         sum(len(system.points) for system in systems) * density_cache_floats_per_point * 4 / (1024**2)
@@ -678,6 +680,8 @@ def main() -> None:
             ("gamma LRU limit (CPU RAM)", f"{gamma_cache_gib:.2f} GiB"),
             ("psi_occ lazy load", lazy_psi_occ),
             ("psi_occ LRU limit (CPU RAM)", f"{psi_cache_gib:.2f} GiB"),
+            ("NPZ mmap cache", mmap_cache_enabled),
+            ("NPZ mmap cache dir", mmap_cache_dir if mmap_cache_enabled else "disabled"),
             ("full corpus gamma expanded", f"{expanded_gamma_gib:.2f} GiB"),
             ("frozen density cache (GPU, approx)", f"{frozen_density_cache_mib:.1f} MiB"),
         ],

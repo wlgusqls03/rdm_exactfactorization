@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import glob
 import hashlib
+import json
 import os
+import shutil
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -21,6 +23,8 @@ _GAMMA_CACHE_BYTES = 0
 _PSI_OCC_CACHE: OrderedDict[str, np.ndarray] = OrderedDict()
 _PSI_OCC_CACHE_BYTES = 0
 _LIGHT_NPZ_CACHE_VERSION = 1
+_MMAP_NPZ_CACHE_VERSION = 1
+_MMAP_LAZY_KEYS = {"gamma_matrix", "psi_occ"}
 
 
 def env_flag(name: str, default: bool) -> bool:
@@ -38,6 +42,151 @@ def psi_occ_cache_limit_bytes() -> int:
     return int(float(os.environ.get("RDM_PSI_OCC_CACHE_GB", "2.0")) * (1024**3))
 
 
+def npz_mmap_cache_enabled() -> bool:
+    return env_flag("RDM_NPZ_MMAP_CACHE", False)
+
+
+def npz_mmap_cache_path(path: str | Path) -> Path:
+    source = Path(path).expanduser().resolve()
+    root_value = os.environ.get("RDM_NPZ_MMAP_CACHE_DIR", "").strip()
+    root = Path(root_value).expanduser() if root_value else source.parent / ".rdm_mmap_cache"
+    digest = hashlib.sha1(str(source).encode("utf-8")).hexdigest()[:12]
+    return root / f"{source.stem}-{digest}"
+
+
+def npz_mmap_cache_valid(path: str | Path, cache_path: Path) -> bool:
+    manifest_path = cache_path / "manifest.json"
+    if not manifest_path.exists():
+        return False
+    try:
+        source = Path(path).expanduser().resolve()
+        stat = source.stat()
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        return (
+            int(manifest["cache_version"]) == _MMAP_NPZ_CACHE_VERSION
+            and int(manifest["source_size"]) == stat.st_size
+            and int(manifest["source_mtime_ns"]) == stat.st_mtime_ns
+        )
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def build_npz_mmap_cache(path: str | Path) -> Path:
+    source = Path(path).expanduser().resolve()
+    cache_path = npz_mmap_cache_path(source)
+    if npz_mmap_cache_valid(source, cache_path):
+        return cache_path
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = cache_path.with_name(
+        f".{cache_path.name}.tmp-{os.getpid()}-{time.time_ns()}"
+    )
+    temp_path.mkdir(parents=True, exist_ok=False)
+    try:
+        with np.load(source, allow_pickle=True) as payload:
+            keys = list(payload.files)
+            for key in keys:
+                if key in _MMAP_LAZY_KEYS:
+                    continue
+                np.save(temp_path / f"{key}.npy", np.asarray(payload[key]), allow_pickle=True)
+        stat = source.stat()
+        manifest = {
+            "cache_version": _MMAP_NPZ_CACHE_VERSION,
+            "source_path": str(source),
+            "source_size": stat.st_size,
+            "source_mtime_ns": stat.st_mtime_ns,
+            "keys": keys,
+        }
+        (temp_path / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        if cache_path.exists():
+            shutil.rmtree(cache_path)
+        temp_path.replace(cache_path)
+    except Exception:
+        shutil.rmtree(temp_path, ignore_errors=True)
+        raise
+    return cache_path
+
+
+def load_cached_npz_key(path: str | Path, key: str) -> np.ndarray:
+    source = Path(path).expanduser().resolve()
+    cache_path = build_npz_mmap_cache(source)
+    array_path = cache_path / f"{key}.npy"
+    if not array_path.exists():
+        temp_path = array_path.with_name(f".{array_path.name}.tmp-{os.getpid()}-{time.time_ns()}")
+        with np.load(source, allow_pickle=True) as payload:
+            if key not in payload:
+                raise KeyError(f"{source} is missing {key}.")
+            with temp_path.open("wb") as handle:
+                np.save(handle, np.asarray(payload[key]), allow_pickle=True)
+        temp_path.replace(array_path)
+    try:
+        return np.load(array_path, mmap_mode="r", allow_pickle=True)
+    except ValueError:
+        return np.load(array_path, allow_pickle=True)
+
+
+def write_cached_array(array_path: Path, value: np.ndarray) -> None:
+    temp_path = array_path.with_name(f".{array_path.name}.tmp-{os.getpid()}-{time.time_ns()}")
+    with temp_path.open("wb") as handle:
+        np.save(handle, np.asarray(value), allow_pickle=False)
+    temp_path.replace(array_path)
+
+
+def load_or_build_grid_cache(
+    path: str | Path,
+    points: np.ndarray,
+    tau_stencil: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    cache_path = build_npz_mmap_cache(path)
+    suffix = tau_stencil.strip().lower()
+    array_paths = {
+        "axis": cache_path / "__rdm_axis.npy",
+        "interior": cache_path / f"__rdm_interior_{suffix}.npy",
+        "left": cache_path / f"__rdm_stencil_left_{suffix}.npy",
+        "right": cache_path / f"__rdm_stencil_right_{suffix}.npy",
+    }
+    if not all(array_path.exists() for array_path in array_paths.values()):
+        axis = infer_uniform_axis(points)
+        interior, left, right = prepare_stencil_indices(len(axis), tau_stencil)
+        write_cached_array(array_paths["axis"], axis)
+        write_cached_array(array_paths["interior"], interior.astype(np.int32))
+        write_cached_array(array_paths["left"], left.astype(np.int32))
+        write_cached_array(array_paths["right"], right.astype(np.int32))
+    return tuple(
+        np.load(array_paths[name], mmap_mode="r", allow_pickle=False)
+        for name in ("axis", "interior", "left", "right")
+    )
+
+
+class MmapNpzPayload:
+    def __init__(self, source: str | Path):
+        self.source = Path(source).expanduser().resolve()
+        self.cache_path = build_npz_mmap_cache(self.source)
+        manifest = json.loads((self.cache_path / "manifest.json").read_text(encoding="utf-8"))
+        self.files = list(manifest["keys"])
+
+    def __contains__(self, key: str) -> bool:
+        return key in self.files
+
+    def __getitem__(self, key: str) -> np.ndarray:
+        return load_cached_npz_key(self.source, key)
+
+    def __enter__(self) -> "MmapNpzPayload":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        return None
+
+
+def open_npz_payload(path: str | Path):
+    if npz_mmap_cache_enabled():
+        return MmapNpzPayload(path)
+    return np.load(path, allow_pickle=True)
+
+
 def load_gamma_matrix_cached(path: str | Path) -> np.ndarray:
     """Load a large NPZ gamma matrix with a small process-local LRU cache."""
     global _GAMMA_CACHE_BYTES
@@ -47,7 +196,7 @@ def load_gamma_matrix_cached(path: str | Path) -> np.ndarray:
         _GAMMA_CACHE.move_to_end(key)
         return cached
 
-    with np.load(key, allow_pickle=True) as payload:
+    with open_npz_payload(key) as payload:
         gamma = np.asarray(payload["gamma_matrix"], dtype=np.float32)
 
     limit = gamma_cache_limit_bytes()
@@ -72,7 +221,7 @@ def load_psi_occ_cached(path: str | Path) -> np.ndarray:
         _PSI_OCC_CACHE.move_to_end(key)
         return cached
 
-    with np.load(key, allow_pickle=True) as payload:
+    with open_npz_payload(key) as payload:
         psi_occ = np.asarray(payload["psi_occ"], dtype=np.float32)
 
     limit = psi_occ_cache_limit_bytes()
@@ -710,6 +859,7 @@ def finalize_system_record(
     rho_sad: np.ndarray | None = None,
     rho_cation: np.ndarray | None = None,
     rho_anion: np.ndarray | None = None,
+    stencil_indices: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
 ) -> SystemRecord:
     """raw system data를 학습용 record로 정리."""
     n_points = len(points)
@@ -725,7 +875,11 @@ def finalize_system_record(
     else:
         raise ValueError("gamma_matrix or rho_diag_override is required to finalize a system record.")
 
-    if gamma_matrix.size:
+    if stencil_indices is not None and not gamma_matrix.size:
+        interior_idx, stencil_left, stencil_right = stencil_indices
+        derivative_true = np.zeros((len(interior_idx), 3), dtype=np.float32)
+        tau_true = np.zeros((len(interior_idx), 1), dtype=np.float32)
+    elif gamma_matrix.size:
         (interior_idx, stencil_left, stencil_right, derivative_true), tau_true = prepare_stencil_targets(
             axis_points=len(axis),
             gamma_matrix=gamma_matrix,
@@ -759,13 +913,13 @@ def finalize_system_record(
     return SystemRecord(
         system_id=system_id,
         family=family,
-        axis=axis.astype(np.float32),
-        points=points.astype(np.float32),
+        axis=np.asarray(axis, dtype=np.float32),
+        points=np.asarray(points, dtype=np.float32),
         step=step,
         cell_volume=step**3,
-        local_features=local_features.astype(np.float32),
-        potential=potential.astype(np.float32),
-        grad_potential=grad_potential.astype(np.float32),
+        local_features=np.asarray(local_features, dtype=np.float32),
+        potential=np.asarray(potential, dtype=np.float32),
+        grad_potential=np.asarray(grad_potential, dtype=np.float32),
         hartree_potential=(
             np.asarray(hartree_potential, dtype=np.float32)
             if hartree_potential is not None
@@ -791,8 +945,8 @@ def finalize_system_record(
             if kinetic_potential_centered is not None
             else np.empty((0, 1), dtype=np.float32)
         ),
-        global_context=global_context.astype(np.float32),
-        gamma_matrix=gamma_matrix.astype(np.float32) if keep_gamma_matrix else np.empty((0, 0), dtype=np.float32),
+        global_context=np.asarray(global_context, dtype=np.float32),
+        gamma_matrix=np.asarray(gamma_matrix, dtype=np.float32) if keep_gamma_matrix else np.empty((0, 0), dtype=np.float32),
         gamma_pairs=np.empty((0, 1), dtype=np.float32),
         rho_diag=rho_diag,
         psi_occ=(
@@ -821,9 +975,9 @@ def finalize_system_record(
         pair_weights=np.empty((0, 1), dtype=np.float32),
         diagonal_pair_indices=np.arange(n_points, dtype=np.int64) * (n_points + 1),
         category_indices={},
-        interior_point_indices=interior_idx.astype(np.int32),
-        stencil_left=stencil_left.astype(np.int32),
-        stencil_right=stencil_right.astype(np.int32),
+        interior_point_indices=np.asarray(interior_idx, dtype=np.int32),
+        stencil_left=np.asarray(stencil_left, dtype=np.int32),
+        stencil_right=np.asarray(stencil_right, dtype=np.int32),
         derivative_true=derivative_true.astype(np.float32),
         tau_true=tau_true.astype(np.float32),
         derivative_true_fd=(
@@ -973,7 +1127,7 @@ def load_npz_system(path: str | Path, config: ExperimentConfig) -> SystemRecord:
             return value.reshape(-1)[0].item()
         return value.tolist()
 
-    with np.load(path, allow_pickle=True) as payload:
+    with open_npz_payload(path) as payload:
         required = ["points", "local_features", "global_context"]
         missing = [key for key in required if key not in payload]
         if missing:
@@ -984,7 +1138,16 @@ def load_npz_system(path: str | Path, config: ExperimentConfig) -> SystemRecord:
         points = np.asarray(payload["points"], dtype=np.float32)
         local_features = np.asarray(payload["local_features"], dtype=np.float32)
         global_context = np.asarray(payload["global_context"], dtype=np.float32)
-        axis = infer_uniform_axis(points)
+        if npz_mmap_cache_enabled():
+            axis, interior_idx, stencil_left, stencil_right = load_or_build_grid_cache(
+                path,
+                points,
+                config.tau_stencil,
+            )
+            cached_stencil_indices = (interior_idx, stencil_left, stencil_right)
+        else:
+            axis = infer_uniform_axis(points)
+            cached_stencil_indices = None
 
         potential = np.asarray(payload["potential"], dtype=np.float32) if "potential" in payload else np.zeros((len(points), 1), dtype=np.float32)
         grad_potential = np.asarray(payload["grad_potential"], dtype=np.float32) if "grad_potential" in payload else np.zeros((len(points), 3), dtype=np.float32)
@@ -1146,6 +1309,7 @@ def load_npz_system(path: str | Path, config: ExperimentConfig) -> SystemRecord:
         rho_sad=rho_sad,
         rho_cation=rho_cation,
         rho_anion=rho_anion,
+        stencil_indices=cached_stencil_indices,
     )
 
 
@@ -1173,6 +1337,7 @@ def build_system_corpus(config: ExperimentConfig) -> list[SystemRecord]:
         progress_every = int(os.environ.get("RDM_LOAD_PROGRESS_EVERY", "25"))
         progress_enabled = env_flag("RDM_LOAD_PROGRESS", True) and progress_every > 0
         load_workers = max(int(os.environ.get("RDM_NPZ_LOAD_WORKERS", "1")), 1)
+        memory_label = "mapped/logical arrays" if npz_mmap_cache_enabled() else "resident arrays"
         start_time = time.perf_counter()
         resident_bytes = 0
         if progress_enabled and load_workers > 1:
@@ -1188,7 +1353,7 @@ def build_system_corpus(config: ExperimentConfig) -> list[SystemRecord]:
                     print(
                         "[NPZ load] "
                         f"{idx}/{len(paths)} systems | "
-                        f"resident arrays ~{resident_bytes / (1024**3):.2f} GiB | "
+                        f"{memory_label} ~{resident_bytes / (1024**3):.2f} GiB | "
                         f"elapsed {elapsed:.1f}s | "
                         f"rate {idx / max(elapsed, 1e-9):.2f} systems/s"
                     )
@@ -1213,7 +1378,7 @@ def build_system_corpus(config: ExperimentConfig) -> list[SystemRecord]:
                         print(
                             "[NPZ load] "
                             f"{completed}/{len(paths)} systems | "
-                            f"resident arrays ~{resident_bytes / (1024**3):.2f} GiB | "
+                            f"{memory_label} ~{resident_bytes / (1024**3):.2f} GiB | "
                             f"elapsed {elapsed:.1f}s | "
                             f"rate {completed / max(elapsed, 1e-9):.2f} systems/s"
                         )
