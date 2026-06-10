@@ -1266,6 +1266,11 @@ def trainable_variables(models: ModelBundle) -> list[tf.Variable]:
     )
 
 
+def use_compiled_train_step(config: ExperimentConfig) -> bool:
+    """The compiled path receives detached density tensors from Python."""
+    return config.compile_train_step and config.freeze_point_after_pretrain
+
+
 def loss_enabled(config: ExperimentConfig, name: str) -> bool:
     preset = config.loss_preset.strip().lower()
     if preset in {"core5", "simple5"}:
@@ -2286,11 +2291,17 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
     best_val_for_lr = np.inf
 
     vars_all = trainable_variables(models)
+    compile_train_step = use_compiled_train_step(config)
     compiled_train_step = (
         make_compiled_train_step(models, optimizer, vars_all, config)
-        if config.compile_train_step
+        if compile_train_step
         else None
     )
+    if config.compile_train_step and not compile_train_step:
+        print(
+            "Joint point training disables the compiled train step because "
+            "precomputed density tensors would detach point-model gradients."
+        )
     diagnostic_system = split.train_systems[0]
     diagnostic_batch = (
         sample_pair_batch(
@@ -2313,7 +2324,7 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
             ("deriv/tau loss", "target-RMS normalized Huber"),
             ("Huber delta", f"{config.physics_huber_delta:.6g}"),
             ("deriv/tau scale floor", f"{config.deriv_scale_floor:.6g} / {config.tau_scale_floor:.6g}"),
-            ("compiled train step", config.compile_train_step),
+            ("compiled train step", compile_train_step),
             ("active system tensor cache", config.active_system_tensor_cache_size),
             ("train diagonal points", "full" if config.train_diagonal_points <= 0 else config.train_diagonal_points),
             ("train stencil centers", "full" if config.train_stencil_centers <= 0 else config.train_stencil_centers),
