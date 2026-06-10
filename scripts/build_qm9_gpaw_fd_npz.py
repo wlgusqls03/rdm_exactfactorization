@@ -84,6 +84,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--tau-stencil", choices=["central2", "richardson"], default="richardson")
     parser.add_argument(
+        "--kinetic-reference",
+        choices=["gamma-stencil", "orbital-gradient"],
+        default="gamma-stencil",
+        help=(
+            "Reference stored in kinetic_energy_hartree. 'gamma-stencil' integrates the same "
+            "near-diagonal gamma stencil used by physics-target=fd; 'orbital-gradient' preserves "
+            "the legacy full-grid np.gradient reference."
+        ),
+    )
+    parser.add_argument(
         "--store-full-gamma",
         action="store_true",
         help=(
@@ -616,6 +626,15 @@ def run_gpaw(record: Qm9Record, args: argparse.Namespace) -> dict[str, object]:
     tau_consistency_rms_ratio = float(
         np.sqrt(np.mean(tau_gamma_fd**2)) / max(np.sqrt(np.mean(interior_tau_orbital**2)), 1e-30)
     )
+    kinetic_energy_orbital_fd = float(np.sum(tau_orbital_fd, dtype=np.float64) * args.grid_spacing_bohr**3)
+    kinetic_energy_gamma_stencil = float(
+        np.sum(tau_gamma_fd, dtype=np.float64) * args.grid_spacing_bohr**3
+    )
+    kinetic_energy = (
+        kinetic_energy_gamma_stencil
+        if args.kinetic_reference == "gamma-stencil"
+        else kinetic_energy_orbital_fd
+    )
 
     atomic_numbers = np.asarray([ELEMENT_Z[symbol] for symbol in record.symbols], dtype=np.float64)
     potential, grad = nuclear_potential_and_grad(points_bohr, coords_bohr_centered, atomic_numbers)
@@ -653,7 +672,9 @@ def run_gpaw(record: Qm9Record, args: argparse.Namespace) -> dict[str, object]:
         "orbital_energies": (eigenvalues_ev / 27.211386245988).astype(np.float32),
         "electron_count": electron_count,
         "total_energy_hartree": energy_ev / 27.211386245988,
-        "kinetic_energy_hartree": float(np.sum(tau_orbital_fd) * args.grid_spacing_bohr**3),
+        "kinetic_energy_hartree": kinetic_energy,
+        "kinetic_energy_orbital_fd_hartree": kinetic_energy_orbital_fd,
+        "kinetic_energy_gamma_stencil_hartree": kinetic_energy_gamma_stencil,
         "tau_consistency_mae": tau_consistency_mae,
         "tau_consistency_rms_ratio": tau_consistency_rms_ratio,
     }
@@ -697,6 +718,13 @@ def write_npz(record: Qm9Record, args: argparse.Namespace, output_path: Path) ->
         grid_radius_bohr=np.asarray(float(np.max(np.abs(result["axis"]))), dtype=np.float32),
         box_length_bohr=np.asarray((axis_points + 1) * args.grid_spacing_bohr, dtype=np.float32),
         kinetic_energy_hartree=np.asarray(result["kinetic_energy_hartree"], dtype=np.float32),
+        kinetic_energy_orbital_fd_hartree=np.asarray(
+            result["kinetic_energy_orbital_fd_hartree"], dtype=np.float32
+        ),
+        kinetic_energy_gamma_stencil_hartree=np.asarray(
+            result["kinetic_energy_gamma_stencil_hartree"], dtype=np.float32
+        ),
+        kinetic_reference=np.asarray(args.kinetic_reference),
         total_energy_hartree=np.asarray(result["total_energy_hartree"], dtype=np.float32),
         tau_reference=np.asarray("gpaw_fd_orbital_gradient"),
         gamma_reference=np.asarray("gpaw_fd_pseudo_wavefunctions"),
@@ -716,6 +744,9 @@ def write_npz(record: Qm9Record, args: argparse.Namespace, output_path: Path) ->
         "electron_count": float(result["electron_count"]),
         "total_energy_hartree": float(result["total_energy_hartree"]),
         "kinetic_energy_hartree": float(result["kinetic_energy_hartree"]),
+        "kinetic_energy_orbital_fd_hartree": float(result["kinetic_energy_orbital_fd_hartree"]),
+        "kinetic_energy_gamma_stencil_hartree": float(result["kinetic_energy_gamma_stencil_hartree"]),
+        "kinetic_reference": args.kinetic_reference,
         "tau_fd_orbital_vs_gamma_mae": float(result["tau_consistency_mae"]),
         "tau_fd_gamma_over_orbital_rms": float(result["tau_consistency_rms_ratio"]),
         "axis_points": axis_points,
@@ -745,6 +776,9 @@ def write_indices(output_dir: Path, manifest: list[dict[str, object]]) -> None:
         "axis_points",
         "grid_spacing_bohr",
         "kinetic_energy_hartree",
+        "kinetic_energy_orbital_fd_hartree",
+        "kinetic_energy_gamma_stencil_hartree",
+        "kinetic_reference",
         "tau_fd_orbital_vs_gamma_mae",
         "tau_fd_gamma_over_orbital_rms",
         "npz_file",
@@ -818,6 +852,13 @@ def main() -> None:
                     "axis_points": int(payload["axis_points"]),
                     "grid_spacing_bohr": float(payload["grid_spacing_bohr"]),
                     "kinetic_energy_hartree": float(payload["kinetic_energy_hartree"]),
+                    "kinetic_energy_orbital_fd_hartree": float(
+                        payload.get("kinetic_energy_orbital_fd_hartree", payload["kinetic_energy_hartree"])
+                    ),
+                    "kinetic_energy_gamma_stencil_hartree": float(
+                        payload.get("kinetic_energy_gamma_stencil_hartree", payload["kinetic_energy_hartree"])
+                    ),
+                    "kinetic_reference": str(np.asarray(payload.get("kinetic_reference", "legacy")).item()),
                     "tau_fd_orbital_vs_gamma_mae": float(payload["tau_fd_orbital_vs_gamma_mae"]),
                     "tau_fd_gamma_over_orbital_rms": float(payload["tau_fd_gamma_over_orbital_rms"]),
                 }
@@ -832,6 +873,9 @@ def main() -> None:
                 "axis_points": axis_points,
                 "grid_spacing_bohr": float(args.grid_spacing_bohr),
                 "kinetic_energy_hartree": float("nan"),
+                "kinetic_energy_orbital_fd_hartree": float("nan"),
+                "kinetic_energy_gamma_stencil_hartree": float("nan"),
+                "kinetic_reference": args.kinetic_reference,
                 "tau_fd_orbital_vs_gamma_mae": float("nan"),
                 "tau_fd_gamma_over_orbital_rms": float("nan"),
             }

@@ -1274,6 +1274,13 @@ def load_npz_system(path: str | Path, config: ExperimentConfig) -> SystemRecord:
             "box_length_bohr": float(scalar_payload(payload, "box_length_bohr", axis[-1] - axis[0])),
             "total_energy_hartree": float(scalar_payload(payload, "total_energy_hartree", np.nan)),
             "kinetic_energy_hartree": float(scalar_payload(payload, "kinetic_energy_hartree", np.nan)),
+            "kinetic_energy_orbital_fd_hartree": float(
+                scalar_payload(payload, "kinetic_energy_orbital_fd_hartree", np.nan)
+            ),
+            "kinetic_energy_gamma_stencil_hartree": float(
+                scalar_payload(payload, "kinetic_energy_gamma_stencil_hartree", np.nan)
+            ),
+            "kinetic_reference": scalar_payload(payload, "kinetic_reference", "legacy"),
             "chemical_potential_hartree": float(scalar_payload(payload, "chemical_potential_hartree", np.nan)),
             "kinetic_potential_center": float(scalar_payload(payload, "kinetic_potential_center", np.nan)),
             "kinetic_potential_reference": scalar_payload(payload, "kinetic_potential_reference", "not_computed"),

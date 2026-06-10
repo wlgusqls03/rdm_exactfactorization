@@ -203,9 +203,18 @@ by default:
 - `tau_true_fd_orbital = 1/2 sum_n f_n |grad_h psi_n|^2`;
 - `tau_true_fd_gamma`, the same-grid near-diagonal curvature diagnostic from
   `gamma_matrix`;
+- `kinetic_energy_gamma_stencil_hartree`, the integral of that exact gamma
+  stencil target;
+- `kinetic_energy_orbital_fd_hartree`, the legacy full-grid orbital-gradient
+  integral;
 - loader-compatible `tau_true_ao` and `derivative_true_ao` aliases, which in
   this dataset are FD orbital-gradient references rather than AO-gradient
   references.
+
+By default `kinetic_energy_hartree` selects the gamma-stencil integral so
+`--physics-target fd`, tau loss, and kinetic loss optimize one discrete
+definition. Use `--kinetic-reference orbital-gradient` only for a legacy
+comparison.
 
 The dense `gamma_matrix` is not stored unless `--store-full-gamma` is passed.
 This is required for fine grids such as `0.4` or `0.3` bohr, where dense gamma
@@ -249,6 +258,7 @@ python scripts/build_qm9_gpaw_fd_npz.py \
   --grid-spacing-bohr 0.4 \
   --padding-bohr 4.0 \
   --max-axis-points 55 \
+  --kinetic-reference gamma-stencil \
   --xc LDA
 ```
 
