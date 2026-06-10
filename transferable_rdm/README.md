@@ -156,9 +156,10 @@ RDM_NPZ_LOAD_WORKERS=4 \
 python train_transferable_1rdm.py --dataset-mode npz ...
 ```
 
-worker 수를 늘리면 압축 해제 시간은 줄지만 동시에 로딩 중인 시스템 수만큼
-일시적인 RAM 사용량이 증가한다. 500-system corpus에서는 먼저 `4`, 여유가
-충분하면 `8`을 비교한다.
+worker 수를 늘리면 압축 해제 시간은 줄 수 있지만 저장장치 종류와 파일 크기
+분포에 따라 I/O 경합이 생길 수 있다. 500-system corpus에서는 `2`와 `4`의
+최종 `rate`를 비교하고 더 빠른 값을 사용한다. worker 수만큼 일시적인 RAM
+사용량도 증가한다.
 
 큰 3D grid에서는 validation과 종료 summary도 오래 걸린다. 아래 설정은
 주기 validation을 고정된 10-system subset으로 제한하고, 종료 시 train은

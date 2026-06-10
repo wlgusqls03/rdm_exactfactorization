@@ -5,7 +5,7 @@ import hashlib
 import os
 import time
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1179,13 +1179,8 @@ def build_system_corpus(config: ExperimentConfig) -> list[SystemRecord]:
             print(f"[NPZ load] using {load_workers} parallel workers")
 
         if load_workers == 1:
-            loaded_systems = map(lambda path: load_npz_system(path, config), paths)
-        else:
-            executor = ThreadPoolExecutor(max_workers=load_workers)
-            loaded_systems = executor.map(lambda path: load_npz_system(path, config), paths)
-
-        try:
-            for idx, system in enumerate(loaded_systems, start=1):
+            for idx, path in enumerate(paths, start=1):
+                system = load_npz_system(path, config)
                 systems.append(system)
                 resident_bytes += system_resident_nbytes(system)
                 if progress_enabled and (idx == 1 or idx % progress_every == 0 or idx == len(paths)):
@@ -1194,11 +1189,35 @@ def build_system_corpus(config: ExperimentConfig) -> list[SystemRecord]:
                         "[NPZ load] "
                         f"{idx}/{len(paths)} systems | "
                         f"resident arrays ~{resident_bytes / (1024**3):.2f} GiB | "
-                        f"elapsed {elapsed:.1f}s"
+                        f"elapsed {elapsed:.1f}s | "
+                        f"rate {idx / max(elapsed, 1e-9):.2f} systems/s"
                     )
-        finally:
-            if load_workers > 1:
-                executor.shutdown(wait=True)
+        else:
+            loaded_by_index: list[SystemRecord | None] = [None] * len(paths)
+            with ThreadPoolExecutor(max_workers=load_workers) as executor:
+                future_to_index = {
+                    executor.submit(load_npz_system, path, config): index
+                    for index, path in enumerate(paths)
+                }
+                for completed, future in enumerate(as_completed(future_to_index), start=1):
+                    index = future_to_index[future]
+                    system = future.result()
+                    loaded_by_index[index] = system
+                    resident_bytes += system_resident_nbytes(system)
+                    if progress_enabled and (
+                        completed == 1
+                        or completed % progress_every == 0
+                        or completed == len(paths)
+                    ):
+                        elapsed = time.perf_counter() - start_time
+                        print(
+                            "[NPZ load] "
+                            f"{completed}/{len(paths)} systems | "
+                            f"resident arrays ~{resident_bytes / (1024**3):.2f} GiB | "
+                            f"elapsed {elapsed:.1f}s | "
+                            f"rate {completed / max(elapsed, 1e-9):.2f} systems/s"
+                        )
+            systems.extend(system for system in loaded_by_index if system is not None)
 
     if not systems:
         raise RuntimeError("No systems were generated or loaded.")
