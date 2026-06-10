@@ -106,6 +106,7 @@ EVAL_OBJECTIVE_TERMS = (
 
 PHYSICS_TARGET_MODES = ("ao", "fd")
 _TRUE_GAMMA_STENCIL_TARGET_CACHE: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+_PHYSICS_TAU_INTEGRAL_CACHE: dict[tuple[int, str], float] = {}
 _STENCIL_PAIR_FEATURE_CACHE: OrderedDict[tuple[int, int], np.ndarray] = OrderedDict()
 _SYSTEM_TENSOR_CACHE: OrderedDict[int, "SystemTensorState"] = OrderedDict()
 _COULOMB_KERNEL_FFT_CACHE: OrderedDict[tuple[int, float], np.ndarray] = OrderedDict()
@@ -776,6 +777,16 @@ def kinetic_energy_reference(system: SystemRecord) -> float:
     return float(np.sum(system.tau_true) * system.cell_volume)
 
 
+def physics_tau_integral(system: SystemRecord, config: ExperimentConfig) -> float:
+    key = (id(system), physics_target_mode(config))
+    cached = _PHYSICS_TAU_INTEGRAL_CACHE.get(key)
+    if cached is None:
+        _, tau_target = physics_stencil_targets(system, config)
+        cached = float(np.sum(tau_target, dtype=np.float64) * system.cell_volume)
+        _PHYSICS_TAU_INTEGRAL_CACHE[key] = cached
+    return cached
+
+
 def local_curvature_basis_scale(system: SystemRecord, config: ExperimentConfig) -> float:
     """Undo pair-feature length normalization for local near-diagonal curvature terms."""
     if config.local_curvature_basis_scale > 0.0:
@@ -792,8 +803,19 @@ def kinetic_energy_loss_from_tau(
     tau_pred: tf.Tensor,
     *,
     integration_multiplier: float = 1.0,
+    tau_target: tf.Tensor | None = None,
+    target_integral: float | None = None,
+    control_variate: bool = True,
 ) -> tuple[tf.Tensor, tf.Tensor, float]:
-    kinetic_pred = tf.reduce_sum(tau_pred) * float(integration_multiplier) * system.cell_volume
+    if control_variate and tau_target is not None and target_integral is not None:
+        residual_integral = (
+            tf.reduce_sum(tau_pred - tau_target)
+            * float(integration_multiplier)
+            * system.cell_volume
+        )
+        kinetic_pred = tf.cast(target_integral, tau_pred.dtype) + residual_integral
+    else:
+        kinetic_pred = tf.reduce_sum(tau_pred) * float(integration_multiplier) * system.cell_volume
     kinetic_ref = kinetic_energy_reference(system)
     scale = max(abs(kinetic_ref), 1.0)
     loss = tf.square((kinetic_pred - kinetic_ref) / scale)
@@ -1587,6 +1609,9 @@ def evaluate_system(
         system,
         tau_pred_t,
         integration_multiplier=stencil_integration_multiplier,
+        tau_target=to_tensor(tau_target),
+        target_integral=physics_tau_integral(system, config),
+        control_variate=config.kinetic_control_variate,
     )
     kinetic_loss = float(kinetic_loss_t.numpy())
     kinetic_pred = float(kinetic_pred_t.numpy())
@@ -1920,6 +1945,7 @@ def make_compiled_train_step(
         electron_count: tf.Tensor,
         kinetic_ref: tf.Tensor,
         kinetic_scale: tf.Tensor,
+        kinetic_target_integral: tf.Tensor,
         kinetic_multiplier: tf.Tensor,
         stencil_order: int,
         gamma_weight: tf.Tensor,
@@ -2010,7 +2036,12 @@ def make_compiled_train_step(
                     scale_floor=config.tau_scale_floor,
                     delta=config.physics_huber_delta,
                 )
-                kinetic_pred = tf.reduce_sum(tau_pred) * kinetic_multiplier * cell_volume
+                if config.kinetic_control_variate:
+                    kinetic_pred = kinetic_target_integral + (
+                        tf.reduce_sum(tau_pred - tau_target) * kinetic_multiplier * cell_volume
+                    )
+                else:
+                    kinetic_pred = tf.reduce_sum(tau_pred) * kinetic_multiplier * cell_volume
                 kinetic_loss_t = tf.square((kinetic_pred - kinetic_ref) / kinetic_scale)
                 return deriv_loss_t, tau_loss_t, kinetic_loss_t
 
@@ -2136,6 +2167,9 @@ def compute_training_losses(
             system,
             tau_pred,
             integration_multiplier=kinetic_multiplier,
+            tau_target=to_tensor(tau_target),
+            target_integral=physics_tau_integral(system, config),
+            control_variate=config.kinetic_control_variate,
         )
     else:
         deriv_loss = zero
@@ -2198,7 +2232,7 @@ def print_gradient_diagnostics(
     diagnostic_weights = dict(weights)
     diagnostic_weights["deriv"] = 1.0
     diagnostic_weights["tau"] = 1.0
-    diagnostic_weights["kinetic"] = 0.0
+    diagnostic_weights["kinetic"] = 1.0
     diagnostic_stencil_centers = int(config.gradient_diagnostic_stencil_centers)
     diagnostic_center_indices = select_stencil_center_indices(
         system,
@@ -2243,8 +2277,20 @@ def print_gradient_diagnostics(
         ),
         ("local curvature basis scale", f"{local_curvature_basis_scale(system, config):.6e}"),
         (
-            "scheduled weights gamma/deriv/tau",
-            f"{weights['gamma']:.3e} / {weights['deriv']:.3e} / {weights['tau']:.3e}",
+            "scheduled weights gamma/deriv/tau/kinetic",
+            (
+                f"{weights['gamma']:.3e} / {weights['deriv']:.3e} / "
+                f"{weights['tau']:.3e} / {weights['kinetic']:.3e}"
+            ),
+        ),
+        ("kinetic control variate", config.kinetic_control_variate),
+        (
+            "T reference stored/target/AO",
+            (
+                f"{kinetic_energy_reference(system):.6e} / "
+                f"{physics_tau_integral(system, config):.6e} / "
+                f"{float(np.sum(system.tau_true, dtype=np.float64) * system.cell_volume):.6e}"
+            ),
         ),
     ]
     effective_norms = {}
@@ -2252,6 +2298,7 @@ def print_gradient_diagnostics(
         ("gamma", "pair_loss", "gamma"),
         ("deriv", "deriv_loss", "deriv"),
         ("tau", "tau_loss", "tau"),
+        ("kinetic", "kinetic_loss", "kinetic"),
     ):
         raw_total = gradient_global_norm(tape.gradient(losses[loss_name], all_vars))
         effective_total = raw_total * weights[weight_name]
@@ -2276,8 +2323,12 @@ def print_gradient_diagnostics(
     gamma_effective = max(effective_norms["gamma"], 1e-30)
     rows.append(
         (
-            "effective grad ratio deriv/tau vs gamma",
-            f"{effective_norms['deriv'] / gamma_effective:.6e} / {effective_norms['tau'] / gamma_effective:.6e}",
+            "effective grad ratio deriv/tau/kinetic vs gamma",
+            (
+                f"{effective_norms['deriv'] / gamma_effective:.6e} / "
+                f"{effective_norms['tau'] / gamma_effective:.6e} / "
+                f"{effective_norms['kinetic'] / gamma_effective:.6e}"
+            ),
         )
     )
     del tape
@@ -2384,6 +2435,7 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
             ("deriv/tau loss", "target-RMS normalized Huber"),
             ("Huber delta", f"{config.physics_huber_delta:.6g}"),
             ("deriv/tau scale floor", f"{config.deriv_scale_floor:.6g} / {config.tau_scale_floor:.6g}"),
+            ("kinetic control variate", config.kinetic_control_variate),
             ("compiled train step", compile_train_step),
             ("active system tensor cache", config.active_system_tensor_cache_size),
             ("train diagonal points", "full" if config.train_diagonal_points <= 0 else config.train_diagonal_points),
@@ -2529,6 +2581,7 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
                     tf.constant(float(system.electron_count), dtype=tf.float32),
                     tf.constant(float(kinetic_ref), dtype=tf.float32),
                     tf.constant(float(max(abs(kinetic_ref), 1.0)), dtype=tf.float32),
+                    tf.constant(float(physics_tau_integral(system, config)), dtype=tf.float32),
                     tf.constant(float(kinetic_multiplier), dtype=tf.float32),
                     int(system.stencil_left.shape[2]),
                     tf.constant(float(weights["gamma"]), dtype=tf.float32),

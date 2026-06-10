@@ -194,6 +194,7 @@ class ExperimentConfig:
     tau_ramp_epochs: int = int(os.environ.get("RDM_TAU_RAMP_EPOCHS", 40))
     kinetic_start_epoch: int = int(os.environ.get("RDM_KINETIC_START_EPOCH", 0))
     kinetic_ramp_epochs: int = int(os.environ.get("RDM_KINETIC_RAMP_EPOCHS", 0))
+    kinetic_control_variate: bool = env_flag("RDM_KINETIC_CONTROL_VARIATE", True)
     physics_huber_delta: float = float(os.environ.get("RDM_PHYSICS_HUBER_DELTA", 1.0))
     deriv_scale_floor: float = float(os.environ.get("RDM_DERIV_SCALE_FLOOR", 1e-6))
     tau_scale_floor: float = float(os.environ.get("RDM_TAU_SCALE_FLOOR", 1e-6))

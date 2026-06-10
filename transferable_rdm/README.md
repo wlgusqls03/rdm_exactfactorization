@@ -214,6 +214,20 @@ python train_transferable_1rdm.py --dataset-mode npz ...
 final val/test도 `10` 또는 `20`으로 제한할 수 있지만, 최종 비교 실험에서는
 val/test 전체 평가를 유지하는 편이 낫다.
 
+kinetic loss가 활성화되고 stencil center 일부만 계산할 때는 기본적으로
+정확한 target tau 적분에 sampling된 `tau_pred - tau_target` 적분을 더하는
+control-variate estimator를 사용한다. raw `tau_pred` sample 합을 전체
+grid로 확대하는 방식보다 분산이 작다.
+
+```bash
+RDM_KINETIC_CONTROL_VARIATE=1 \
+python train_transferable_1rdm.py ...
+```
+
+`RDM_KINETIC_CONTROL_VARIATE=0`은 이전 raw sampled-sum estimator를
+복원한다. Gradient diagnostics에는 kinetic gradient와 stored/physics-target/AO
+kinetic integral이 함께 출력된다.
+
 ## 파일 구조
 
 Point density pretrain은 기본적으로 scaled MSE, integrated relative L1,
