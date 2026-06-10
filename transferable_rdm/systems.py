@@ -5,6 +5,7 @@ import hashlib
 import os
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1171,20 +1172,33 @@ def build_system_corpus(config: ExperimentConfig) -> list[SystemRecord]:
             raise FileNotFoundError("dataset_mode='npz' but RDM_NPZ_GLOB did not match any files.")
         progress_every = int(os.environ.get("RDM_LOAD_PROGRESS_EVERY", "25"))
         progress_enabled = env_flag("RDM_LOAD_PROGRESS", True) and progress_every > 0
+        load_workers = max(int(os.environ.get("RDM_NPZ_LOAD_WORKERS", "1")), 1)
         start_time = time.perf_counter()
         resident_bytes = 0
-        for idx, path in enumerate(paths, start=1):
-            system = load_npz_system(path, config)
-            systems.append(system)
-            resident_bytes += system_resident_nbytes(system)
-            if progress_enabled and (idx == 1 or idx % progress_every == 0 or idx == len(paths)):
-                elapsed = time.perf_counter() - start_time
-                print(
-                    "[NPZ load] "
-                    f"{idx}/{len(paths)} systems | "
-                    f"resident arrays ~{resident_bytes / (1024**3):.2f} GiB | "
-                    f"elapsed {elapsed:.1f}s"
-                )
+        if progress_enabled and load_workers > 1:
+            print(f"[NPZ load] using {load_workers} parallel workers")
+
+        if load_workers == 1:
+            loaded_systems = map(lambda path: load_npz_system(path, config), paths)
+        else:
+            executor = ThreadPoolExecutor(max_workers=load_workers)
+            loaded_systems = executor.map(lambda path: load_npz_system(path, config), paths)
+
+        try:
+            for idx, system in enumerate(loaded_systems, start=1):
+                systems.append(system)
+                resident_bytes += system_resident_nbytes(system)
+                if progress_enabled and (idx == 1 or idx % progress_every == 0 or idx == len(paths)):
+                    elapsed = time.perf_counter() - start_time
+                    print(
+                        "[NPZ load] "
+                        f"{idx}/{len(paths)} systems | "
+                        f"resident arrays ~{resident_bytes / (1024**3):.2f} GiB | "
+                        f"elapsed {elapsed:.1f}s"
+                    )
+        finally:
+            if load_workers > 1:
+                executor.shutdown(wait=True)
 
     if not systems:
         raise RuntimeError("No systems were generated or loaded.")

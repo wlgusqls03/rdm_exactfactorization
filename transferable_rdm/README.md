@@ -147,6 +147,19 @@ optional:
 
 uniform Cartesian grid라고 가정하며, `points`로부터 axis를 복원한다.
 
+압축 NPZ corpus의 초기 로딩은 시스템 단위로 병렬화할 수 있다. 기본값은
+기존과 같은 직렬 로딩이며, CPU와 저장장치 여유가 있으면 4 workers부터
+사용한다.
+
+```bash
+RDM_NPZ_LOAD_WORKERS=4 \
+python train_transferable_1rdm.py --dataset-mode npz ...
+```
+
+worker 수를 늘리면 압축 해제 시간은 줄지만 동시에 로딩 중인 시스템 수만큼
+일시적인 RAM 사용량이 증가한다. 500-system corpus에서는 먼저 `4`, 여유가
+충분하면 `8`을 비교한다.
+
 ## 파일 구조
 
 Point density pretrain은 기본적으로 scaled MSE, integrated relative L1,
