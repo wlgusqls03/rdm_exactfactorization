@@ -25,6 +25,7 @@ _PSI_OCC_CACHE_BYTES = 0
 _LIGHT_NPZ_CACHE_VERSION = 1
 _MMAP_NPZ_CACHE_VERSION = 1
 _MMAP_LAZY_KEYS = {"gamma_matrix", "psi_occ"}
+_MMAP_RESIDENT_KEYS = {"local_features"}
 
 
 def env_flag(name: str, default: bool) -> bool:
@@ -122,10 +123,12 @@ def load_cached_npz_key(path: str | Path, key: str) -> np.ndarray:
             with temp_path.open("wb") as handle:
                 np.save(handle, np.asarray(payload[key]), allow_pickle=True)
         temp_path.replace(array_path)
-    try:
-        return np.load(array_path, mmap_mode="r", allow_pickle=True)
-    except ValueError:
-        return np.load(array_path, allow_pickle=True)
+    if key in _MMAP_RESIDENT_KEYS:
+        try:
+            return np.load(array_path, mmap_mode="r", allow_pickle=True)
+        except ValueError:
+            pass
+    return np.load(array_path, allow_pickle=True)
 
 
 def write_cached_array(array_path: Path, value: np.ndarray) -> None:
@@ -156,7 +159,7 @@ def load_or_build_grid_cache(
         write_cached_array(array_paths["left"], left.astype(np.int32))
         write_cached_array(array_paths["right"], right.astype(np.int32))
     return tuple(
-        np.load(array_paths[name], mmap_mode="r", allow_pickle=False)
+        np.load(array_paths[name], allow_pickle=False)
         for name in ("axis", "interior", "left", "right")
     )
 
@@ -175,10 +178,12 @@ class MmapNpzPayload:
         array_path = self.cache_path / f"{key}.npy"
         if not array_path.exists():
             return load_cached_npz_key(self.source, key)
-        try:
-            return np.load(array_path, mmap_mode="r", allow_pickle=True)
-        except ValueError:
-            return np.load(array_path, allow_pickle=True)
+        if key in _MMAP_RESIDENT_KEYS:
+            try:
+                return np.load(array_path, mmap_mode="r", allow_pickle=True)
+            except ValueError:
+                pass
+        return np.load(array_path, allow_pickle=True)
 
     def __enter__(self) -> "MmapNpzPayload":
         return self
