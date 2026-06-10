@@ -172,7 +172,13 @@ class MmapNpzPayload:
         return key in self.files
 
     def __getitem__(self, key: str) -> np.ndarray:
-        return load_cached_npz_key(self.source, key)
+        array_path = self.cache_path / f"{key}.npy"
+        if not array_path.exists():
+            return load_cached_npz_key(self.source, key)
+        try:
+            return np.load(array_path, mmap_mode="r", allow_pickle=True)
+        except ValueError:
+            return np.load(array_path, allow_pickle=True)
 
     def __enter__(self) -> "MmapNpzPayload":
         return self
@@ -1338,6 +1344,16 @@ def build_system_corpus(config: ExperimentConfig) -> list[SystemRecord]:
         progress_enabled = env_flag("RDM_LOAD_PROGRESS", True) and progress_every > 0
         load_workers = max(int(os.environ.get("RDM_NPZ_LOAD_WORKERS", "1")), 1)
         memory_label = "mapped/logical arrays" if npz_mmap_cache_enabled() else "resident arrays"
+        if npz_mmap_cache_enabled():
+            valid_cache_entries = sum(
+                npz_mmap_cache_valid(path, npz_mmap_cache_path(path))
+                for path in paths
+            )
+            print(
+                "[NPZ mmap cache] "
+                f"valid entries={valid_cache_entries}/{len(paths)} | "
+                f"dir={npz_mmap_cache_path(paths[0]).parent}"
+            )
         start_time = time.perf_counter()
         resident_bytes = 0
         if progress_enabled and load_workers > 1:

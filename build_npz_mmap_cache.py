@@ -7,7 +7,15 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from transferable_rdm.systems import build_npz_mmap_cache
+import numpy as np
+
+from transferable_rdm.systems import build_npz_mmap_cache, load_or_build_grid_cache
+
+
+def build_cache_entry(path: str, tau_stencil: str) -> None:
+    cache_path = build_npz_mmap_cache(path)
+    points = np.load(cache_path / "points.npy", mmap_mode="r", allow_pickle=False)
+    load_or_build_grid_cache(path, points, tau_stencil)
 
 
 def main() -> None:
@@ -17,6 +25,7 @@ def main() -> None:
     parser.add_argument("--num-systems", type=int, default=0)
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--progress-every", type=int, default=25)
+    parser.add_argument("--tau-stencil", default="richardson")
     args = parser.parse_args()
 
     paths = sorted(glob.glob(args.npz_glob))
@@ -34,7 +43,10 @@ def main() -> None:
     print(f"[NPZ mmap cache] files={len(paths)} workers={workers} dir={cache_dir}")
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(build_npz_mmap_cache, path): path for path in paths}
+        futures = {
+            executor.submit(build_cache_entry, path, args.tau_stencil): path
+            for path in paths
+        }
         for completed, future in enumerate(as_completed(futures), start=1):
             future.result()
             if (
