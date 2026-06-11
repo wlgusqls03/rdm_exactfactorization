@@ -334,7 +334,7 @@ oracle NPZ dataset:
 MPLCONFIGDIR=/tmp/mplconfig \
 MPLBACKEND=Agg \
 RDM_NORMALIZE_RHO=1 \
-RDM_TAU_STENCIL=richardson \
+RDM_TAU_STENCIL=central2 \
 RDM_LOSS_PRESET=core5 \
 RDM_LEARNING_RATE=2.0e-4 \
 RDM_MIN_LR=1.0e-5 \

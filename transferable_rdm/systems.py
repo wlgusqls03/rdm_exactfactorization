@@ -765,7 +765,7 @@ def stencil_offsets(axis_points: int, tau_stencil: str) -> tuple[int, ...]:
 
 def prepare_stencil_indices(
     axis_points: int,
-    tau_stencil: str = "richardson",
+    tau_stencil: str = "central2",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """near-diagonal mixed derivative target을 위한 stencil index만 준비."""
     interior = []
@@ -815,7 +815,7 @@ def prepare_stencil_targets(
     axis_points: int,
     gamma_matrix: np.ndarray,
     step: float,
-    tau_stencil: str = "richardson",
+    tau_stencil: str = "central2",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """near-diagonal mixed derivative target을 위한 stencil index와 true 값을 준비."""
     interior_idx, left_idx, right_idx = prepare_stencil_indices(axis_points, tau_stencil)

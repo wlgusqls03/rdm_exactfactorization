@@ -360,7 +360,7 @@ def parse_args() -> argparse.Namespace:
     group.add_argument("--npz-glob", type=str, help="Glob pattern for NPZ files.")
     parser.add_argument("--index", type=int, default=0, help="Index into --npz-glob results.")
     parser.add_argument("--max-files", type=int, default=1, help="Number of globbed files to inspect.")
-    parser.add_argument("--tau-stencil", default="richardson", help="Stencil used for FD tau.")
+    parser.add_argument("--tau-stencil", default="central2", help="Stencil used for FD tau.")
     return parser.parse_args()
 
 
