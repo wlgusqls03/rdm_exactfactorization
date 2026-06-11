@@ -1319,6 +1319,29 @@ def load_npz_system(path: str | Path, config: ExperimentConfig) -> SystemRecord:
             ),
             "kinetic_reference": scalar_payload(payload, "kinetic_reference", "legacy"),
             "reference_schema": scalar_payload(payload, "reference_schema", "legacy"),
+            "storage_profile": scalar_payload(payload, "storage_profile", "legacy"),
+            "gpaw_mode": scalar_payload(payload, "gpaw_mode", ""),
+            "gpaw_xc": scalar_payload(payload, "gpaw_xc", ""),
+            "gpaw_setups": scalar_payload(payload, "gpaw_setups", ""),
+            "gpaw_fd_order": int(scalar_payload(payload, "gpaw_fd_order", 0)),
+            "tau_orbital_vs_gamma_central2_mae": float(
+                scalar_payload(payload, "tau_orbital_vs_gamma_central2_mae", np.nan)
+            ),
+            "tau_orbital_vs_gamma_richardson_mae": float(
+                scalar_payload(payload, "tau_orbital_vs_gamma_richardson_mae", np.nan)
+            ),
+            "tau_gamma_central2_over_orbital_rms": float(
+                scalar_payload(payload, "tau_gamma_central2_over_orbital_rms", np.nan)
+            ),
+            "tau_gamma_richardson_over_orbital_rms": float(
+                scalar_payload(payload, "tau_gamma_richardson_over_orbital_rms", np.nan)
+            ),
+            "tau_fd_orbital_vs_gamma_mae": float(
+                scalar_payload(payload, "tau_fd_orbital_vs_gamma_mae", np.nan)
+            ),
+            "tau_fd_gamma_over_orbital_rms": float(
+                scalar_payload(payload, "tau_fd_gamma_over_orbital_rms", np.nan)
+            ),
             "chemical_potential_hartree": float(scalar_payload(payload, "chemical_potential_hartree", np.nan)),
             "kinetic_potential_center": float(scalar_payload(payload, "kinetic_potential_center", np.nan)),
             "kinetic_potential_reference": scalar_payload(payload, "kinetic_potential_reference", "not_computed"),

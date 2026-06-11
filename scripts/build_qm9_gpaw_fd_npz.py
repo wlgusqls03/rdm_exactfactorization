@@ -84,6 +84,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--tau-stencil", choices=["central2", "richardson"], default="central2")
     parser.add_argument(
+        "--storage-profile",
+        choices=["training-compact", "full"],
+        default="training-compact",
+        help=(
+            "'training-compact' stores all production training inputs, primary orbital "
+            "derivative/tau targets, scalar diagnostics, and reference metadata while omitting "
+            "legacy aliases and gamma-derived diagnostic fields. 'full' also stores those "
+            "duplicate/diagnostic arrays."
+        ),
+    )
+    parser.add_argument(
         "--kinetic-reference",
         choices=["orbital-interior", "orbital-full", "gamma-stencil"],
         default="orbital-interior",
@@ -683,7 +694,7 @@ def run_gpaw(record: Qm9Record, args: argparse.Namespace) -> dict[str, object]:
     if args.store_full_gamma:
         gamma_matrix = (psi_matrix * occupancies[None, :]) @ psi_matrix.T
         gamma_matrix = 0.5 * (gamma_matrix + gamma_matrix.T)
-    return {
+    result = {
         "axis_points": axis_points,
         "axis": axis,
         "points_bohr": points_bohr,
@@ -697,10 +708,6 @@ def run_gpaw(record: Qm9Record, args: argparse.Namespace) -> dict[str, object]:
         "psi_occ": psi_matrix.astype(np.float32),
         "derivative_orbital_fd": derivative_orbital_fd,
         "tau_orbital_fd": tau_orbital_fd,
-        "derivative_gamma_central2_interior": derivative_gamma_central2.astype(np.float32),
-        "tau_gamma_central2_interior": tau_gamma_central2.astype(np.float32),
-        "derivative_gamma_richardson_interior": derivative_gamma_richardson.astype(np.float32),
-        "tau_gamma_richardson_interior": tau_gamma_richardson.astype(np.float32),
         "occupancies": occupancies.astype(np.float32),
         "orbital_energies": (eigenvalues_ev / 27.211386245988).astype(np.float32),
         "electron_count": electron_count,
@@ -715,6 +722,16 @@ def run_gpaw(record: Qm9Record, args: argparse.Namespace) -> dict[str, object]:
         "tau_central2_consistency_rms_ratio": tau_central2_consistency_rms_ratio,
         "tau_richardson_consistency_rms_ratio": tau_richardson_consistency_rms_ratio,
     }
+    if args.storage_profile == "full":
+        result.update(
+            {
+                "derivative_gamma_central2_interior": derivative_gamma_central2.astype(np.float32),
+                "tau_gamma_central2_interior": tau_gamma_central2.astype(np.float32),
+                "derivative_gamma_richardson_interior": derivative_gamma_richardson.astype(np.float32),
+                "tau_gamma_richardson_interior": tau_gamma_richardson.astype(np.float32),
+            }
+        )
+    return result
 
 
 def write_npz(record: Qm9Record, args: argparse.Namespace, output_path: Path) -> dict[str, object]:
@@ -722,101 +739,68 @@ def write_npz(record: Qm9Record, args: argparse.Namespace, output_path: Path) ->
     axis_points = int(result["axis_points"])
     points_bohr = np.asarray(result["points_bohr"], dtype=np.float32)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        output_path,
-        points=points_bohr,
-        gamma_matrix=np.asarray(result["gamma_matrix"], dtype=np.float32),
-        rho_diag=np.asarray(result["rho_diag"], dtype=np.float32),
-        psi_occ=np.asarray(result["psi_occ"], dtype=np.float32),
-        derivative_orbital_gradient=np.asarray(result["derivative_orbital_fd"], dtype=np.float32),
-        tau_orbital_gradient=np.asarray(result["tau_orbital_fd"], dtype=np.float32),
-        derivative_gamma_central2_interior=np.asarray(
-            result["derivative_gamma_central2_interior"], dtype=np.float32
-        ),
-        tau_gamma_central2_interior=np.asarray(result["tau_gamma_central2_interior"], dtype=np.float32),
-        derivative_gamma_richardson_interior=np.asarray(
-            result["derivative_gamma_richardson_interior"], dtype=np.float32
-        ),
-        tau_gamma_richardson_interior=np.asarray(
-            result["tau_gamma_richardson_interior"], dtype=np.float32
-        ),
-        # Backward-compatible aliases for existing loaders.
-        derivative_true_ao=np.asarray(result["derivative_orbital_fd"], dtype=np.float32),
-        tau_true_ao=np.asarray(result["tau_orbital_fd"], dtype=np.float32),
-        derivative_true_fd_orbital=np.asarray(result["derivative_orbital_fd"], dtype=np.float32),
-        tau_true_fd_orbital=np.asarray(result["tau_orbital_fd"], dtype=np.float32),
-        derivative_true_fd_gamma=np.asarray(
-            result[
-                "derivative_gamma_central2_interior"
-                if args.tau_stencil == "central2"
-                else "derivative_gamma_richardson_interior"
-            ],
-            dtype=np.float32,
-        ),
-        tau_true_fd_gamma=np.asarray(
-            result[
-                "tau_gamma_central2_interior"
-                if args.tau_stencil == "central2"
-                else "tau_gamma_richardson_interior"
-            ],
-            dtype=np.float32,
-        ),
-        local_features=np.asarray(result["local_features"], dtype=np.float32),
-        global_context=np.asarray(result["global_context"], dtype=np.float32),
-        potential=np.asarray(result["potential"], dtype=np.float32),
-        grad_potential=np.asarray(result["grad_potential"], dtype=np.float32),
-        rho_sad=np.empty((0, 1), dtype=np.float32),
-        electron_count=np.asarray(result["electron_count"], dtype=np.float32),
-        occupancies=np.asarray(result["occupancies"], dtype=np.float32),
-        orbital_energies=np.asarray(result["orbital_energies"], dtype=np.float32),
-        atom_symbols=np.asarray(record.symbols),
-        atom_coords_bohr=np.asarray(result["coords_bohr_centered"], dtype=np.float32),
-        formula=np.asarray(molecular_formula(record.symbols)),
-        smiles_gdb=np.asarray(record.smiles_gdb),
-        smiles_relaxed=np.asarray(record.smiles_relaxed),
-        inchi_gdb=np.asarray(record.inchi_gdb),
-        inchi_relaxed=np.asarray(record.inchi_relaxed),
-        axis_points=np.asarray(axis_points, dtype=np.int32),
-        grid_spacing_bohr=np.asarray(args.grid_spacing_bohr, dtype=np.float32),
-        grid_radius_bohr=np.asarray(float(np.max(np.abs(result["axis"]))), dtype=np.float32),
-        box_length_bohr=np.asarray((axis_points + 1) * args.grid_spacing_bohr, dtype=np.float32),
-        kinetic_energy_hartree=np.asarray(result["kinetic_energy_hartree"], dtype=np.float32),
-        kinetic_energy_orbital_fd_hartree=np.asarray(
+    payload = {
+        "points": points_bohr,
+        "rho_diag": np.asarray(result["rho_diag"], dtype=np.float32),
+        "psi_occ": np.asarray(result["psi_occ"], dtype=np.float32),
+        "derivative_orbital_gradient": np.asarray(result["derivative_orbital_fd"], dtype=np.float32),
+        "tau_orbital_gradient": np.asarray(result["tau_orbital_fd"], dtype=np.float32),
+        "local_features": np.asarray(result["local_features"], dtype=np.float32),
+        "global_context": np.asarray(result["global_context"], dtype=np.float32),
+        "potential": np.asarray(result["potential"], dtype=np.float32),
+        "grad_potential": np.asarray(result["grad_potential"], dtype=np.float32),
+        "electron_count": np.asarray(result["electron_count"], dtype=np.float32),
+        "occupancies": np.asarray(result["occupancies"], dtype=np.float32),
+        "orbital_energies": np.asarray(result["orbital_energies"], dtype=np.float32),
+        "atom_symbols": np.asarray(record.symbols),
+        "atom_coords_bohr": np.asarray(result["coords_bohr_centered"], dtype=np.float32),
+        "formula": np.asarray(molecular_formula(record.symbols)),
+        "smiles_gdb": np.asarray(record.smiles_gdb),
+        "smiles_relaxed": np.asarray(record.smiles_relaxed),
+        "inchi_gdb": np.asarray(record.inchi_gdb),
+        "inchi_relaxed": np.asarray(record.inchi_relaxed),
+        "axis_points": np.asarray(axis_points, dtype=np.int32),
+        "grid_spacing_bohr": np.asarray(args.grid_spacing_bohr, dtype=np.float32),
+        "grid_radius_bohr": np.asarray(float(np.max(np.abs(result["axis"]))), dtype=np.float32),
+        "box_length_bohr": np.asarray((axis_points + 1) * args.grid_spacing_bohr, dtype=np.float32),
+        "kinetic_energy_hartree": np.asarray(result["kinetic_energy_hartree"], dtype=np.float32),
+        "kinetic_energy_orbital_fd_hartree": np.asarray(
             result["kinetic_energy_orbital_fd_hartree"], dtype=np.float32
         ),
-        kinetic_energy_orbital_central2_interior_hartree=np.asarray(
+        "kinetic_energy_orbital_central2_interior_hartree": np.asarray(
             result["kinetic_energy_orbital_central2_interior_hartree"], dtype=np.float32
         ),
-        kinetic_energy_gamma_central2_interior_hartree=np.asarray(
+        "kinetic_energy_gamma_central2_interior_hartree": np.asarray(
             result["kinetic_energy_gamma_central2_interior_hartree"], dtype=np.float32
         ),
-        kinetic_energy_gamma_richardson_interior_hartree=np.asarray(
+        "kinetic_energy_gamma_richardson_interior_hartree": np.asarray(
             result["kinetic_energy_gamma_richardson_interior_hartree"], dtype=np.float32
         ),
-        kinetic_reference=np.asarray(args.kinetic_reference),
-        total_energy_hartree=np.asarray(result["total_energy_hartree"], dtype=np.float32),
-        reference_schema=np.asarray("gpaw_fd_orbital_v2"),
-        tau_reference_primary=np.asarray("orbital_gradient_central2"),
-        tau_reference=np.asarray("gpaw_fd_orbital_gradient"),
-        gamma_reference=np.asarray("gpaw_fd_pseudo_wavefunctions"),
-        reference_backend=np.asarray("gpaw_fd_pseudopotential"),
-        gpaw_mode=np.asarray("FD"),
-        gpaw_xc=np.asarray(args.xc),
-        gpaw_setups=np.asarray(args.setups if args.setups else "default"),
-        gpaw_fd_order=np.asarray(args.fd_order, dtype=np.int32),
-        tau_orbital_vs_gamma_central2_mae=np.asarray(
+        "kinetic_reference": np.asarray(args.kinetic_reference),
+        "total_energy_hartree": np.asarray(result["total_energy_hartree"], dtype=np.float32),
+        "reference_schema": np.asarray("gpaw_fd_orbital_v2"),
+        "storage_profile": np.asarray(args.storage_profile),
+        "tau_reference_primary": np.asarray("orbital_gradient_central2"),
+        "tau_reference": np.asarray("gpaw_fd_orbital_gradient"),
+        "gamma_reference": np.asarray("gpaw_fd_pseudo_wavefunctions"),
+        "reference_backend": np.asarray("gpaw_fd_pseudopotential"),
+        "gpaw_mode": np.asarray("FD"),
+        "gpaw_xc": np.asarray(args.xc),
+        "gpaw_setups": np.asarray(args.setups if args.setups else "default"),
+        "gpaw_fd_order": np.asarray(args.fd_order, dtype=np.int32),
+        "tau_orbital_vs_gamma_central2_mae": np.asarray(
             result["tau_central2_consistency_mae"], dtype=np.float32
         ),
-        tau_orbital_vs_gamma_richardson_mae=np.asarray(
+        "tau_orbital_vs_gamma_richardson_mae": np.asarray(
             result["tau_richardson_consistency_mae"], dtype=np.float32
         ),
-        tau_gamma_central2_over_orbital_rms=np.asarray(
+        "tau_gamma_central2_over_orbital_rms": np.asarray(
             result["tau_central2_consistency_rms_ratio"], dtype=np.float32
         ),
-        tau_gamma_richardson_over_orbital_rms=np.asarray(
+        "tau_gamma_richardson_over_orbital_rms": np.asarray(
             result["tau_richardson_consistency_rms_ratio"], dtype=np.float32
         ),
-        tau_fd_orbital_vs_gamma_mae=np.asarray(
+        "tau_fd_orbital_vs_gamma_mae": np.asarray(
             result[
                 "tau_central2_consistency_mae"
                 if args.tau_stencil == "central2"
@@ -824,7 +808,7 @@ def write_npz(record: Qm9Record, args: argparse.Namespace, output_path: Path) ->
             ],
             dtype=np.float32,
         ),
-        tau_fd_gamma_over_orbital_rms=np.asarray(
+        "tau_fd_gamma_over_orbital_rms": np.asarray(
             result[
                 "tau_central2_consistency_rms_ratio"
                 if args.tau_stencil == "central2"
@@ -832,8 +816,49 @@ def write_npz(record: Qm9Record, args: argparse.Namespace, output_path: Path) ->
             ],
             dtype=np.float32,
         ),
-        local_feature_schema=np.asarray("gpaw_fd_lapv_v2"),
-    )
+        "local_feature_schema": np.asarray("gpaw_fd_lapv_v2"),
+    }
+    if args.store_full_gamma:
+        payload["gamma_matrix"] = np.asarray(result["gamma_matrix"], dtype=np.float32)
+    if args.storage_profile == "full":
+        payload.update(
+            {
+                "derivative_gamma_central2_interior": np.asarray(
+                    result["derivative_gamma_central2_interior"], dtype=np.float32
+                ),
+                "tau_gamma_central2_interior": np.asarray(
+                    result["tau_gamma_central2_interior"], dtype=np.float32
+                ),
+                "derivative_gamma_richardson_interior": np.asarray(
+                    result["derivative_gamma_richardson_interior"], dtype=np.float32
+                ),
+                "tau_gamma_richardson_interior": np.asarray(
+                    result["tau_gamma_richardson_interior"], dtype=np.float32
+                ),
+                "derivative_true_ao": np.asarray(result["derivative_orbital_fd"], dtype=np.float32),
+                "tau_true_ao": np.asarray(result["tau_orbital_fd"], dtype=np.float32),
+                "derivative_true_fd_orbital": np.asarray(result["derivative_orbital_fd"], dtype=np.float32),
+                "tau_true_fd_orbital": np.asarray(result["tau_orbital_fd"], dtype=np.float32),
+                "derivative_true_fd_gamma": np.asarray(
+                    result[
+                        "derivative_gamma_central2_interior"
+                        if args.tau_stencil == "central2"
+                        else "derivative_gamma_richardson_interior"
+                    ],
+                    dtype=np.float32,
+                ),
+                "tau_true_fd_gamma": np.asarray(
+                    result[
+                        "tau_gamma_central2_interior"
+                        if args.tau_stencil == "central2"
+                        else "tau_gamma_richardson_interior"
+                    ],
+                    dtype=np.float32,
+                ),
+                "rho_sad": np.empty((0, 1), dtype=np.float32),
+            }
+        )
+    np.savez_compressed(output_path, **payload)
     return {
         "system_id": output_path.stem,
         "qm9_id": record.qm9_id,
@@ -872,6 +897,7 @@ def write_npz(record: Qm9Record, args: argparse.Namespace, output_path: Path) ->
         "axis_points": axis_points,
         "grid_spacing_bohr": float(args.grid_spacing_bohr),
         "box_length_bohr": (axis_points + 1) * float(args.grid_spacing_bohr),
+        "storage_profile": args.storage_profile,
         "xc": args.xc,
         "setups": args.setups,
     }
@@ -905,6 +931,7 @@ def write_indices(output_dir: Path, manifest: list[dict[str, object]]) -> None:
         "tau_orbital_vs_gamma_richardson_mae",
         "tau_fd_orbital_vs_gamma_mae",
         "tau_fd_gamma_over_orbital_rms",
+        "storage_profile",
         "npz_file",
         "xyz_file",
     ]
@@ -1003,6 +1030,7 @@ def main() -> None:
                         )
                     ),
                     "kinetic_reference": str(np.asarray(payload.get("kinetic_reference", "legacy")).item()),
+                    "storage_profile": str(np.asarray(payload.get("storage_profile", "full")).item()),
                     "tau_orbital_vs_gamma_central2_mae": float(
                         payload.get(
                             "tau_orbital_vs_gamma_central2_mae",
@@ -1034,6 +1062,7 @@ def main() -> None:
                 "kinetic_energy_gamma_central2_interior_hartree": float("nan"),
                 "kinetic_energy_gamma_richardson_interior_hartree": float("nan"),
                 "kinetic_reference": args.kinetic_reference,
+                "storage_profile": args.storage_profile,
                 "tau_orbital_vs_gamma_central2_mae": float("nan"),
                 "tau_orbital_vs_gamma_richardson_mae": float("nan"),
                 "tau_fd_orbital_vs_gamma_mae": float("nan"),

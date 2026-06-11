@@ -250,3 +250,19 @@ python train_transferable_1rdm.py \
 - `training.py`: 학습 / held-out system 평가
 - `plotting.py`: 요약 figure
 - `train_transferable_1rdm.py`: 실행 entry point
+## GPAW NPZ storage profiles
+
+New GPAW datasets default to `--storage-profile training-compact`. This keeps
+the orbital factors, density and physics targets, model inputs, geometry,
+scalar diagnostics, and reference metadata required for production training.
+It omits duplicate legacy aliases and full gamma-derived diagnostic grids.
+
+Use `--storage-profile full` only when the per-point central2/Richardson
+diagnostic arrays are needed. Existing full datasets can be converted without
+rerunning GPAW:
+
+```bash
+python scripts/compact_gpaw_training_npz.py \
+  --input-dir qmugs_npz/qm9_gpaw_fd_orbital_v2_500_atoms10_h0p4 \
+  --output-dir qmugs_npz/qm9_gpaw_fd_orbital_v2_500_atoms10_h0p4_compact
+```

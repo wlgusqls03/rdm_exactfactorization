@@ -1200,6 +1200,13 @@ def true_gamma_stencil_targets(system: SystemRecord) -> tuple[np.ndarray, np.nda
         )
         _TRUE_GAMMA_STENCIL_TARGET_CACHE[id(system)] = targets
         return targets
+    if int(system.stencil_left.shape[2]) < 8:
+        targets = (
+            np.asarray(system.derivative_true, dtype=np.float32),
+            np.asarray(system.tau_true, dtype=np.float32),
+        )
+        _TRUE_GAMMA_STENCIL_TARGET_CACHE[id(system)] = targets
+        return targets
     stencil_order = int(system.stencil_left.shape[2])
     stencil_shape = system.stencil_left.shape
     left_idx = system.stencil_left.reshape(-1)
