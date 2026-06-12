@@ -330,6 +330,18 @@ only to force one global conversion factor for all systems.
 `RDM_LOCAL_CURVATURE_SIGMA` remains a backward-compatible alias for
 `RDM_LOCAL_CURVATURE_SIGMA_NORM`.
 
+Large real-space grids should chunk full diagonal evaluation separately from
+stencil prediction:
+
+```bash
+RDM_DIAGONAL_PREDICTION_CHUNK_SIZE=32768
+```
+
+Reduce this to `16384` or `8192` on GPUs with limited free memory. This setting
+prevents final evaluation from constructing the full `n_points x model_width`
+activation tensor at once; `RDM_STENCIL_PREDICTION_CHUNK_SIZE` controls a
+different derivative/tau path.
+
 Recommended Fukui-feature training command for an existing 500-molecule charged
 oracle NPZ dataset:
 

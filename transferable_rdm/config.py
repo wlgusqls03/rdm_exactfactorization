@@ -128,6 +128,9 @@ class ExperimentConfig:
     train_stencil_centers: int = int(os.environ.get("RDM_TRAIN_STENCIL_CENTERS", 0))
     stencil_feature_cache_max_centers: int = int(os.environ.get("RDM_STENCIL_FEATURE_CACHE_MAX_CENTERS", 200000))
     stencil_prediction_chunk_size: int = int(os.environ.get("RDM_STENCIL_PREDICTION_CHUNK_SIZE", 65536))
+    diagonal_prediction_chunk_size: int = int(
+        os.environ.get("RDM_DIAGONAL_PREDICTION_CHUNK_SIZE", 32768)
+    )
     overfit_one_system: bool = env_flag("RDM_OVERFIT_ONE_SYSTEM", False)
     overfit_system_index: int = int(os.environ.get("RDM_OVERFIT_SYSTEM_INDEX", 0))
     overfit_system_id: str = os.environ.get("RDM_OVERFIT_SYSTEM_ID", "")

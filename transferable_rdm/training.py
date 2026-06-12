@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
@@ -1020,6 +1021,25 @@ def diagonal_predictions(
         if diag_indices is None
         else np.asarray(diag_indices, dtype=np.int64)
     )
+    chunk_size = max(int(config.diagonal_prediction_chunk_size), 1)
+    if len(diag_idx) > chunk_size:
+        gamma_chunks: list[tf.Tensor] = []
+        kernel_chunks: list[tf.Tensor] = []
+        for start in range(0, len(diag_idx), chunk_size):
+            chunk_outputs = diagonal_predictions(
+                system,
+                models,
+                config,
+                rho_all=rho_all,
+                density_state=density_state,
+                diag_indices=diag_idx[start : start + chunk_size],
+            )
+            gamma_chunks.append(chunk_outputs["gamma"])
+            kernel_chunks.append(chunk_outputs["kernel"])
+        return {
+            "gamma": tf.concat(gamma_chunks, axis=0),
+            "kernel": tf.concat(kernel_chunks, axis=0),
+        }
     pair_feat = build_pair_features(system, diag_idx, diag_idx)
     rho_diag = gather_density(rho_all, diag_idx)
     outputs = predict_from_features(
@@ -1034,6 +1054,13 @@ def diagonal_predictions(
         local_curvature_basis_scale=local_curvature_basis_scale(system, config),
     )
     return outputs
+
+
+def clear_gpu_evaluation_caches() -> None:
+    """Release per-system tensors before evaluating another large split."""
+    clear_frozen_density_state_cache()
+    _SYSTEM_TENSOR_CACHE.clear()
+    gc.collect()
 
 
 def select_diagonal_indices(
@@ -2596,6 +2623,7 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
                 "stencil feature cache centers",
                 "disabled" if config.stencil_feature_cache_max_centers <= 0 else config.stencil_feature_cache_max_centers,
             ),
+            ("diagonal prediction chunk", config.diagonal_prediction_chunk_size),
             ("kinetic integral active", loss_enabled(config, "kinetic")),
         ],
     )
@@ -2922,7 +2950,9 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
         split.val_systems,
         config.final_val_eval_system_count,
     )
+    clear_gpu_evaluation_caches()
     final_train = evaluate_systems(final_train_systems, models, config, epoch=last_epoch)
+    clear_gpu_evaluation_caches()
     final_val = evaluate_systems(final_val_systems, models, config, epoch=last_epoch)
     final_train["evaluated_system_count"] = len(final_train_systems)
     final_train["available_system_count"] = len(split.train_systems)
@@ -2934,9 +2964,11 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
             split.test_systems,
             config.final_test_eval_system_count,
         )
+        clear_gpu_evaluation_caches()
         summary["test"] = evaluate_systems(final_test_systems, models, config, epoch=last_epoch)
         summary["test"]["evaluated_system_count"] = len(final_test_systems)
         summary["test"]["available_system_count"] = len(split.test_systems)
+    clear_gpu_evaluation_caches()
     summary["evaluation_metadata"] = {
         "density_source": (
             "true oracle"
