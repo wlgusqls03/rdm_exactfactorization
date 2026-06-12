@@ -311,21 +311,24 @@ K_local = scale * window * (c_x s_x^2 + c_y s_y^2 + c_z s_z^2)
 ```
 
 where `s_a^2` is the pair-feature separation square rescaled from
-`Delta_a^2 / domain^2` to approximately `Delta_a^2 / h^2`. The local heads are
-zero-initialized; training starts as the previous kernel and learns local
-curvature only if the derivative/tau losses supply useful signal. Useful
-controls:
+`Delta_a^2 / domain^2` back to physical `Delta_a^2` for the quadratic form.
+The Gaussian window still uses normalized separation, so its sigma is expressed
+in domain-radius units rather than bohr. The local heads are zero-initialized;
+training starts as the previous kernel and learns local curvature only if the
+derivative/tau losses supply useful signal. Useful controls:
 
 ```bash
 RDM_USE_LOCAL_CURVATURE_KERNEL=1 \
 RDM_LOCAL_CURVATURE_SCALE=0.5 \
-RDM_LOCAL_CURVATURE_SIGMA=1.0 \
+RDM_LOCAL_CURVATURE_SIGMA_NORM=1.0 \
 RDM_LOCAL_CURVATURE_BASIS_SCALE=0
 ```
 
 `RDM_LOCAL_CURVATURE_BASIS_SCALE=0` uses the automatic per-system
-`(max(abs(axis)) / grid_step)^2` conversion. Set it to a positive value only to
-force one global conversion factor for all systems.
+`max(abs(axis))^2` conversion for the quadratic form. Set it to a positive value
+only to force one global conversion factor for all systems.
+`RDM_LOCAL_CURVATURE_SIGMA` remains a backward-compatible alias for
+`RDM_LOCAL_CURVATURE_SIGMA_NORM`.
 
 Recommended Fukui-feature training command for an existing 500-molecule charged
 oracle NPZ dataset:

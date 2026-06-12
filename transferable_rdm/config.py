@@ -90,7 +90,14 @@ class ExperimentConfig:
     use_local_curvature_kernel: bool = env_flag("RDM_USE_LOCAL_CURVATURE_KERNEL", True)
     local_curvature_form: str = os.environ.get("RDM_LOCAL_CURVATURE_FORM", "quadratic")
     local_curvature_scale: float = float(os.environ.get("RDM_LOCAL_CURVATURE_SCALE", 0.5))
-    local_curvature_sigma: float = float(os.environ.get("RDM_LOCAL_CURVATURE_SIGMA", 1.0))
+    # Width in normalized separation units, where 1.0 is the system domain radius.
+    # RDM_LOCAL_CURVATURE_SIGMA remains a backward-compatible alias.
+    local_curvature_sigma: float = float(
+        os.environ.get(
+            "RDM_LOCAL_CURVATURE_SIGMA_NORM",
+            os.environ.get("RDM_LOCAL_CURVATURE_SIGMA", 1.0),
+        )
+    )
     local_curvature_diag_eps: float = float(os.environ.get("RDM_LOCAL_CURVATURE_DIAG_EPS", 1e-8))
     local_curvature_basis_scale: float = float(os.environ.get("RDM_LOCAL_CURVATURE_BASIS_SCALE", 0.0))
     local_curvature_init_bias: float = float(os.environ.get("RDM_LOCAL_CURVATURE_INIT_BIAS", -10.0))

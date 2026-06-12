@@ -174,7 +174,14 @@ def build_models(config: ExperimentConfig, point_feat_dim: int, pair_feat_dim: i
             ("local curvature kernel", config.use_local_curvature_kernel),
             ("local curvature form", config.local_curvature_form if config.use_local_curvature_kernel else "off"),
             ("local curvature scale", f"{config.local_curvature_scale:.6g}" if config.use_local_curvature_kernel else "off"),
-            ("local curvature sigma", f"{config.local_curvature_sigma:.6g}" if config.use_local_curvature_kernel else "off"),
+            (
+                "local curvature sigma",
+                (
+                    f"{config.local_curvature_sigma:.6g} normalized domain units"
+                    if config.use_local_curvature_kernel
+                    else "off"
+                ),
+            ),
             ("local curvature init bias", f"{config.local_curvature_init_bias:.6g}" if config.use_local_curvature_kernel else "off"),
             ("local curvature basis scale", local_basis_label if config.use_local_curvature_kernel else "off"),
             ("point output dim", n_density_heads),

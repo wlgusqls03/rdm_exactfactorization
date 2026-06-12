@@ -113,6 +113,8 @@ CSV_METRIC_KEYS = [
     "energy_total_pred",
     "energy_total_ref_minus_pred",
     "energy_total_grid_ref_minus_pred",
+    "energy_stored_minus_grid_ref",
+    "energy_stored_total_available",
     "energy_total_abs_error",
     "energy_total_rmse",
     "energy_grid_total_abs_error",
@@ -159,6 +161,8 @@ CSV_SYSTEM_KEYS = [
     "n_points",
     "grid_spacing_bohr",
     "electron_count",
+    "gamma_fd_target_source",
+    "kinetic_evaluation_mode",
 ] + CSV_METRIC_KEYS
 
 
@@ -470,10 +474,28 @@ def summarize_for_json(summary: dict[str, object]) -> dict[str, object]:
     payload = {
         "train_average": train_avg,
         "val_average": val_avg,
+        "train_evaluation": {
+            "evaluated_system_count": summary["train"].get("evaluated_system_count"),
+            "available_system_count": summary["train"].get("available_system_count"),
+            "gamma_fd_target_sources": summary["train"].get("gamma_fd_target_sources", []),
+            "kinetic_evaluation_modes": summary["train"].get("kinetic_evaluation_modes", []),
+        },
+        "val_evaluation": {
+            "evaluated_system_count": summary["val"].get("evaluated_system_count"),
+            "available_system_count": summary["val"].get("available_system_count"),
+            "gamma_fd_target_sources": summary["val"].get("gamma_fd_target_sources", []),
+            "kinetic_evaluation_modes": summary["val"].get("kinetic_evaluation_modes", []),
+        },
     }
     if "test" in summary:
         payload["test_average"] = {
             key: value for key, value in summary["test"].items() if isinstance(value, (int, float))
+        }
+        payload["test_evaluation"] = {
+            "evaluated_system_count": summary["test"].get("evaluated_system_count"),
+            "available_system_count": summary["test"].get("available_system_count"),
+            "gamma_fd_target_sources": summary["test"].get("gamma_fd_target_sources", []),
+            "kinetic_evaluation_modes": summary["test"].get("kinetic_evaluation_modes", []),
         }
 
     representative = summary["val"]["per_system"][0]
@@ -485,6 +507,11 @@ def summarize_for_json(summary: dict[str, object]) -> dict[str, object]:
         "tau_fd_ao_mae": representative["tau_fd_ao_mae"],
         "tau_fd_ao_rms_ratio": representative["tau_fd_ao_rms_ratio"],
         "tau_pred_fd_mae": representative["tau_pred_fd_mae"],
+        "gamma_fd_target_source": representative["gamma_fd_target_source"],
+        "kinetic_evaluation_mode": representative["kinetic_evaluation_mode"],
+        "stencil_eval_centers": representative["stencil_eval_centers"],
+        "stencil_eval_total_centers": representative["stencil_eval_total_centers"],
+        "stencil_eval_sampled": representative["stencil_eval_sampled"],
         "kinetic_loss": representative["kinetic_loss"],
         "kinetic_pred": representative["kinetic_pred"],
         "kinetic_training_ref": representative["kinetic_training_ref"],
@@ -504,6 +531,8 @@ def summarize_for_json(summary: dict[str, object]) -> dict[str, object]:
         "energy_total_pred": representative["energy_total_pred"],
         "energy_total_ref_minus_pred": representative["energy_total_ref_minus_pred"],
         "energy_total_grid_ref_minus_pred": representative["energy_total_grid_ref_minus_pred"],
+        "energy_stored_minus_grid_ref": representative["energy_stored_minus_grid_ref"],
+        "energy_stored_total_available": representative["energy_stored_total_available"],
         "energy_kinetic_ref_minus_pred": representative["energy_kinetic_ref_minus_pred"],
         "energy_external_ref_minus_pred": representative["energy_external_ref_minus_pred"],
         "energy_hartree_ref_minus_pred": representative["energy_hartree_ref_minus_pred"],

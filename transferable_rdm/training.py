@@ -105,8 +105,8 @@ EVAL_OBJECTIVE_TERMS = (
 )
 
 PHYSICS_TARGET_MODES = ("orbital", "fd")
-_TRUE_GAMMA_STENCIL_TARGET_CACHE: dict[int, tuple[np.ndarray, np.ndarray]] = {}
-_PHYSICS_TAU_INTEGRAL_CACHE: dict[tuple[int, str], float] = {}
+_TRUE_GAMMA_STENCIL_TARGET_CACHE: dict[tuple[int, int, float], tuple[np.ndarray, np.ndarray]] = {}
+_PHYSICS_TAU_INTEGRAL_CACHE: dict[tuple[int, str, int, float], float] = {}
 _STENCIL_PAIR_FEATURE_CACHE: OrderedDict[tuple[int, int], np.ndarray] = OrderedDict()
 _SYSTEM_TENSOR_CACHE: OrderedDict[int, "SystemTensorState"] = OrderedDict()
 _COULOMB_KERNEL_FFT_CACHE: OrderedDict[tuple[int, float], np.ndarray] = OrderedDict()
@@ -784,7 +784,12 @@ def kinetic_energy_reference(
 
 
 def physics_tau_integral(system: SystemRecord, config: ExperimentConfig) -> float:
-    key = (id(system), physics_target_mode(config))
+    key = (
+        id(system),
+        physics_target_mode(config),
+        int(system.stencil_left.shape[2]),
+        float(system.step),
+    )
     cached = _PHYSICS_TAU_INTEGRAL_CACHE.get(key)
     if cached is None:
         _, tau_target = physics_stencil_targets(system, config)
@@ -956,12 +961,19 @@ def energy_diagnostics(
     total_ref_for_error = stored_total_ref if np.isfinite(stored_total_ref) else ref["total"]
     total_error = float(total_ref_for_error - pred["total"])
     grid_total_error = float(ref["total"] - pred["total"])
+    stored_minus_grid_ref = (
+        float(stored_total_ref - ref["total"])
+        if np.isfinite(stored_total_ref)
+        else float("nan")
+    )
     out: dict[str, float] = {
         "energy_total_ref": total_ref_for_error,
         "energy_total_grid_ref": ref["total"],
         "energy_total_pred": pred["total"],
         "energy_total_ref_minus_pred": total_error,
         "energy_total_grid_ref_minus_pred": grid_total_error,
+        "energy_stored_minus_grid_ref": stored_minus_grid_ref,
+        "energy_stored_total_available": float(np.isfinite(stored_total_ref)),
         "energy_total_abs_error": abs(total_error),
         "energy_total_sq_error": total_error**2,
         "energy_grid_total_abs_error": abs(grid_total_error),
@@ -1188,49 +1200,69 @@ def stencil_predictions(
     return derivative_pred, tau_pred
 
 
+def gamma_stencil_targets(
+    system: SystemRecord,
+    *,
+    center_indices: np.ndarray | None = None,
+    chunk_centers: int = 8192,
+) -> tuple[np.ndarray, np.ndarray, str]:
+    """Compute true-gamma mixed derivatives, preserving the diagnostic source."""
+    selected = (
+        np.arange(system.stencil_left.shape[0], dtype=np.int64)
+        if center_indices is None
+        else np.asarray(center_indices, dtype=np.int64)
+    )
+    if system.derivative_true_fd is not None and system.tau_true_fd is not None:
+        return (
+            np.asarray(system.derivative_true_fd[selected], dtype=np.float32),
+            np.asarray(system.tau_true_fd[selected], dtype=np.float32),
+            "stored_gamma_stencil",
+        )
+
+    stencil_order = int(system.stencil_left.shape[2])
+    derivative_chunks = []
+    for start in range(0, len(selected), max(int(chunk_centers), 1)):
+        chunk_indices = selected[start : start + max(int(chunk_centers), 1)]
+        chunk_shape = (len(chunk_indices),) + tuple(system.stencil_left.shape[1:])
+        left_idx = system.stencil_left[chunk_indices].reshape(-1)
+        right_idx = system.stencil_right[chunk_indices].reshape(-1)
+        gamma_stencil = system.gamma_values(left_idx, right_idx).reshape(chunk_shape)
+        d_h = (
+            gamma_stencil[:, :, 0]
+            - gamma_stencil[:, :, 1]
+            - gamma_stencil[:, :, 2]
+            + gamma_stencil[:, :, 3]
+        ) / (4.0 * system.step * system.step)
+        if stencil_order >= 8:
+            d_2h = (
+                gamma_stencil[:, :, 4]
+                - gamma_stencil[:, :, 5]
+                - gamma_stencil[:, :, 6]
+                + gamma_stencil[:, :, 7]
+            ) / (16.0 * system.step * system.step)
+            derivative_chunks.append((4.0 * d_h - d_2h) / 3.0)
+        else:
+            derivative_chunks.append(d_h)
+    derivative_fd = np.concatenate(derivative_chunks, axis=0).astype(np.float32)
+    tau_fd = 0.5 * np.sum(derivative_fd, axis=1, keepdims=True)
+    source = (
+        "reconstructed_from_psi_occ"
+        if (system.psi_occ is not None and system.psi_occ.size)
+        or bool(system.metadata.get("has_psi_occ", False))
+        else "reconstructed_from_gamma_matrix"
+    )
+    return derivative_fd, tau_fd.astype(np.float32), source
+
+
 def true_gamma_stencil_targets(system: SystemRecord) -> tuple[np.ndarray, np.ndarray]:
-    """Compute derivative/tau targets from the true gamma on the model stencil."""
-    cached = _TRUE_GAMMA_STENCIL_TARGET_CACHE.get(id(system))
+    """Compute and cache full derivative/tau targets from true gamma."""
+    cache_key = (id(system), int(system.stencil_left.shape[2]), float(system.step))
+    cached = _TRUE_GAMMA_STENCIL_TARGET_CACHE.get(cache_key)
     if cached is not None:
         return cached
-    if system.derivative_true_fd is not None and system.tau_true_fd is not None:
-        targets = (
-            np.asarray(system.derivative_true_fd, dtype=np.float32),
-            np.asarray(system.tau_true_fd, dtype=np.float32),
-        )
-        _TRUE_GAMMA_STENCIL_TARGET_CACHE[id(system)] = targets
-        return targets
-    if int(system.stencil_left.shape[2]) < 8:
-        targets = (
-            np.asarray(system.derivative_true, dtype=np.float32),
-            np.asarray(system.tau_true, dtype=np.float32),
-        )
-        _TRUE_GAMMA_STENCIL_TARGET_CACHE[id(system)] = targets
-        return targets
-    stencil_order = int(system.stencil_left.shape[2])
-    stencil_shape = system.stencil_left.shape
-    left_idx = system.stencil_left.reshape(-1)
-    right_idx = system.stencil_right.reshape(-1)
-    gamma_stencil = system.gamma_values(left_idx, right_idx).reshape(stencil_shape)
-    d_h = (
-        gamma_stencil[:, :, 0]
-        - gamma_stencil[:, :, 1]
-        - gamma_stencil[:, :, 2]
-        + gamma_stencil[:, :, 3]
-    ) / (4.0 * system.step * system.step)
-    if stencil_order >= 8:
-        d_2h = (
-            gamma_stencil[:, :, 4]
-            - gamma_stencil[:, :, 5]
-            - gamma_stencil[:, :, 6]
-            + gamma_stencil[:, :, 7]
-        ) / (16.0 * system.step * system.step)
-        derivative_fd = (4.0 * d_h - d_2h) / 3.0
-    else:
-        derivative_fd = d_h
-    tau_fd = 0.5 * np.sum(derivative_fd, axis=1, keepdims=True)
-    targets = (derivative_fd.astype(np.float32), tau_fd.astype(np.float32))
-    _TRUE_GAMMA_STENCIL_TARGET_CACHE[id(system)] = targets
+    derivative_fd, tau_fd, _ = gamma_stencil_targets(system)
+    targets = (derivative_fd, tau_fd)
+    _TRUE_GAMMA_STENCIL_TARGET_CACHE[cache_key] = targets
     return targets
 
 
@@ -1565,11 +1597,9 @@ def evaluate_system(
     )
     derivative_pred = derivative_pred_t.numpy()
     tau_pred = tau_pred_t.numpy()
-    full_derivative_true_fd, full_tau_true_fd = true_gamma_stencil_targets(system)
     full_derivative_target, full_tau_target = physics_stencil_targets(system, config)
     if eval_center_indices is None:
-        derivative_true_fd = full_derivative_true_fd
-        tau_true_fd = full_tau_true_fd
+        derivative_true_fd, tau_true_fd, gamma_fd_target_source = gamma_stencil_targets(system)
         derivative_target = full_derivative_target
         tau_target = full_tau_target
         derivative_true_orbital = system.derivative_true
@@ -1577,8 +1607,10 @@ def evaluate_system(
         stencil_integration_multiplier = 1.0
         stencil_eval_centers = total_stencil_centers
     else:
-        derivative_true_fd = full_derivative_true_fd[eval_center_indices]
-        tau_true_fd = full_tau_true_fd[eval_center_indices]
+        derivative_true_fd, tau_true_fd, gamma_fd_target_source = gamma_stencil_targets(
+            system,
+            center_indices=eval_center_indices,
+        )
         derivative_target = full_derivative_target[eval_center_indices]
         tau_target = full_tau_target[eval_center_indices]
         derivative_true_orbital = system.derivative_true[eval_center_indices]
@@ -1672,7 +1704,11 @@ def evaluate_system(
     min_eig_pred = float(np.min(occ_eigs_t.numpy()))
     top_mo_occ_true = topk_descending(system.occupancies, 6) if len(system.occupancies) else np.array([], dtype=np.float32)
     tau_true_integral = float(np.sum(system.tau_true) * system.cell_volume)
-    tau_true_fd_integral = float(np.sum(full_tau_true_fd) * system.cell_volume)
+    tau_true_fd_integral = (
+        float(np.sum(tau_true_fd) * system.cell_volume)
+        if eval_center_indices is None
+        else float("nan")
+    )
     tau_pred_integral = float(kinetic_pred)
 
     metrics = {
@@ -1687,6 +1723,16 @@ def evaluate_system(
         "stencil_eval_centers": float(stencil_eval_centers),
         "stencil_eval_total_centers": float(total_stencil_centers),
         "stencil_eval_sampled": float(eval_center_indices is not None),
+        "gamma_fd_target_source": gamma_fd_target_source,
+        "kinetic_evaluation_mode": (
+            "full_grid"
+            if eval_center_indices is None
+            else (
+                "sampled_control_variate"
+                if config.kinetic_control_variate
+                else "sampled_scaled_integral"
+            )
+        ),
         "pair_loss": pair_loss,
         "pair_mae": pair_mae,
         "rho_loss": rho_loss,
@@ -1846,6 +1892,8 @@ def evaluate_systems(
         "energy_total_pred",
         "energy_total_ref_minus_pred",
         "energy_total_grid_ref_minus_pred",
+        "energy_stored_minus_grid_ref",
+        "energy_stored_total_available",
         "energy_total_abs_error",
         "energy_total_sq_error",
         "energy_grid_total_abs_error",
@@ -1896,6 +1944,12 @@ def evaluate_systems(
     ):
         values = np.asarray([entry[src_key] for entry in per_system], dtype=np.float64)
         averages[dst_key] = float(np.nan) if np.all(np.isnan(values)) else float(np.sqrt(np.nanmean(values)))
+    averages["gamma_fd_target_sources"] = sorted(
+        {str(entry["gamma_fd_target_source"]) for entry in per_system}
+    )
+    averages["kinetic_evaluation_modes"] = sorted(
+        {str(entry["kinetic_evaluation_mode"]) for entry in per_system}
+    )
     averages["per_system"] = per_system
     return averages
 
@@ -2268,6 +2322,10 @@ def print_gradient_diagnostics(
         config.train_diagonal_points,
         rng=np.random.default_rng(config.seed + 4402),
     )
+    diagnostic_derivative_fd, diagnostic_tau_fd, diagnostic_gamma_fd_source = gamma_stencil_targets(
+        system,
+        center_indices=diagnostic_center_indices,
+    )
 
     with tf.GradientTape(persistent=True) as tape:
         losses = compute_training_losses(
@@ -2297,6 +2355,8 @@ def print_gradient_diagnostics(
             f"{min(diagnostic_stencil_centers, int(system.stencil_left.shape[0]))}/{int(system.stencil_left.shape[0])}",
         ),
         ("local curvature basis scale", f"{local_curvature_basis_scale(system, config):.6e}"),
+        ("local curvature sigma", f"{config.local_curvature_sigma:.6g} normalized domain units"),
+        ("gamma-FD diagnostic source", diagnostic_gamma_fd_source),
         (
             "scheduled weights gamma/deriv/tau/kinetic",
             (
@@ -2374,11 +2434,10 @@ def print_gradient_diagnostics(
         max_centers=diagnostic_stencil_centers,
         center_indices=diagnostic_center_indices,
     )
-    derivative_true_fd, tau_true_fd = true_gamma_stencil_targets(system)
+    derivative_true_fd = diagnostic_derivative_fd
+    tau_true_fd = diagnostic_tau_fd
     derivative_target, tau_target = physics_stencil_targets(system, config)
     if diagnostic_center_indices is not None:
-        derivative_true_fd = derivative_true_fd[diagnostic_center_indices]
-        tau_true_fd = tau_true_fd[diagnostic_center_indices]
         derivative_target = derivative_target[diagnostic_center_indices]
         tau_target = tau_target[diagnostic_center_indices]
     elif diagnostic_stencil_centers > 0:
@@ -2722,7 +2781,8 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
                     + f"held-out systems={len(val_metrics['per_system'])} "
                     + f"stencil eval centers={val_metrics['stencil_eval_centers']:.0f}/"
                     + f"{val_metrics['stencil_eval_total_centers']:.0f} "
-                    + f"sampled={bool(val_metrics['stencil_eval_sampled'])}"
+                    + f"sampled={bool(val_metrics['stencil_eval_sampled'])} "
+                    + f"kinetic={','.join(val_metrics['kinetic_evaluation_modes'])}"
                 )
                 print(
                     " " * 14
@@ -2750,14 +2810,22 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
                     " " * 14
                     + f"held-out gamma-FD-vs-orbital tau_mae={val_metrics['tau_fd_ao_mae']:.3e} "
                     + f"pred-vs-FD tau_mae={val_metrics['tau_pred_fd_mae']:.3e} "
-                    + f"tau_fd/orbital_rms={val_metrics['tau_fd_ao_rms_ratio']:.3e}"
+                    + f"tau_fd/orbital_rms={val_metrics['tau_fd_ao_rms_ratio']:.3e} "
+                    + f"source={','.join(val_metrics['gamma_fd_target_sources'])}"
                 )
-                print(
-                    " " * 14
-                    + f"held-out E stored ref-pred={val_metrics['energy_total_ref_minus_pred']:.3e} "
-                    + f"MAE={val_metrics['energy_total_abs_error']:.3e} "
-                    + f"RMSE={val_metrics['energy_total_rmse']:.3e}"
-                )
+                if val_metrics["energy_stored_total_available"] >= 1.0:
+                    print(
+                        " " * 14
+                        + f"held-out E stored-GPAW minus grid-pred={val_metrics['energy_total_ref_minus_pred']:.3e} "
+                        + f"MAE={val_metrics['energy_total_abs_error']:.3e} "
+                        + f"RMSE={val_metrics['energy_total_rmse']:.3e} diagnostic-only"
+                    )
+                    print(
+                        " " * 14
+                        + f"held-out E stored-GPAW minus grid-ref={val_metrics['energy_stored_minus_grid_ref']:.3e}"
+                    )
+                else:
+                    print(" " * 14 + "held-out stored GPAW total unavailable; reporting grid energy only")
                 print(
                     " " * 14
                     + f"held-out E grid ref-pred={val_metrics['energy_total_grid_ref_minus_pred']:.3e} "
@@ -2803,6 +2871,10 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
     )
     final_train = evaluate_systems(final_train_systems, models, config, epoch=last_epoch)
     final_val = evaluate_systems(final_val_systems, models, config, epoch=last_epoch)
+    final_train["evaluated_system_count"] = len(final_train_systems)
+    final_train["available_system_count"] = len(split.train_systems)
+    final_val["evaluated_system_count"] = len(final_val_systems)
+    final_val["available_system_count"] = len(split.val_systems)
     summary = {"train": final_train, "val": final_val}
     if split.test_systems:
         final_test_systems = select_evaluation_systems(
@@ -2810,6 +2882,8 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
             config.final_test_eval_system_count,
         )
         summary["test"] = evaluate_systems(final_test_systems, models, config, epoch=last_epoch)
+        summary["test"]["evaluated_system_count"] = len(final_test_systems)
+        summary["test"]["available_system_count"] = len(split.test_systems)
 
     rows = [
         ("train objective", f"{final_train['objective']:.6e}"),
@@ -2818,10 +2892,22 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
         ("held-out density MAE", f"{final_val['density_mae']:.6e}"),
         ("held-out kinetic loss", f"{final_val['kinetic_loss']:.6e}"),
         ("held-out kinetic abs err", f"{final_val['kinetic_abs_error']:.6e}"),
-        ("held-out total E ref-pred", f"{final_val['energy_total_ref_minus_pred']:.6e}"),
-        ("held-out total E MAE", f"{final_val['energy_total_abs_error']:.6e}"),
-        ("held-out total E RMSE", f"{final_val['energy_total_rmse']:.6e}"),
+        (
+            "held-out systems evaluated",
+            f"{final_val['evaluated_system_count']} / {final_val['available_system_count']}",
+        ),
+        (
+            "held-out stencil evaluation",
+            (
+                f"{final_val['stencil_eval_centers']:.0f} / "
+                f"{final_val['stencil_eval_total_centers']:.0f}; "
+                f"{','.join(final_val['kinetic_evaluation_modes'])}"
+            ),
+        ),
+        ("held-out gamma-FD source", ",".join(final_val["gamma_fd_target_sources"])),
         ("held-out grid E ref-pred", f"{final_val['energy_total_grid_ref_minus_pred']:.6e}"),
+        ("held-out grid E MAE", f"{final_val['energy_grid_total_abs_error']:.6e}"),
+        ("held-out grid E RMSE", f"{final_val['energy_grid_total_rmse']:.6e}"),
         ("held-out E ref T/Vext/J/Exc/Enn", energy_component_summary(final_val, "ref")),
         ("held-out E pred T/Vext/J/Exc/Enn", energy_component_summary(final_val, "pred")),
         ("held-out trace rel err", f"{final_val['trace_abs_rel_error']:.6e}"),
@@ -2832,25 +2918,59 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
         ("held-out symmetry MAE", f"{final_val['symmetry_mae']:.6e}"),
         ("held-out kernel diag err", f"{final_val['kernel_diag_error']:.6e}"),
     ]
+    if final_val["energy_stored_total_available"] >= 1.0:
+        rows[9:9] = [
+            (
+                "held-out stored GPAW E - grid pred",
+                f"{final_val['energy_total_ref_minus_pred']:.6e} (diagnostic only)",
+            ),
+            (
+                "held-out stored GPAW E - grid ref",
+                f"{final_val['energy_stored_minus_grid_ref']:.6e}",
+            ),
+        ]
+    else:
+        rows.insert(9, ("held-out stored GPAW total", "unavailable; grid energy only"))
     if "test" in summary:
         final_test = summary["test"]
-        rows.extend(
-            [
+        test_rows = [
                 ("test objective", f"{final_test['objective']:.6e}"),
                 ("test gamma_pair loss", f"{final_test['pair_loss']:.6e}"),
                 ("test density MAE", f"{final_test['density_mae']:.6e}"),
                 ("test kinetic loss", f"{final_test['kinetic_loss']:.6e}"),
                 ("test kinetic abs err", f"{final_test['kinetic_abs_error']:.6e}"),
-                ("test total E ref-pred", f"{final_test['energy_total_ref_minus_pred']:.6e}"),
-                ("test total E MAE", f"{final_test['energy_total_abs_error']:.6e}"),
-                ("test total E RMSE", f"{final_test['energy_total_rmse']:.6e}"),
+                (
+                    "test systems evaluated",
+                    f"{final_test['evaluated_system_count']} / {final_test['available_system_count']}",
+                ),
+                (
+                    "test stencil evaluation",
+                    (
+                        f"{final_test['stencil_eval_centers']:.0f} / "
+                        f"{final_test['stencil_eval_total_centers']:.0f}; "
+                        f"{','.join(final_test['kinetic_evaluation_modes'])}"
+                    ),
+                ),
+                ("test gamma-FD source", ",".join(final_test["gamma_fd_target_sources"])),
                 ("test grid E ref-pred", f"{final_test['energy_total_grid_ref_minus_pred']:.6e}"),
+                ("test grid E MAE", f"{final_test['energy_grid_total_abs_error']:.6e}"),
+                ("test grid E RMSE", f"{final_test['energy_grid_total_rmse']:.6e}"),
                 ("test E ref T/Vext/J/Exc/Enn", energy_component_summary(final_test, "ref")),
                 ("test E pred T/Vext/J/Exc/Enn", energy_component_summary(final_test, "pred")),
                 ("test tau MAE", f"{final_test['tau_mae']:.6e}"),
                 ("test tau gamma-FD-vs-orbital MAE", f"{final_test['tau_fd_ao_mae']:.6e}"),
                 ("test tau pred-vs-FD MAE", f"{final_test['tau_pred_fd_mae']:.6e}"),
+        ]
+        if final_test["energy_stored_total_available"] >= 1.0:
+            test_rows[8:8] = [
+                (
+                    "test stored GPAW E - grid pred",
+                    f"{final_test['energy_total_ref_minus_pred']:.6e} (diagnostic only)",
+                ),
+                ("test stored GPAW E - grid ref", f"{final_test['energy_stored_minus_grid_ref']:.6e}"),
             ]
-        )
+        else:
+            test_rows.insert(8, ("test stored GPAW total", "unavailable; grid energy only"))
+        rows.extend(test_rows)
     print_block("Final transferable summary", rows)
     return history, summary

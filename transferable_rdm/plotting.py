@@ -228,8 +228,21 @@ def build_metrics_text(summary: dict[str, object], representative: dict[str, obj
         f"tau MAE         : {val_avg['tau_mae']:10.3e}",
         f"T loss          : {val_avg.get('kinetic_loss', np.nan):10.3e}",
         f"T abs error [Ha]: {val_avg.get('kinetic_abs_error', np.nan):10.3e}",
+        f"grid E MAE [Ha] : {val_avg.get('energy_grid_total_abs_error', np.nan):10.3e}",
         f"trace loss      : {val_avg['trace_loss']:10.3e}",
         f"symmetry MAE    : {val_avg['symmetry_mae']:10.3e}",
+        (
+            "systems evaluated: "
+            f"{val_avg.get('evaluated_system_count', len(val_avg.get('per_system', [])))} / "
+            f"{val_avg.get('available_system_count', len(val_avg.get('per_system', [])))}"
+        ),
+        (
+            "stencil eval     : "
+            f"{val_avg.get('stencil_eval_centers', np.nan):.0f} / "
+            f"{val_avg.get('stencil_eval_total_centers', np.nan):.0f}"
+        ),
+        "kinetic estimate  : " + ",".join(val_avg.get("kinetic_evaluation_modes", [])),
+        "gamma-FD source   : " + ",".join(val_avg.get("gamma_fd_target_sources", [])),
         "",
         "REPRESENTATIVE SYSTEM",
         f"id              : {representative['system_id']}",
@@ -253,6 +266,12 @@ def build_metrics_text(summary: dict[str, object], representative: dict[str, obj
             max_line_width=90,
         ),
     ]
+    if representative.get("energy_stored_total_available", 0.0) >= 1.0:
+        top_eigenvalue_index = lines.index("TOP SUBSET EIGENVALUES")
+        lines.insert(
+            top_eigenvalue_index - 1,
+            f"stored-grid ref : {representative['energy_stored_minus_grid_ref']:10.3e}",
+        )
     return "\n".join(lines)
 
 
