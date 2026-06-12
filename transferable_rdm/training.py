@@ -514,7 +514,7 @@ def evaluate_point_model(
     delta_diagnostics = None
     for idx, system in enumerate(systems):
         pred = point_density_predictions(system, models, config)
-        if density_baseline_mode(config) == "sad-multiplicative":
+        if density_baseline_mode(config) == "sad-multiplicative" and system.rho_sad is not None:
             if delta_diagnostics is None:
                 delta_diagnostics = empty_delta_diagnostics(int(pred["delta_raw"].shape[1]))
             update_delta_diagnostics(delta_diagnostics, pred["delta_raw"], config.sad_residual_clip)
