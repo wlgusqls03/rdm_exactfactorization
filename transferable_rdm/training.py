@@ -1530,6 +1530,53 @@ def predict_pair_values(
     return outputs["gamma"].numpy().astype(np.float32)
 
 
+def gamma_anchor_slice(
+    system: SystemRecord,
+    models: ModelBundle,
+    config: ExperimentConfig,
+    *,
+    rho_all: tf.Tensor,
+    density_state: DensityFeatureState,
+) -> dict[str, object]:
+    """Evaluate gamma(r, r0) on one z-plane without constructing full gamma."""
+    axis_points = int(len(system.axis))
+    anchor_index = int(np.argmax(np.asarray(system.rho_diag).reshape(-1)))
+    anchor_xyz = np.unravel_index(
+        anchor_index,
+        (axis_points, axis_points, axis_points),
+    )
+    index_cube = np.arange(len(system.points), dtype=np.int64).reshape(
+        axis_points,
+        axis_points,
+        axis_points,
+    )
+    slice_indices = index_cube[:, :, anchor_xyz[2]].reshape(-1)
+    anchor_indices = np.full(slice_indices.shape, anchor_index, dtype=np.int64)
+    gamma_true = system.gamma_values(slice_indices, anchor_indices).reshape(
+        axis_points,
+        axis_points,
+    )
+    gamma_pred = predict_pair_values(
+        system,
+        models,
+        config,
+        slice_indices,
+        anchor_indices,
+        rho_all=rho_all,
+        density_state=density_state,
+    ).reshape(axis_points, axis_points)
+    return {
+        "gamma_anchor_true_slice": gamma_true.astype(np.float32),
+        "gamma_anchor_pred_slice": gamma_pred.astype(np.float32),
+        "gamma_anchor_index": anchor_index,
+        "gamma_anchor_xyz_index": np.asarray(anchor_xyz, dtype=np.int64),
+        "gamma_anchor_position_bohr": np.asarray(
+            system.points[anchor_index],
+            dtype=np.float32,
+        ),
+    }
+
+
 def evaluate_system(
     system: SystemRecord,
     models: ModelBundle,
@@ -1817,10 +1864,16 @@ def evaluate_system(
         metrics["fukui_minus_mae"] = float(
             np.mean(np.abs((density_state.rho_neutral - density_state.rho_cation).numpy() - (system.rho_diag - system.rho_cation)))
         )
-    if keep_arrays and len(system.points) <= config.full_eval_max_points:
-        gamma_pred_matrix = predict_full_gamma_matrix(system, models, config)
-        metrics["gamma_pred_matrix"] = gamma_pred_matrix
-        metrics["gamma_true_matrix"] = system.gamma_submatrix(np.arange(len(system.points), dtype=np.int64))
+    if keep_arrays:
+        metrics.update(
+            gamma_anchor_slice(
+                system,
+                models,
+                config,
+                rho_all=rho_all,
+                density_state=density_state,
+            )
+        )
     metrics["objective"] = objective_from_metrics(metrics, config, epoch=epoch)
     return metrics
 
@@ -2884,6 +2937,15 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
         summary["test"] = evaluate_systems(final_test_systems, models, config, epoch=last_epoch)
         summary["test"]["evaluated_system_count"] = len(final_test_systems)
         summary["test"]["available_system_count"] = len(split.test_systems)
+    summary["evaluation_metadata"] = {
+        "density_source": (
+            "true oracle"
+            if density_source_mode(config) == "true"
+            else density_source_mode(config)
+        ),
+        "kinetic_integral_active": bool(loss_enabled(config, "kinetic")),
+        "eval_full_final": bool(config.eval_full_final),
+    }
 
     rows = [
         ("train objective", f"{final_train['objective']:.6e}"),

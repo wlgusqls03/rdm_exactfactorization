@@ -474,6 +474,7 @@ def summarize_for_json(summary: dict[str, object]) -> dict[str, object]:
     payload = {
         "train_average": train_avg,
         "val_average": val_avg,
+        "evaluation_metadata": summary.get("evaluation_metadata", {}),
         "train_evaluation": {
             "evaluated_system_count": summary["train"].get("evaluated_system_count"),
             "available_system_count": summary["train"].get("available_system_count"),
