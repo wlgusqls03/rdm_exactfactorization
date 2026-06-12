@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
@@ -1910,13 +1911,29 @@ def evaluate_systems(
     models: ModelBundle,
     config: ExperimentConfig,
     epoch: int | None = None,
+    progress_label: str | None = None,
 ) -> dict[str, object]:
     """여러 시스템 평가 후 평균 지표 계산."""
     rng = np.random.default_rng(config.seed + 999)
-    per_system = [
-        evaluate_system(system, models, config, rng=rng, keep_arrays=(idx == 0), epoch=epoch)
-        for idx, system in enumerate(systems)
-    ]
+    per_system = []
+    start_time = time.perf_counter()
+    for idx, system in enumerate(systems):
+        per_system.append(
+            evaluate_system(
+                system,
+                models,
+                config,
+                rng=rng,
+                keep_arrays=(idx == 0),
+                epoch=epoch,
+            )
+        )
+        if progress_label:
+            elapsed = time.perf_counter() - start_time
+            print(
+                f"[{progress_label}] {idx + 1}/{len(systems)} systems | "
+                f"{system.system_id} | elapsed {elapsed:.1f}s"
+            )
 
     scalar_keys = [
         "objective",

@@ -342,6 +342,28 @@ prevents final evaluation from constructing the full `n_points x model_width`
 activation tensor at once; `RDM_STENCIL_PREDICTION_CHUNK_SIZE` controls a
 different derivative/tau path.
 
+Saved checkpoints can be evaluated on every interior stencil center without
+retraining. Start with one validation and one test molecule on fine grids:
+
+```bash
+TF_GPU_ALLOCATOR=cuda_malloc_async \
+python -u evaluate_transferable_1rdm.py \
+  --summary-json \
+    transferable_outputs/RUN_DIR/RUN_NAME_summary.json \
+  --mmap-cache-dir "$PWD/qmugs_npz/.rdm_mmap_cache_h0p3_compact" \
+  --splits val,test \
+  --val-system-count 1 \
+  --test-system-count 1 \
+  --stencil-prediction-chunk-size 2048 \
+  --diagonal-prediction-chunk-size 16384
+```
+
+The evaluator restores the original model configuration and split seed from
+the summary JSON, loads all four weight files, and forces
+`eval_stencil_centers=0` with `eval_full_final=True`. A successful full-grid
+result reports `stencil eval centers = total centers`. Increase the validation
+and test counts to `3` or `5` after the one-system memory check passes.
+
 Recommended Fukui-feature training command for an existing 500-molecule charged
 oracle NPZ dataset:
 
