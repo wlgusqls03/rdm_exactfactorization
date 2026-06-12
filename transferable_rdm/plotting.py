@@ -4,8 +4,14 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.gridspec import GridSpecFromSubplotSpec
 
 from .training import TrainingHistory
+
+
+TITLE_SIZE = 12
+LABEL_SIZE = 10
+TICK_SIZE = 9
 
 
 def reshape_center_slice(values: np.ndarray, axis_points: int) -> np.ndarray:
@@ -82,8 +88,10 @@ def add_imshow(
     cmap: str = "coolwarm",
 ) -> None:
     im = ax.imshow(image.T, origin="lower", cmap=cmap, aspect="equal", vmin=vmin, vmax=vmax)
-    ax.set_title(title)
-    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_title(title, fontsize=TITLE_SIZE)
+    ax.tick_params(labelsize=TICK_SIZE)
+    colorbar = ax.figure.colorbar(im, ax=ax, fraction=0.046, pad=0.035)
+    colorbar.ax.tick_params(labelsize=TICK_SIZE)
 
 
 def add_parity_plot(
@@ -92,75 +100,158 @@ def add_parity_plot(
     pred_values: np.ndarray,
     title: str,
 ) -> None:
-    true_flat = np.asarray(true_values).reshape(-1)
-    pred_flat = np.asarray(pred_values).reshape(-1)
+    true_flat = np.asarray(true_values, dtype=np.float64).reshape(-1)
+    pred_flat = np.asarray(pred_values, dtype=np.float64).reshape(-1)
     if true_flat.shape != pred_flat.shape:
         raise ValueError(
             f"Parity arrays must have matching shapes, got {true_flat.shape} and {pred_flat.shape}."
         )
-    ax.scatter(true_flat, pred_flat, s=4, alpha=0.35)
+    finite = np.isfinite(true_flat) & np.isfinite(pred_flat)
+    true_flat = true_flat[finite]
+    pred_flat = pred_flat[finite]
+    if true_flat.size == 0:
+        raise ValueError(f"{title} has no finite values.")
+    ax.scatter(true_flat, pred_flat, s=7, alpha=0.3, edgecolors="none", rasterized=True)
     lower = float(min(np.min(true_flat), np.min(pred_flat)))
     upper = float(max(np.max(true_flat), np.max(pred_flat)))
     ax.plot([lower, upper], [lower, upper], "k--", linewidth=1.0)
-    ax.set_title(title)
-    ax.set_xlabel("True")
-    ax.set_ylabel("Pred")
+    ax.set_title(title, fontsize=TITLE_SIZE)
+    ax.set_xlabel("True", fontsize=LABEL_SIZE)
+    ax.set_ylabel("Pred", fontsize=LABEL_SIZE)
+    ax.tick_params(labelsize=TICK_SIZE)
+    ax.grid(alpha=0.18)
 
 
-def add_integral_ratio_plot(ax, representative: dict[str, object]) -> None:
-    trace_true = float(representative["trace_true"])
-    trace_pred = float(representative["trace_pred"])
-    tau_true = float(representative["tau_true_integral"])
-    tau_pred = float(representative["tau_pred_integral"])
-    kinetic_ref = float(representative.get("kinetic_energy_ref", np.nan))
+def add_absolute_error_histogram(
+    ax,
+    true_values: np.ndarray,
+    pred_values: np.ndarray,
+    title: str,
+    *,
+    color: str,
+) -> None:
+    errors = np.abs(
+        np.asarray(pred_values, dtype=np.float64).reshape(-1)
+        - np.asarray(true_values, dtype=np.float64).reshape(-1)
+    )
+    errors = errors[np.isfinite(errors)]
+    ax.hist(errors, bins=40, color=color, alpha=0.82)
+    ax.set_title(title, fontsize=TITLE_SIZE)
+    ax.set_xlabel("Absolute error", fontsize=LABEL_SIZE)
+    ax.set_ylabel("Count", fontsize=LABEL_SIZE)
+    ax.tick_params(labelsize=TICK_SIZE)
+    ax.grid(axis="y", alpha=0.18)
 
-    labels = [r"$\int\rho/N$", r"$T_\tau/T_\tau^{true}$"]
-    pred_ratios = [
-        trace_pred / trace_true if abs(trace_true) > 1e-12 else np.nan,
-        tau_pred / tau_true if abs(tau_true) > 1e-12 else np.nan,
-    ]
-    if np.isfinite(kinetic_ref) and abs(kinetic_ref) > 1e-12:
-        labels.append(r"$T_\tau/T_s^{DFT}$")
-        pred_ratios.append(tau_pred / kinetic_ref)
-    x = np.arange(len(labels))
-    width = 0.34
-    ax.bar(x - width / 2, [1.0] * len(labels), width, label="reference")
-    ax.bar(x + width / 2, pred_ratios, width, label="pred")
-    ax.axhline(1.0, color="black", linestyle=":", linewidth=1.0)
-    ax.set_xticks(x, labels)
-    ax.tick_params(axis="x", labelrotation=12)
-    ax.set_ylabel("Ratio")
-    ax.set_title("Kinetic Energy Ratios")
-    ax.legend()
+
+def add_sorted_comparison(
+    ax,
+    true_values: np.ndarray,
+    pred_values: np.ndarray,
+    title: str,
+    *,
+    max_points: int = 2048,
+) -> None:
+    true_flat = np.asarray(true_values, dtype=np.float64).reshape(-1)
+    pred_flat = np.asarray(pred_values, dtype=np.float64).reshape(-1)
+    finite = np.isfinite(true_flat) & np.isfinite(pred_flat)
+    true_flat = true_flat[finite]
+    pred_flat = pred_flat[finite]
+    order = np.argsort(true_flat)
+    if order.size > max_points:
+        order = order[np.linspace(0, order.size - 1, max_points, dtype=np.int64)]
+    ax.plot(true_flat[order], label="true", linewidth=1.5)
+    ax.plot(pred_flat[order], label="pred", linewidth=1.1, alpha=0.85)
+    ax.set_title(title, fontsize=TITLE_SIZE)
+    ax.set_xlabel("Samples sorted by true value", fontsize=LABEL_SIZE)
+    ax.set_ylabel("Value", fontsize=LABEL_SIZE)
+    ax.tick_params(labelsize=TICK_SIZE)
+    ax.grid(alpha=0.18)
+    ax.legend(fontsize=9)
+
+
+def add_kinetic_energy_plot(ax, representative: dict[str, object]) -> None:
+    kinetic_true = float(
+        representative.get(
+            "kinetic_training_ref",
+            representative.get("tau_true_integral", np.nan),
+        )
+    )
+    kinetic_pred = float(
+        representative.get(
+            "kinetic_pred",
+            representative.get("tau_pred_integral", np.nan),
+        )
+    )
+    delta = kinetic_pred - kinetic_true
+    abs_error = abs(delta)
+    relative_error = 100.0 * delta / kinetic_true if abs(kinetic_true) > 1e-12 else np.nan
+
+    bars = ax.bar(
+        ["Reference", "Prediction"],
+        [kinetic_true, kinetic_pred],
+        color=["#4C78A8", "#F58518"],
+        width=0.62,
+    )
+    value_scale = max(abs(kinetic_true), abs(kinetic_pred), 1.0)
+    for bar, value in zip(bars, (kinetic_true, kinetic_pred)):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + 0.025 * value_scale,
+            f"{value:.6f} Ha",
+            ha="center",
+            va="bottom",
+            fontsize=9,
+        )
+    ax.set_ylim(
+        min(0.0, kinetic_true, kinetic_pred),
+        max(kinetic_true, kinetic_pred, 0.0) + 0.14 * value_scale,
+    )
+    ax.set_title(
+        "Kinetic Energy Comparison\n"
+        rf"$\Delta T={delta:+.3e}$ Ha, "
+        rf"$|\Delta T|={abs_error:.3e}$ Ha, "
+        f"rel.={relative_error:+.2f}%",
+        fontsize=TITLE_SIZE,
+        linespacing=1.35,
+    )
+    ax.set_ylabel("Kinetic energy [Ha]", fontsize=LABEL_SIZE)
+    ax.tick_params(labelsize=TICK_SIZE)
+    ax.grid(axis="y", alpha=0.2)
 
 
 def build_metrics_text(summary: dict[str, object], representative: dict[str, object]) -> str:
     val_avg = summary["val"]
     lines = [
-        "Held-out Average",
-        f"gamma_pair loss: {val_avg['pair_loss']:.3e}",
-        f"density MAE : {val_avg['density_mae']:.3e}",
-        f"tau MAE     : {val_avg['tau_mae']:.3e}",
-        f"T loss      : {val_avg.get('kinetic_loss', np.nan):.3e}",
-        f"T abs err   : {val_avg.get('kinetic_abs_error', np.nan):.3e}",
-        f"trace loss  : {val_avg['trace_loss']:.3e}",
-        f"occ penalty : {val_avg['occ_penalty']:.3e}",
-        f"symmetry    : {val_avg['symmetry_mae']:.3e}",
+        "HELD-OUT AVERAGE",
+        f"gamma pair loss : {val_avg['pair_loss']:10.3e}",
+        f"density MAE     : {val_avg['density_mae']:10.3e}",
+        f"tau MAE         : {val_avg['tau_mae']:10.3e}",
+        f"T loss          : {val_avg.get('kinetic_loss', np.nan):10.3e}",
+        f"T abs error [Ha]: {val_avg.get('kinetic_abs_error', np.nan):10.3e}",
+        f"trace loss      : {val_avg['trace_loss']:10.3e}",
+        f"symmetry MAE    : {val_avg['symmetry_mae']:10.3e}",
         "",
-        f"Representative: {representative['system_id']}",
-        f"near diag MAE : {representative['near_diag_mae']:.3e}",
-        f"far offdiag   : {representative['far_offdiag_mae']:.3e}",
-        f"gamma samples : {np.asarray(representative['gamma_true_sample']).size}",
-        f"|K(r,r)-1|    : {representative['kernel_diag_error']:.3e}",
-        f"T_tau true/pred: {representative['tau_true_integral']:.3e} / {representative['tau_pred_integral']:.3e}",
-        f"T_s DFT ref   : {representative.get('kinetic_energy_ref', np.nan):.3e}",
+        "REPRESENTATIVE SYSTEM",
+        f"id              : {representative['system_id']}",
+        f"near-diag MAE   : {representative['near_diag_mae']:10.3e}",
+        f"far-offdiag MAE : {representative['far_offdiag_mae']:10.3e}",
+        f"gamma samples   : {np.asarray(representative['gamma_true_sample']).size:10d}",
+        f"|K(r,r)-1|      : {representative['kernel_diag_error']:10.3e}",
+        f"tau MAE         : {representative['tau_mae']:10.3e}",
+        f"T true [Ha]     : {representative.get('kinetic_training_ref', np.nan):10.3e}",
+        f"T pred [Ha]     : {representative.get('kinetic_pred', np.nan):10.3e}",
         "",
-        "DFT MO occupations",
-        np.array2string(representative.get("top_mo_occ_true", np.array([])), precision=3),
-        "Subset eigs (true)",
-        np.array2string(representative.get("top_subset_eigs_true", representative["top_occ_true"]), precision=3),
-        "Subset eigs (pred)",
-        np.array2string(representative.get("top_subset_eigs_pred", representative["top_occ_pred"]), precision=3),
+        "TOP SUBSET EIGENVALUES",
+        "true: " + np.array2string(
+            representative.get("top_subset_eigs_true", representative["top_occ_true"]),
+            precision=3,
+            max_line_width=90,
+        ),
+        "pred: " + np.array2string(
+            representative.get("top_subset_eigs_pred", representative["top_occ_pred"]),
+            precision=3,
+            max_line_width=90,
+        ),
     ]
     return "\n".join(lines)
 
@@ -172,82 +263,65 @@ def plot_training_summary(
     axis_points: int,
     output_png: Path,
 ) -> None:
-    """학습 곡선 + held-out system 시각화."""
+    """Save a dense, publication-ready training and held-out summary."""
     representative = summary["val"]["per_system"][0]
     representative_axis_points = infer_axis_points(representative["rho_true_diag"])
 
-    fig, axes = plt.subplots(4, 4, figsize=(21, 17))
-    axes = axes.reshape(4, 4)
+    fig = plt.figure(figsize=(22, 17), constrained_layout=False)
+    grid = fig.add_gridspec(
+        4,
+        4,
+        left=0.045,
+        right=0.985,
+        bottom=0.055,
+        top=0.95,
+        hspace=0.38,
+        wspace=0.30,
+    )
+    fig.suptitle(
+        f"1-RDM Transferable Model Summary | {representative['system_id']}",
+        fontsize=17,
+        fontweight="semibold",
+    )
 
-    ax = axes[0, 0]
+    ax = fig.add_subplot(grid[0, 0])
     ax.plot(history.train_objective, label="train obj")
     ax.plot(history.val_objective, label="held-out val obj")
-    ax.set_title("Training Curve")
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Objective")
+    ax.set_title("Training Curve", fontsize=TITLE_SIZE)
+    ax.set_xlabel("Epoch", fontsize=LABEL_SIZE)
+    ax.set_ylabel("Objective", fontsize=LABEL_SIZE)
     ax.set_yscale("log")
-    ax.legend()
+    ax.tick_params(labelsize=TICK_SIZE)
+    ax.grid(alpha=0.2)
+    ax.legend(fontsize=9)
 
-    ax = axes[0, 1]
     true_source = representative.get("gamma_true_matrix", representative.get("gamma_true_sample"))
     pred_source = representative.get("gamma_pred_matrix", representative.get("gamma_pred_sample"))
     true_pairs = true_source.reshape(-1)
     pred_pairs = pred_source.reshape(-1)
-    ax.scatter(true_pairs, pred_pairs, s=4, alpha=0.35)
-    lims = [
-        float(min(np.min(true_pairs), np.min(pred_pairs))),
-        float(max(np.max(true_pairs), np.max(pred_pairs))),
-    ]
-    ax.plot(lims, lims, "k--", linewidth=1.0)
-    ax.set_title("Held-out Gamma Parity")
-    ax.set_xlabel(r"$\gamma_{\rm true}$")
-    ax.set_ylabel(r"$\gamma_{\rm pred}$")
+    add_parity_plot(
+        fig.add_subplot(grid[0, 1]),
+        true_pairs,
+        pred_pairs,
+        "Gamma Parity",
+    )
+    add_absolute_error_histogram(
+        fig.add_subplot(grid[0, 2]),
+        true_pairs,
+        pred_pairs,
+        r"Sampled $|\Delta\gamma|$",
+        color="#4C78A8",
+    )
 
-    rho_true_slice = reshape_center_slice(representative["rho_true_diag"], representative_axis_points)
-    rho_pred_slice = reshape_center_slice(representative["rho_pred_diag"], representative_axis_points)
-    rho_vmin, rho_vmax = shared_limits(rho_true_slice, rho_pred_slice, include_zero=True)
-    add_imshow(
-        axes[0, 2],
-        rho_true_slice,
-        r"True $\rho$ Slice",
-        vmin=rho_vmin,
-        vmax=rho_vmax,
-    )
-    add_imshow(
-        axes[0, 3],
-        rho_pred_slice,
-        r"Pred $\rho$ Slice",
-        vmin=rho_vmin,
-        vmax=rho_vmax,
-    )
     tau_target = np.asarray(representative.get("tau_target_eval", representative["tau_true"]))
     tau_pred = np.asarray(representative["tau_pred"])
     sampled_tau = bool(representative.get("stencil_eval_sampled", 0.0))
-    if not sampled_tau and tau_target.size == tau_pred.size:
-        tau_true_slice = reshape_tau_slice(tau_target, representative_axis_points)
-        tau_pred_slice = reshape_tau_slice(tau_pred, representative_axis_points)
-        tau_vmin, tau_vmax = shared_limits(tau_true_slice, tau_pred_slice, include_zero=True)
-        add_imshow(
-            axes[1, 0],
-            tau_true_slice,
-            r"True $\tau$ Slice",
-            vmin=tau_vmin,
-            vmax=tau_vmax,
-        )
-        add_imshow(
-            axes[1, 1],
-            tau_pred_slice,
-            r"Pred $\tau$ Slice",
-            vmin=tau_vmin,
-            vmax=tau_vmax,
-        )
-    else:
-        add_parity_plot(axes[1, 0], tau_target, tau_pred, r"Sampled $\tau$ Parity")
-        tau_abs_error = np.abs(tau_pred.reshape(-1) - tau_target.reshape(-1))
-        axes[1, 1].hist(tau_abs_error, bins=40, color="tab:red", alpha=0.8)
-        axes[1, 1].set_title(r"Sampled $|\Delta\tau|$")
-        axes[1, 1].set_xlabel("Absolute error")
-        axes[1, 1].set_ylabel("Count")
+    add_parity_plot(
+        fig.add_subplot(grid[0, 3]),
+        tau_target,
+        tau_pred,
+        "Tau Parity" if not sampled_tau else "Sampled Tau Parity",
+    )
 
     has_full_gamma = "gamma_true_matrix" in representative and "gamma_pred_matrix" in representative
     if has_full_gamma:
@@ -260,15 +334,16 @@ def plot_training_summary(
             representative_axis_points,
         )
         gamma_vmin, gamma_vmax = shared_limits(gamma_true_slice, gamma_pred_slice, symmetric=True)
+        gamma_grid = GridSpecFromSubplotSpec(1, 3, subplot_spec=grid[1, 0:2], wspace=0.42)
         add_imshow(
-            axes[1, 2],
+            fig.add_subplot(gamma_grid[0, 0]),
             gamma_true_slice,
             r"True $\gamma(r,r_0)$ Slice",
             vmin=gamma_vmin,
             vmax=gamma_vmax,
         )
         add_imshow(
-            axes[1, 3],
+            fig.add_subplot(gamma_grid[0, 1]),
             gamma_pred_slice,
             r"Pred $\gamma(r,r_0)$ Slice",
             vmin=gamma_vmin,
@@ -276,7 +351,7 @@ def plot_training_summary(
         )
         gamma_err_vmin, gamma_err_vmax = shared_limits(np.abs(gamma_pred_slice - gamma_true_slice), include_zero=True)
         add_imshow(
-            axes[2, 0],
+            fig.add_subplot(gamma_grid[0, 2]),
             np.abs(gamma_pred_slice - gamma_true_slice),
             r"$|\Delta\gamma(r,r_0)|$ Slice",
             vmin=gamma_err_vmin,
@@ -284,79 +359,101 @@ def plot_training_summary(
             cmap="Reds",
         )
     else:
-        ax = axes[1, 2]
-        abs_err = np.abs(pred_pairs - true_pairs)
-        ax.hist(abs_err, bins=40, color="tab:blue", alpha=0.8)
-        ax.set_title(r"Sampled $|\Delta\gamma|$")
-        ax.set_xlabel("Absolute error")
-        ax.set_ylabel("Count")
-
-        axes[1, 3].axis("off")
-        axes[1, 3].text(
-            0.0,
-            0.5,
-            "Full gamma slice skipped\n(sample parity only)",
-            va="center",
-            ha="left",
-            family="monospace",
+        add_sorted_comparison(
+            fig.add_subplot(grid[1, 0:2]),
+            true_pairs,
+            pred_pairs,
+            "Sampled Gamma Values",
         )
 
-        axes[2, 0].axis("off")
+    add_sorted_comparison(
+        fig.add_subplot(grid[1, 2]),
+        tau_target,
+        tau_pred,
+        "Tau Values",
+    )
+    add_absolute_error_histogram(
+        fig.add_subplot(grid[1, 3]),
+        tau_target,
+        tau_pred,
+        r"Sampled $|\Delta\tau|$" if sampled_tau else r"$|\Delta\tau|$",
+        color="#E45756",
+    )
 
+    rho_true_slice = reshape_center_slice(representative["rho_true_diag"], representative_axis_points)
+    rho_pred_slice = reshape_center_slice(representative["rho_pred_diag"], representative_axis_points)
+    rho_vmin, rho_vmax = shared_limits(rho_true_slice, rho_pred_slice, include_zero=True)
+    add_imshow(
+        fig.add_subplot(grid[2, 0]),
+        rho_true_slice,
+        r"True $\rho$ Slice",
+        vmin=rho_vmin,
+        vmax=rho_vmax,
+        cmap="viridis",
+    )
+    add_imshow(
+        fig.add_subplot(grid[2, 1]),
+        rho_pred_slice,
+        r"Pred $\rho$ Slice",
+        vmin=rho_vmin,
+        vmax=rho_vmax,
+        cmap="viridis",
+    )
     rho_err_slice = np.abs(rho_pred_slice - rho_true_slice)
     rho_err_vmin, rho_err_vmax = shared_limits(rho_err_slice, include_zero=True)
-    add_imshow(axes[2, 1], rho_err_slice, r"$|\Delta\rho|$ Slice", vmin=rho_err_vmin, vmax=rho_err_vmax, cmap="Reds")
-    if not sampled_tau and tau_target.size == tau_pred.size:
-        tau_err_slice = np.abs(tau_pred_slice - tau_true_slice)
-        tau_err_vmin, tau_err_vmax = shared_limits(tau_err_slice, include_zero=True)
-        add_imshow(
-            axes[2, 2],
-            tau_err_slice,
-            r"$|\Delta\tau|$ Slice",
-            vmin=tau_err_vmin,
-            vmax=tau_err_vmax,
-            cmap="Reds",
-        )
-    else:
-        axes[2, 2].axis("off")
-        axes[2, 2].text(
-            0.0,
-            0.5,
-            "Spatial tau slice skipped\n(sampled stencil centers)",
-            va="center",
-            ha="left",
-            family="monospace",
-        )
-    axes[2, 3].axis("off")
+    add_imshow(
+        fig.add_subplot(grid[2, 2]),
+        rho_err_slice,
+        r"$|\Delta\rho|$ Slice",
+        vmin=rho_err_vmin,
+        vmax=rho_err_vmax,
+        cmap="magma",
+    )
+    add_kinetic_energy_plot(fig.add_subplot(grid[2, 3]), representative)
 
-    add_integral_ratio_plot(axes[3, 0], representative)
-
-    ax = axes[3, 1]
+    ax = fig.add_subplot(grid[3, 0])
     top_true = representative.get("top_subset_eigs_true", representative["top_occ_true"])
     top_pred = representative.get("top_subset_eigs_pred", representative["top_occ_pred"])
     x = np.arange(max(len(top_true), len(top_pred)))
     ax.plot(x[: len(top_true)], top_true, "o-", label="true")
     ax.plot(x[: len(top_pred)], top_pred, "s--", label="pred")
-    ax.set_title("Coarse Subset Eigenvalues")
-    ax.set_xlabel("Mode index")
-    ax.set_ylabel("Eigenvalue")
-    ax.legend()
+    ax.set_title("Coarse Subset Eigenvalues", fontsize=TITLE_SIZE)
+    ax.set_xlabel("Mode index", fontsize=LABEL_SIZE)
+    ax.set_ylabel("Eigenvalue", fontsize=LABEL_SIZE)
+    ax.tick_params(labelsize=TICK_SIZE)
+    ax.grid(alpha=0.2)
+    ax.legend(fontsize=9)
 
-    ax = axes[3, 2]
+    ax = fig.add_subplot(grid[3, 1])
+    per_system = summary["val"]["per_system"]
+    kinetic_errors = np.asarray(
+        [item.get("kinetic_ref_error", np.nan) for item in per_system],
+        dtype=np.float64,
+    )
+    kinetic_errors = kinetic_errors[np.isfinite(kinetic_errors)]
+    ax.hist(kinetic_errors, bins=min(20, max(6, kinetic_errors.size)), color="#72B7B2", alpha=0.85)
+    ax.axvline(0.0, color="black", linestyle="--", linewidth=1.0)
+    ax.set_title(r"Held-out $\Delta T$ Distribution", fontsize=TITLE_SIZE)
+    ax.set_xlabel(r"$T_{pred}-T_{true}$ [Ha]", fontsize=LABEL_SIZE)
+    ax.set_ylabel("Systems", fontsize=LABEL_SIZE)
+    ax.tick_params(labelsize=TICK_SIZE)
+    ax.grid(axis="y", alpha=0.2)
+
+    ax = fig.add_subplot(grid[3, 2:4])
     ax.axis("off")
     ax.text(
         0.0,
-        1.0,
+        0.98,
         build_metrics_text(summary, representative),
         va="top",
         ha="left",
         family="monospace",
-        fontsize=10,
+        fontsize=10.5,
+        linespacing=1.25,
+        transform=ax.transAxes,
     )
-    axes[3, 3].axis("off")
 
-    fig.tight_layout()
-    fig.savefig(output_png, dpi=180, bbox_inches="tight")
+    fig.savefig(output_png, dpi=200, bbox_inches="tight", facecolor="white")
     print(f"Saved figure to: {output_png}")
 
     if plt.get_backend().lower() != "agg":
