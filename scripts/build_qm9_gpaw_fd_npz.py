@@ -963,6 +963,91 @@ def select_records(args: argparse.Namespace) -> list[Qm9Record]:
     return records
 
 
+def qm9_id_from_output_path(path: Path) -> str:
+    parts = path.stem.split("_", 1)
+    if len(parts) != 2 or not parts[0].isdigit():
+        raise ValueError(f"Unexpected GPAW NPZ filename: {path.name}")
+    return parts[1]
+
+
+def output_index(path: Path) -> int:
+    prefix = path.stem.split("_", 1)[0]
+    return int(prefix) if prefix.isdigit() else -1
+
+
+def scan_existing_outputs(output_dir: Path) -> tuple[dict[str, Path], dict[str, list[Path]], int]:
+    grouped: dict[str, list[Path]] = {}
+    max_index = -1
+    for path in sorted(output_dir.glob("*.npz")):
+        try:
+            qm9_id = qm9_id_from_output_path(path)
+        except ValueError:
+            continue
+        grouped.setdefault(qm9_id, []).append(path)
+        max_index = max(max_index, output_index(path))
+    existing = {
+        qm9_id: min(paths, key=lambda path: (output_index(path), path.name))
+        for qm9_id, paths in grouped.items()
+    }
+    duplicates = {
+        qm9_id: sorted(paths, key=lambda path: (output_index(path), path.name))
+        for qm9_id, paths in grouped.items()
+        if len(paths) > 1
+    }
+    return existing, duplicates, max_index + 1
+
+
+def existing_output_row(path: Path, record: Qm9Record) -> dict[str, object]:
+    with np.load(path, allow_pickle=True) as payload:
+        return {
+            "system_id": path.stem,
+            "qm9_id": record.qm9_id,
+            "formula": molecular_formula(record.symbols),
+            "n_atoms": len(record.symbols),
+            "electron_count": float(payload["electron_count"]),
+            "axis_points": int(payload["axis_points"]),
+            "grid_spacing_bohr": float(payload["grid_spacing_bohr"]),
+            "kinetic_energy_hartree": float(payload["kinetic_energy_hartree"]),
+            "kinetic_energy_orbital_fd_hartree": float(
+                payload.get("kinetic_energy_orbital_fd_hartree", payload["kinetic_energy_hartree"])
+            ),
+            "kinetic_energy_orbital_central2_interior_hartree": float(
+                payload.get(
+                    "kinetic_energy_orbital_central2_interior_hartree",
+                    payload["kinetic_energy_hartree"],
+                )
+            ),
+            "kinetic_energy_gamma_central2_interior_hartree": float(
+                payload.get(
+                    "kinetic_energy_gamma_central2_interior_hartree",
+                    payload["kinetic_energy_hartree"],
+                )
+            ),
+            "kinetic_energy_gamma_richardson_interior_hartree": float(
+                payload.get(
+                    "kinetic_energy_gamma_richardson_interior_hartree",
+                    payload["kinetic_energy_hartree"],
+                )
+            ),
+            "kinetic_reference": str(np.asarray(payload.get("kinetic_reference", "legacy")).item()),
+            "storage_profile": str(np.asarray(payload.get("storage_profile", "full")).item()),
+            "tau_orbital_vs_gamma_central2_mae": float(
+                payload.get(
+                    "tau_orbital_vs_gamma_central2_mae",
+                    payload["tau_fd_orbital_vs_gamma_mae"],
+                )
+            ),
+            "tau_orbital_vs_gamma_richardson_mae": float(
+                payload.get(
+                    "tau_orbital_vs_gamma_richardson_mae",
+                    payload["tau_fd_orbital_vs_gamma_mae"],
+                )
+            ),
+            "tau_fd_orbital_vs_gamma_mae": float(payload["tau_fd_orbital_vs_gamma_mae"]),
+            "tau_fd_gamma_over_orbital_rms": float(payload["tau_fd_gamma_over_orbital_rms"]),
+        }
+
+
 def main() -> None:
     args = parse_args()
     if args.kinetic_reference == "orbital-interior" and args.tau_stencil != "central2":
@@ -975,6 +1060,14 @@ def main() -> None:
     if len(records) < args.num_systems:
         raise RuntimeError(f"Only found {len(records)} suitable records.")
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    existing_outputs, duplicate_outputs, next_output_index = scan_existing_outputs(args.output_dir)
+    if duplicate_outputs:
+        duplicate_file_count = sum(len(paths) - 1 for paths in duplicate_outputs.values())
+        print(
+            f"[resume] found {duplicate_file_count} duplicate NPZ files across "
+            f"{len(duplicate_outputs)} QM9 IDs; canonical files will be reused. "
+            "Run scripts/deduplicate_gpaw_npz.py to remove the extras."
+        )
 
     manifest: list[dict[str, object]] = []
     skipped: list[dict[str, object]] = []
@@ -982,6 +1075,22 @@ def main() -> None:
         if len(manifest) >= args.num_systems:
             break
         idx = len(manifest)
+        existing_path = existing_outputs.get(record.qm9_id)
+        if existing_path is not None:
+            print(f"[{idx + 1}/{args.num_systems}] exists by QM9 ID: {existing_path}")
+            row = existing_output_row(existing_path, record)
+            row.update(
+                {
+                    "index": idx,
+                    "npz_file": existing_path.name,
+                    "xyz_file": f"xyz/{existing_path.stem}.xyz",
+                }
+            )
+            manifest.append(row)
+            xyz_path = args.output_dir / "xyz" / f"{existing_path.stem}.xyz"
+            if not xyz_path.exists():
+                write_xyz(record, xyz_path)
+            continue
         coords_bohr = record.coords_angstrom * ANGSTROM_TO_BOHR
         centered = coords_bohr - np.mean(coords_bohr, axis=0, keepdims=True)
         try:
@@ -995,58 +1104,8 @@ def main() -> None:
         except RuntimeError as exc:
             skipped.append({"qm9_id": record.qm9_id, "reason": str(exc)})
             continue
-        output_path = args.output_dir / f"{idx:04d}_{record.qm9_id}.npz"
-        if output_path.exists():
-            print(f"[{idx + 1}/{args.num_systems}] exists: {output_path}")
-            with np.load(output_path, allow_pickle=True) as payload:
-                row = {
-                    "system_id": output_path.stem,
-                    "qm9_id": record.qm9_id,
-                    "formula": molecular_formula(record.symbols),
-                    "n_atoms": len(record.symbols),
-                    "electron_count": float(payload["electron_count"]),
-                    "axis_points": int(payload["axis_points"]),
-                    "grid_spacing_bohr": float(payload["grid_spacing_bohr"]),
-                    "kinetic_energy_hartree": float(payload["kinetic_energy_hartree"]),
-                    "kinetic_energy_orbital_fd_hartree": float(
-                        payload.get("kinetic_energy_orbital_fd_hartree", payload["kinetic_energy_hartree"])
-                    ),
-                    "kinetic_energy_orbital_central2_interior_hartree": float(
-                        payload.get(
-                            "kinetic_energy_orbital_central2_interior_hartree",
-                            payload["kinetic_energy_hartree"],
-                        )
-                    ),
-                    "kinetic_energy_gamma_central2_interior_hartree": float(
-                        payload.get(
-                            "kinetic_energy_gamma_central2_interior_hartree",
-                            payload["kinetic_energy_hartree"],
-                        )
-                    ),
-                    "kinetic_energy_gamma_richardson_interior_hartree": float(
-                        payload.get(
-                            "kinetic_energy_gamma_richardson_interior_hartree",
-                            payload["kinetic_energy_hartree"],
-                        )
-                    ),
-                    "kinetic_reference": str(np.asarray(payload.get("kinetic_reference", "legacy")).item()),
-                    "storage_profile": str(np.asarray(payload.get("storage_profile", "full")).item()),
-                    "tau_orbital_vs_gamma_central2_mae": float(
-                        payload.get(
-                            "tau_orbital_vs_gamma_central2_mae",
-                            payload["tau_fd_orbital_vs_gamma_mae"],
-                        )
-                    ),
-                    "tau_orbital_vs_gamma_richardson_mae": float(
-                        payload.get(
-                            "tau_orbital_vs_gamma_richardson_mae",
-                            payload["tau_fd_orbital_vs_gamma_mae"],
-                        )
-                    ),
-                    "tau_fd_orbital_vs_gamma_mae": float(payload["tau_fd_orbital_vs_gamma_mae"]),
-                    "tau_fd_gamma_over_orbital_rms": float(payload["tau_fd_gamma_over_orbital_rms"]),
-                }
-        elif args.dry_run:
+        output_path = args.output_dir / f"{next_output_index:04d}_{record.qm9_id}.npz"
+        if args.dry_run:
             print(f"[dry-run] {record.qm9_id}: atoms={len(record.symbols)} axis={axis_points} points={axis_points ** 3}")
             row = {
                 "system_id": output_path.stem,
@@ -1068,6 +1127,7 @@ def main() -> None:
                 "tau_fd_orbital_vs_gamma_mae": float("nan"),
                 "tau_fd_gamma_over_orbital_rms": float("nan"),
             }
+            next_output_index += 1
         else:
             print(f"[{idx + 1}/{args.num_systems}] GPAW FD -> NPZ: {record.qm9_id} axis={axis_points}")
             try:
@@ -1080,6 +1140,8 @@ def main() -> None:
                     traceback.print_exc()
                 skipped.append({"qm9_id": record.qm9_id, "reason": str(exc)})
                 continue
+            existing_outputs[record.qm9_id] = output_path
+            next_output_index += 1
         row.update({"index": idx, "npz_file": output_path.name, "xyz_file": f"xyz/{output_path.stem}.xyz"})
         manifest.append(row)
         write_xyz(record, args.output_dir / "xyz" / f"{output_path.stem}.xyz")
