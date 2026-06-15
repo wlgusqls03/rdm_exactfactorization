@@ -171,7 +171,8 @@ class ExperimentConfig:
     loss_preset: str = os.environ.get("RDM_LOSS_PRESET", "core5")
     # "all" / "custom" : individual RDM_USE_*_LOSS switches decide active terms
     # "core5"          : gamma + rho + kernel + trace + mode only
-    # "staged-physics" : core5 + RMS-normalized Huber derivative/tau terms
+    # "staged-physics"         : core5 + RMS-normalized Huber derivative/tau terms
+    # "staged-physics-kinetic" : staged-physics + integrated kinetic-energy loss
 
     use_gamma_loss: bool = env_flag("RDM_USE_GAMMA_LOSS", True)
     use_rho_loss: bool = env_flag("RDM_USE_RHO_LOSS", True)

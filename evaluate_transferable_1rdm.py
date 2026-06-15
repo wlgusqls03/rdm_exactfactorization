@@ -258,6 +258,13 @@ def main() -> None:
                     (f"{split_name} systems", f"{metrics['evaluated_system_count']} / {metrics['available_system_count']}"),
                     (f"{split_name} tau MAE", f"{metrics['tau_mae']:.6e}"),
                     (f"{split_name} kinetic MAE", f"{metrics['kinetic_abs_error']:.6e} Ha"),
+                    (
+                        f"{split_name} stencil diag/offdiag",
+                        (
+                            f"{metrics['kinetic_stencil_diag_error']:.6e} / "
+                            f"{metrics['kinetic_stencil_offdiag_error']:.6e} Ha"
+                        ),
+                    ),
                     (f"{split_name} stencil eval", f"{metrics['stencil_eval_centers']:.0f} / {metrics['stencil_eval_total_centers']:.0f}"),
                 ]
             )

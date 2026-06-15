@@ -293,6 +293,35 @@ schedule-weighted gradient norms for gamma, derivative, and tau losses. They
 also split each norm across the point, mode, pair, and context models and print
 target/prediction RMS values for derivative and tau fields.
 
+Saved runs can be fine-tuned from their four model checkpoints. The resume
+summary restores the original model, dataset, and split configuration; explicit
+command-line options then override the fine-tuning settings:
+
+```bash
+python -u train_transferable_1rdm.py \
+  --resume-summary-json transferable_outputs/RUN/RUN_summary.json \
+  --loss-preset staged-physics-kinetic \
+  --use-kinetic-loss \
+  --lambda-kinetic 0.005 \
+  --deriv-start-epoch 0 \
+  --deriv-ramp-epochs 0 \
+  --tau-start-epoch 0 \
+  --tau-ramp-epochs 0 \
+  --kinetic-start-epoch 0 \
+  --kinetic-ramp-epochs 20 \
+  --train-stencil-centers 4096 \
+  --learning-rate 1e-5 \
+  --epochs 40 \
+  --output-dir transferable_outputs \
+  --run-name RUN_kinetic_ft_lam005 \
+  --auto-run-dir
+```
+
+The optimizer is restarted, but the point, mode, pair, and context weights are
+loaded from the saved run. The initial checkpoint is evaluated and retained as
+a candidate best model, so fine-tuning cannot silently replace it with a worse
+validation checkpoint.
+
 The default kernel also includes a near-diagonal, axis-resolved local curvature
 correction:
 

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import shutil
 from datetime import datetime
-from dataclasses import asdict, replace
+from dataclasses import asdict, fields, replace
 from pathlib import Path
 
 import numpy as np
@@ -96,6 +97,11 @@ CSV_METRIC_KEYS = [
     "kinetic_training_ref",
     "kinetic_ref_error",
     "kinetic_abs_error",
+    "kinetic_stencil_diag_error",
+    "kinetic_stencil_offdiag_error",
+    "kinetic_stencil_total_error",
+    "kinetic_stencil_reconstruction_residual",
+    "kinetic_stencil_reference_gap",
     "trace_loss",
     "trace_rel_error",
     "trace_abs_rel_error",
@@ -186,6 +192,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-every", type=int, default=None)
     parser.add_argument("--log-every", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=None)
+    parser.add_argument("--min-learning-rate", type=float, default=None)
+    parser.add_argument("--loss-preset", type=str, default=None)
+    parser.add_argument("--lambda-kinetic", type=float, default=None)
+    parser.add_argument("--deriv-start-epoch", type=int, default=None)
+    parser.add_argument("--deriv-ramp-epochs", type=int, default=None)
+    parser.add_argument("--tau-start-epoch", type=int, default=None)
+    parser.add_argument("--tau-ramp-epochs", type=int, default=None)
+    parser.add_argument("--kinetic-start-epoch", type=int, default=None)
+    parser.add_argument("--kinetic-ramp-epochs", type=int, default=None)
+    parser.add_argument("--train-stencil-centers", type=int, default=None)
+    parser.add_argument(
+        "--use-kinetic-loss",
+        dest="use_kinetic_loss",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--no-use-kinetic-loss",
+        dest="use_kinetic_loss",
+        action="store_false",
+    )
     parser.add_argument("--point-pretrain-epochs", type=int, default=None)
     parser.add_argument("--point-pretrain-steps-per-epoch", type=int, default=None)
     parser.add_argument("--point-pretrain-lr", type=float, default=None)
@@ -229,6 +256,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument(
+        "--resume-summary-json",
+        type=Path,
+        default=None,
+        help="Restore saved config and model weights from a previous run summary.",
+    )
+    parser.add_argument(
+        "--checkpoint-prefix",
+        type=Path,
+        default=None,
+        help="Path prefix before _point.weights.h5. Defaults to the resume summary run name.",
+    )
     parser.add_argument("--npz-glob", type=str, default=None)
     parser.add_argument(
         "--toy-dimensions",
@@ -295,6 +334,17 @@ def apply_overrides(config: ExperimentConfig, args: argparse.Namespace) -> Exper
         ("val_every", "val_every"),
         ("log_every", "log_every"),
         ("initial_lr", "learning_rate"),
+        ("min_lr", "min_learning_rate"),
+        ("loss_preset", "loss_preset"),
+        ("lambda_kinetic", "lambda_kinetic"),
+        ("deriv_start_epoch", "deriv_start_epoch"),
+        ("deriv_ramp_epochs", "deriv_ramp_epochs"),
+        ("tau_start_epoch", "tau_start_epoch"),
+        ("tau_ramp_epochs", "tau_ramp_epochs"),
+        ("kinetic_start_epoch", "kinetic_start_epoch"),
+        ("kinetic_ramp_epochs", "kinetic_ramp_epochs"),
+        ("train_stencil_centers", "train_stencil_centers"),
+        ("use_kinetic_loss", "use_kinetic_loss"),
         ("point_pretrain_epochs", "point_pretrain_epochs"),
         ("point_pretrain_steps_per_epoch", "point_pretrain_steps_per_epoch"),
         ("point_pretrain_lr", "point_pretrain_lr"),
@@ -335,6 +385,50 @@ def apply_overrides(config: ExperimentConfig, args: argparse.Namespace) -> Exper
         if value is not None:
             updates[field_name] = value
     return replace(config, **updates) if updates else config
+
+
+def config_from_resume_summary(path: Path) -> tuple[ExperimentConfig, dict[str, object]]:
+    summary_path = path.resolve()
+    payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    valid_fields = {item.name for item in fields(ExperimentConfig)}
+    saved = {
+        key: value
+        for key, value in payload.get("config", {}).items()
+        if key in valid_fields
+    }
+    if not saved:
+        raise ValueError(f"Resume summary has no saved ExperimentConfig: {summary_path}")
+    return replace(ExperimentConfig(), **saved), payload
+
+
+def resume_checkpoint_prefix(
+    summary_path: Path,
+    payload: dict[str, object],
+    requested: Path | None,
+) -> Path:
+    if requested is not None:
+        return requested.resolve()
+    run_name = str(payload.get("config", {}).get("run_name", "")).strip()
+    if not run_name:
+        raise ValueError("Resume summary config does not contain run_name.")
+    return summary_path.resolve().parent / run_name
+
+
+def load_model_weights(models, prefix: Path) -> dict[str, Path]:
+    paths = {
+        "point": Path(f"{prefix}_point.weights.h5"),
+        "mode": Path(f"{prefix}_mode.weights.h5"),
+        "pair": Path(f"{prefix}_pair.weights.h5"),
+        "context": Path(f"{prefix}_context.weights.h5"),
+    }
+    missing = [str(path) for path in paths.values() if not path.exists()]
+    if missing:
+        raise FileNotFoundError("Missing resume checkpoint file(s): " + ", ".join(missing))
+    models.point_model.load_weights(paths["point"])
+    models.mode_model.load_weights(paths["mode"])
+    models.pair_model.load_weights(paths["pair"])
+    models.context_model.load_weights(paths["context"])
+    return paths
 
 
 def apply_auto_run_dir(config: ExperimentConfig) -> ExperimentConfig:
@@ -651,7 +745,12 @@ def save_per_system_metrics_csv(path: Path, summary: dict[str, object]) -> None:
 
 def main() -> None:
     args = parse_args()
-    base_config = ExperimentConfig()
+    resume_payload = None
+    resume_paths = None
+    if args.resume_summary_json is not None:
+        base_config, resume_payload = config_from_resume_summary(args.resume_summary_json)
+    else:
+        base_config = ExperimentConfig()
     if args.phase is not None:
         base_config = replace(base_config, phase=args.phase)
     config = apply_phase_preset(base_config)
@@ -722,7 +821,25 @@ def main() -> None:
         ],
     )
     models = build_models(config, point_dim, pair_dim, global_dim)
-    if density_source_mode(config) == "predicted":
+    if args.resume_summary_json is not None:
+        assert resume_payload is not None
+        prefix = resume_checkpoint_prefix(
+            args.resume_summary_json,
+            resume_payload,
+            args.checkpoint_prefix,
+        )
+        resume_paths = load_model_weights(models, prefix)
+        print_block(
+            "Resume checkpoint",
+            [
+                ("summary", args.resume_summary_json.resolve()),
+                ("prefix", prefix),
+                ("learned rank", config.learned_rank),
+                ("fine-tune epochs", config.epochs),
+                ("fine-tune learning rate", f"{config.initial_lr:.6e}"),
+            ],
+        )
+    if density_source_mode(config) == "predicted" and resume_paths is None:
         rho_mean = float(np.mean(np.concatenate([system.rho_diag for system in split.train_systems], axis=0)))
         initialize_point_model_density_bias(
             models.point_model,
@@ -730,8 +847,14 @@ def main() -> None:
             residual_baseline=density_baseline_mode(config) == "sad-multiplicative",
         )
 
-    point_history, point_summary = pretrain_point_model(config, split, models)
-    history, summary = train_models(config, split, models)
+    point_config = replace(config, point_pretrain_epochs=0) if resume_paths is not None else config
+    point_history, point_summary = pretrain_point_model(point_config, split, models)
+    history, summary = train_models(
+        config,
+        split,
+        models,
+        initialize_best_from_current=resume_paths is not None,
+    )
 
     out_dir = Path(config.output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -754,6 +877,14 @@ def main() -> None:
 
     payload = {
         "config": asdict(config),
+        "resume": (
+            {
+                "source_summary_json": str(args.resume_summary_json.resolve()),
+                "checkpoint": {name: str(path) for name, path in resume_paths.items()},
+            }
+            if resume_paths is not None
+            else None
+        ),
         "history": {
             "train_objective": history.train_objective,
             "val_objective": history.val_objective,

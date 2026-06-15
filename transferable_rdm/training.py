@@ -1160,7 +1160,8 @@ def stencil_predictions(
     density_state: DensityFeatureState | None = None,
     max_centers: int | None = None,
     center_indices: np.ndarray | None = None,
-) -> tuple[tf.Tensor, tf.Tensor]:
+    return_gamma_stencil: bool = False,
+) -> tuple[tf.Tensor, tf.Tensor] | tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
     """explicit near-diagonal mixed derivative prediction.
 
     Returns
@@ -1184,6 +1185,7 @@ def stencil_predictions(
     chunk_centers = max(1, chunk_pairs // flat_per_center)
 
     derivative_chunks = []
+    gamma_chunks = []
     for start in range(0, n_centers, chunk_centers):
         end = min(start + chunk_centers, n_centers)
         chunk_shape = (end - start,) + stencil_shape[1:]
@@ -1207,6 +1209,8 @@ def stencil_predictions(
             local_curvature_basis_scale=local_curvature_basis_scale(system, config),
         )
         gamma_stencil = tf.reshape(outputs["gamma"], chunk_shape)
+        if return_gamma_stencil:
+            gamma_chunks.append(gamma_stencil)
         d_h = (
             gamma_stencil[:, :, 0]
             - gamma_stencil[:, :, 1]
@@ -1225,7 +1229,40 @@ def stencil_predictions(
             derivative_chunks.append(d_h)
     derivative_pred = tf.concat(derivative_chunks, axis=0)
     tau_pred = 0.5 * tf.reduce_sum(derivative_pred, axis=1, keepdims=True)
+    if return_gamma_stencil:
+        return derivative_pred, tau_pred, tf.concat(gamma_chunks, axis=0)
     return derivative_pred, tau_pred
+
+
+def kinetic_stencil_error_decomposition(
+    system: SystemRecord,
+    gamma_pred: np.ndarray,
+    gamma_true: np.ndarray,
+    *,
+    integration_multiplier: float = 1.0,
+) -> dict[str, float]:
+    """Split signed kinetic error into diagonal and off-diagonal stencil terms."""
+    error = np.asarray(gamma_pred, dtype=np.float64) - np.asarray(gamma_true, dtype=np.float64)
+    stencil_order = int(error.shape[2])
+    step_sq = float(system.step) ** 2
+
+    diag_derivative_error = (error[:, :, 0] + error[:, :, 3]) / (4.0 * step_sq)
+    offdiag_derivative_error = -(error[:, :, 1] + error[:, :, 2]) / (4.0 * step_sq)
+    if stencil_order >= 8:
+        diag_2h = (error[:, :, 4] + error[:, :, 7]) / (16.0 * step_sq)
+        offdiag_2h = -(error[:, :, 5] + error[:, :, 6]) / (16.0 * step_sq)
+        diag_derivative_error = (4.0 * diag_derivative_error - diag_2h) / 3.0
+        offdiag_derivative_error = (4.0 * offdiag_derivative_error - offdiag_2h) / 3.0
+
+    scale = 0.5 * float(integration_multiplier) * float(system.cell_volume)
+    diag_error = scale * float(np.sum(diag_derivative_error, dtype=np.float64))
+    offdiag_error = scale * float(np.sum(offdiag_derivative_error, dtype=np.float64))
+    total_error = diag_error + offdiag_error
+    return {
+        "kinetic_stencil_diag_error": diag_error,
+        "kinetic_stencil_offdiag_error": offdiag_error,
+        "kinetic_stencil_total_error": total_error,
+    }
 
 
 def gamma_stencil_targets(
@@ -1427,6 +1464,8 @@ def loss_enabled(config: ExperimentConfig, name: str) -> bool:
         return name in {"gamma", "rho", "kernel", "trace", "mode"}
     if preset in {"staged-physics", "physics7"}:
         return name in {"gamma", "rho", "kernel", "deriv", "tau", "trace", "mode"}
+    if preset in {"staged-physics-kinetic", "physics8"}:
+        return name in {"gamma", "rho", "kernel", "deriv", "tau", "trace", "mode", "kinetic"}
     if preset in {"core7", "kerdf7"}:
         return name in {"gamma", "rho", "kernel", "trace", "mode", "kinetic"}
     if preset in {"all", "custom", "none"}:
@@ -1489,6 +1528,18 @@ def loss_stage_value(config: ExperimentConfig, name: str, epoch: int) -> int:
 
 def loss_stage_signature(config: ExperimentConfig, epoch: int) -> tuple[int, ...]:
     return tuple(loss_stage_value(config, name, epoch) for name in LOSS_NAMES)
+
+
+def fully_active_schedule_epoch(config: ExperimentConfig) -> int:
+    """First epoch where every enabled scheduled loss has reached full weight."""
+    epochs = [0]
+    for name in ("deriv", "tau", "kinetic"):
+        if loss_weight(config, name) == 0.0:
+            continue
+        start = max(int(getattr(config, f"{name}_start_epoch")), 0)
+        ramp = max(int(getattr(config, f"{name}_ramp_epochs")), 0)
+        epochs.append(start + max(ramp - 1, 0))
+    return max(epochs)
 
 
 def objective_from_metrics(metrics: dict[str, float], config: ExperimentConfig, epoch: int | None = None) -> float:
@@ -1661,7 +1712,7 @@ def evaluate_system(
             config.eval_stencil_centers,
             rng,
         )
-    derivative_pred_t, tau_pred_t = stencil_predictions(
+    derivative_pred_t, tau_pred_t, gamma_stencil_pred_t = stencil_predictions(
         system,
         models,
         config,
@@ -1669,6 +1720,7 @@ def evaluate_system(
         density_state=density_state,
         max_centers=None if full_stencil_eval else config.eval_stencil_centers,
         center_indices=eval_center_indices,
+        return_gamma_stencil=True,
     )
     derivative_pred = derivative_pred_t.numpy()
     tau_pred = tau_pred_t.numpy()
@@ -1743,6 +1795,33 @@ def evaluate_system(
     kinetic_loss = float(kinetic_loss_t.numpy())
     kinetic_pred = float(kinetic_pred_t.numpy())
     kinetic_ref_error = float(kinetic_pred - kinetic_ref)
+    stencil_indices = (
+        np.arange(total_stencil_centers, dtype=np.int64)
+        if eval_center_indices is None
+        else np.asarray(eval_center_indices, dtype=np.int64)
+    )
+    stencil_shape = (len(stencil_indices),) + tuple(system.stencil_left.shape[1:])
+    gamma_stencil_true = system.gamma_values(
+        system.stencil_left[stencil_indices].reshape(-1),
+        system.stencil_right[stencil_indices].reshape(-1),
+    ).reshape(stencil_shape)
+    kinetic_stencil_decomposition = kinetic_stencil_error_decomposition(
+        system,
+        gamma_stencil_pred_t.numpy(),
+        gamma_stencil_true,
+        integration_multiplier=stencil_integration_multiplier,
+    )
+    kinetic_stencil_decomposition["kinetic_stencil_reconstruction_residual"] = float(
+        kinetic_stencil_decomposition["kinetic_stencil_total_error"]
+        - (
+            float(np.sum(tau_pred - tau_true_fd, dtype=np.float64))
+            * stencil_integration_multiplier
+            * system.cell_volume
+        )
+    )
+    kinetic_stencil_decomposition["kinetic_stencil_reference_gap"] = float(
+        kinetic_ref_error - kinetic_stencil_decomposition["kinetic_stencil_total_error"]
+    )
     kinetic_energy_ref = float(system.metadata.get("kinetic_energy_hartree", np.nan))
     kinetic_energy_ref_error = float(kinetic_pred - kinetic_energy_ref) if np.isfinite(kinetic_energy_ref) else float("nan")
     energy_stats = energy_diagnostics(
@@ -1840,6 +1919,7 @@ def evaluate_system(
         "kinetic_training_ref": kinetic_ref,
         "kinetic_ref_error": kinetic_ref_error,
         "kinetic_abs_error": abs(kinetic_ref_error),
+        **kinetic_stencil_decomposition,
         "trace_loss": trace_loss,
         "trace_rel_error": trace_rel_error,
         "trace_abs_rel_error": abs(trace_rel_error),
@@ -1972,6 +2052,11 @@ def evaluate_systems(
         "kinetic_training_ref",
         "kinetic_ref_error",
         "kinetic_abs_error",
+        "kinetic_stencil_diag_error",
+        "kinetic_stencil_offdiag_error",
+        "kinetic_stencil_total_error",
+        "kinetic_stencil_reconstruction_residual",
+        "kinetic_stencil_reference_gap",
         "trace_loss",
         "trace_rel_error",
         "trace_abs_rel_error",
@@ -2566,7 +2651,13 @@ def print_gradient_diagnostics(
     print_block("Gradient diagnostics", rows)
 
 
-def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBundle) -> tuple[TrainingHistory, dict[str, object]]:
+def train_models(
+    config: ExperimentConfig,
+    split: DatasetSplit,
+    models: ModelBundle,
+    *,
+    initialize_best_from_current: bool = False,
+) -> tuple[TrainingHistory, dict[str, object]]:
     """multi-system transferable training."""
     optimizer = optimizer_from_config(config)
     history = TrainingHistory()
@@ -2603,6 +2694,7 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
     )
     last_stage_signature: tuple[int, ...] | None = None
     last_epoch = 0
+    best_selection_epoch = fully_active_schedule_epoch(config) if initialize_best_from_current else 0
     print_block("Base loss weights", loss_weight_rows(config))
     print_block("Loss schedule", loss_schedule_rows(config))
     print_block(
@@ -2664,11 +2756,49 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
         ],
     )
 
+    if initialize_best_from_current:
+        initial_weights = epoch_loss_weights(config, best_selection_epoch)
+        initial_val_systems = select_evaluation_systems(
+            split.val_systems,
+            config.val_eval_system_count,
+        )
+        clear_gpu_evaluation_caches()
+        initial_val = evaluate_systems(
+            initial_val_systems,
+            models,
+            config,
+            epoch=best_selection_epoch,
+        )
+        clear_gpu_evaluation_caches()
+        best_val_objective = float(initial_val["objective"])
+        best_val_for_lr = best_val_objective
+        best_weights = {
+            "point": models.point_model.get_weights(),
+            "mode": models.mode_model.get_weights(),
+            "pair": models.pair_model.get_weights(),
+            "context": models.context_model.get_weights(),
+        }
+        print_block(
+            "Fine-tune baseline",
+            [
+                ("validation systems", len(initial_val_systems)),
+                ("objective", f"{best_val_objective:.6e}"),
+                ("tau MAE", f"{initial_val['tau_mae']:.6e}"),
+                ("kinetic abs error", f"{initial_val['kinetic_abs_error']:.6e} Ha"),
+                ("best-selection starts", f"epoch {best_selection_epoch}"),
+                ("active losses", active_loss_summary(initial_weights)),
+            ],
+        )
+
     for epoch in range(config.epochs):
         last_epoch = epoch
         weights = epoch_loss_weights(config, epoch)
         stage_signature = loss_stage_signature(config, epoch)
-        if last_stage_signature is not None and stage_signature != last_stage_signature:
+        if (
+            not initialize_best_from_current
+            and last_stage_signature is not None
+            and stage_signature != last_stage_signature
+        ):
             best_val_objective = np.inf
             best_weights = None
             best_val_for_lr = np.inf
@@ -2837,7 +2967,8 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
             assert diagnostic_batch is not None
             print_gradient_diagnostics(diagnostic_system, diagnostic_batch, models, config, weights)
 
-        if validation_ran:
+        selection_eligible = validation_ran and epoch >= best_selection_epoch
+        if selection_eligible:
             if val_objective < best_val_objective - 1e-9:
                 best_val_objective = val_objective
                 best_weights = {
@@ -2949,7 +3080,7 @@ def train_models(config: ExperimentConfig, split: DatasetSplit, models: ModelBun
                     + f"Enn={val_metrics['energy_ion_ion_pred']:.3e}"
                 )
 
-        if validation_ran and epochs_without_improvement >= config.early_stopping_patience:
+        if selection_eligible and epochs_without_improvement >= config.early_stopping_patience:
             print(f"Early stopping at epoch {epoch}.")
             break
 
