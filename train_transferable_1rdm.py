@@ -11,6 +11,8 @@ from pathlib import Path
 
 import numpy as np
 
+os.environ.setdefault("MPLBACKEND", "Agg")
+
 
 def env_flag(name: str, default: bool) -> bool:
     value = os.environ.get(name)

@@ -8,6 +8,8 @@ from pathlib import Path
 
 import numpy as np
 
+os.environ.setdefault("MPLBACKEND", "Agg")
+
 from train_transferable_1rdm import (
     configure_system_feature_metadata,
     configure_tensorflow_runtime,
