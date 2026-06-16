@@ -48,6 +48,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-atoms", type=int, default=7)
     parser.add_argument("--selection", choices=["random", "smallest"], default="smallest")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--require-elements",
+        default="",
+        help="Comma-separated element symbols that must each appear at least once, e.g. C,H.",
+    )
+    parser.add_argument(
+        "--exclude-elements",
+        default="",
+        help="Comma-separated element symbols that must not appear, e.g. F.",
+    )
+    parser.add_argument(
+        "--min-heavy-atoms",
+        type=int,
+        default=0,
+        help="Minimum number of non-H atoms required after max-atoms filtering.",
+    )
+    parser.add_argument(
+        "--exclude-qm9-ids-file",
+        type=Path,
+        default=None,
+        help="Text file containing QM9 IDs to skip, one per line; extra columns are ignored.",
+    )
     parser.add_argument("--grid-spacing-bohr", type=float, default=0.55)
     parser.add_argument("--padding-bohr", type=float, default=5.0)
     parser.add_argument("--max-axis-points", type=int, default=35)
@@ -373,6 +395,46 @@ def molecular_formula(symbols: list[str]) -> str:
         if count:
             parts.append(symbol if count == 1 else f"{symbol}{count}")
     return "".join(parts)
+
+
+def parse_element_list(value: str) -> set[str]:
+    elements = {item.strip() for item in value.split(",") if item.strip()}
+    unknown = elements.difference(ALLOWED_ELEMENTS)
+    if unknown:
+        raise ValueError(f"Unknown element symbol(s): {sorted(unknown)}")
+    return elements
+
+
+def read_excluded_qm9_ids(path: Path | None) -> set[str]:
+    if path is None:
+        return set()
+    excluded: set[str] = set()
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            excluded.add(stripped.split()[0].split(",", 1)[0])
+    return excluded
+
+
+def record_matches_selection_filters(
+    record: Qm9Record,
+    *,
+    required_elements: set[str],
+    excluded_elements: set[str],
+    min_heavy_atoms: int,
+    excluded_qm9_ids: set[str],
+) -> bool:
+    if record.qm9_id in excluded_qm9_ids:
+        return False
+    symbols = set(record.symbols)
+    if not required_elements.issubset(symbols):
+        return False
+    if symbols.intersection(excluded_elements):
+        return False
+    heavy_atoms = sum(symbol != "H" for symbol in record.symbols)
+    return heavy_atoms >= min_heavy_atoms
 
 
 def choose_axis_points(
@@ -955,6 +1017,21 @@ def select_records(args: argparse.Namespace) -> list[Qm9Record]:
         records = read_records_from_npz(args.npz_glob, args.max_atoms)
     else:
         records = read_qm9_records(args.qm9_tar, args.max_atoms)
+    required_elements = parse_element_list(args.require_elements)
+    excluded_elements = parse_element_list(args.exclude_elements)
+    excluded_qm9_ids = read_excluded_qm9_ids(args.exclude_qm9_ids_file)
+    if required_elements or excluded_elements or args.min_heavy_atoms > 0 or excluded_qm9_ids:
+        records = [
+            record
+            for record in records
+            if record_matches_selection_filters(
+                record,
+                required_elements=required_elements,
+                excluded_elements=excluded_elements,
+                min_heavy_atoms=max(args.min_heavy_atoms, 0),
+                excluded_qm9_ids=excluded_qm9_ids,
+            )
+        ]
     if args.selection == "smallest":
         records = sorted(records, key=lambda r: (len(r.symbols), sum(ELEMENT_Z[s] for s in r.symbols), r.qm9_id))
     else:
