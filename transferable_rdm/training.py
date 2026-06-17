@@ -785,6 +785,10 @@ def kinetic_energy_reference(
     return float(np.sum(system.tau_true) * system.cell_volume)
 
 
+def kinetic_prefactor(system: SystemRecord) -> float:
+    return float(system.metadata.get("kinetic_prefactor", 0.5))
+
+
 def physics_tau_integral(system: SystemRecord, config: ExperimentConfig) -> float:
     key = (
         id(system),
@@ -1228,7 +1232,7 @@ def stencil_predictions(
         else:
             derivative_chunks.append(d_h)
     derivative_pred = tf.concat(derivative_chunks, axis=0)
-    tau_pred = 0.5 * tf.reduce_sum(derivative_pred, axis=1, keepdims=True)
+    tau_pred = float(kinetic_prefactor(system)) * tf.reduce_sum(derivative_pred, axis=1, keepdims=True)
     if return_gamma_stencil:
         return derivative_pred, tau_pred, tf.concat(gamma_chunks, axis=0)
     return derivative_pred, tau_pred
@@ -1254,7 +1258,7 @@ def kinetic_stencil_error_decomposition(
         diag_derivative_error = (4.0 * diag_derivative_error - diag_2h) / 3.0
         offdiag_derivative_error = (4.0 * offdiag_derivative_error - offdiag_2h) / 3.0
 
-    scale = 0.5 * float(integration_multiplier) * float(system.cell_volume)
+    scale = float(kinetic_prefactor(system)) * float(integration_multiplier) * float(system.cell_volume)
     diag_error = scale * float(np.sum(diag_derivative_error, dtype=np.float64))
     offdiag_error = scale * float(np.sum(offdiag_derivative_error, dtype=np.float64))
     total_error = diag_error + offdiag_error
@@ -1309,7 +1313,7 @@ def gamma_stencil_targets(
         else:
             derivative_chunks.append(d_h)
     derivative_fd = np.concatenate(derivative_chunks, axis=0).astype(np.float32)
-    tau_fd = 0.5 * np.sum(derivative_fd, axis=1, keepdims=True)
+    tau_fd = float(kinetic_prefactor(system)) * np.sum(derivative_fd, axis=1, keepdims=True)
     source = (
         "reconstructed_from_psi_occ"
         if (system.psi_occ is not None and system.psi_occ.size)
@@ -1869,6 +1873,7 @@ def evaluate_system(
         "system_id": system.system_id,
         "family": system.family,
         "toy_dimension": system.metadata.get("toy_dimension", ""),
+        "particle_mass": float(system.metadata.get("particle_mass", 1.0)),
         "formula": str(system.metadata.get("formula", "")),
         "axis_points": int(len(system.axis)),
         "n_points": int(len(system.points)),
@@ -2203,6 +2208,7 @@ def make_compiled_train_step(
         kinetic_scale: tf.Tensor,
         kinetic_target_integral: tf.Tensor,
         kinetic_multiplier: tf.Tensor,
+        kinetic_prefactor_t: tf.Tensor,
         stencil_order: int,
         gamma_weight: tf.Tensor,
         rho_weight: tf.Tensor,
@@ -2279,7 +2285,7 @@ def make_compiled_train_step(
                     derivative_pred = (4.0 * d_h - d_2h) / 3.0
                 else:
                     derivative_pred = d_h
-                tau_pred = 0.5 * tf.reduce_sum(derivative_pred, axis=1, keepdims=True)
+                tau_pred = kinetic_prefactor_t * tf.reduce_sum(derivative_pred, axis=1, keepdims=True)
                 deriv_loss_t = rms_normalized_huber(
                     derivative_target,
                     derivative_pred,
@@ -2891,6 +2897,7 @@ def train_models(
                     tf.constant(float(max(abs(kinetic_ref), 1.0)), dtype=tf.float32),
                     tf.constant(float(physics_tau_integral(system, config)), dtype=tf.float32),
                     tf.constant(float(kinetic_multiplier), dtype=tf.float32),
+                    tf.constant(float(kinetic_prefactor(system)), dtype=tf.float32),
                     int(system.stencil_left.shape[2]),
                     tf.constant(float(weights["gamma"]), dtype=tf.float32),
                     tf.constant(float(weights["rho"]), dtype=tf.float32),

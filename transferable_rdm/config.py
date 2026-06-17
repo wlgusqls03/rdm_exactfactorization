@@ -58,6 +58,7 @@ class ExperimentConfig:
     max_wells: int = int(os.environ.get("RDM_MAX_WELLS", 2))
     max_orbitals: int = int(os.environ.get("RDM_MAX_ORBITALS", 8))
     toy_inactive_omega: float = float(os.environ.get("RDM_TOY_INACTIVE_OMEGA", 0.8))
+    toy_particle_mass: float = float(os.environ.get("RDM_TOY_PARTICLE_MASS", 1.0))
     spectral_subset_points: int = int(os.environ.get("RDM_SPECTRAL_SUBSET_POINTS", 64))
     eval_pair_count: int = int(os.environ.get("RDM_EVAL_PAIR_COUNT", 32768))
     full_eval_max_points: int = int(os.environ.get("RDM_FULL_EVAL_MAX_POINTS", 2500))

@@ -816,6 +816,7 @@ def prepare_stencil_targets(
     gamma_matrix: np.ndarray,
     step: float,
     tau_stencil: str = "central2",
+    kinetic_prefactor: float = 0.5,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """near-diagonal mixed derivative target을 위한 stencil index와 true 값을 준비."""
     interior_idx, left_idx, right_idx = prepare_stencil_indices(axis_points, tau_stencil)
@@ -830,7 +831,7 @@ def prepare_stencil_targets(
         derivative_true.append(per_dim_true)
 
     derivative_true_arr = np.asarray(derivative_true, dtype=np.float32)  # (n_interior, 3)
-    tau_true = 0.5 * np.sum(derivative_true_arr, axis=1, keepdims=True)  # (n_interior, 1)
+    tau_true = float(kinetic_prefactor) * np.sum(derivative_true_arr, axis=1, keepdims=True)  # (n_interior, 1)
     return (
         interior_idx,
         left_idx,
@@ -891,11 +892,13 @@ def finalize_system_record(
         derivative_true = np.zeros((len(interior_idx), 3), dtype=np.float32)
         tau_true = np.zeros((len(interior_idx), 1), dtype=np.float32)
     elif gamma_matrix.size:
+        kinetic_prefactor = float(metadata.get("kinetic_prefactor", 0.5))
         (interior_idx, stencil_left, stencil_right, derivative_true), tau_true = prepare_stencil_targets(
             axis_points=len(axis),
             gamma_matrix=gamma_matrix,
             step=step,
             tau_stencil=config.tau_stencil,
+            kinetic_prefactor=kinetic_prefactor,
         )
     elif derivative_true_grid is not None and tau_true_grid is not None:
         interior_idx, stencil_left, stencil_right = prepare_stencil_indices(

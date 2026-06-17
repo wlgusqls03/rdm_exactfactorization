@@ -164,6 +164,7 @@ CSV_SYSTEM_KEYS = [
     "system_id",
     "family",
     "toy_dimension",
+    "particle_mass",
     "formula",
     "axis_points",
     "n_points",
@@ -277,6 +278,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Comma-separated active dimensions for synthetic toy systems, e.g. 1,2,3.",
     )
+    parser.add_argument(
+        "--toy-particle-mass",
+        type=float,
+        default=None,
+        help="Particle mass for toy Schrodinger systems in electron-mass units.",
+    )
     parser.add_argument("--auto-run-dir", dest="auto_run_dir", action="store_true", default=None)
     parser.add_argument("--no-auto-run-dir", dest="auto_run_dir", action="store_false")
     parser.add_argument("--overfit-one-system", dest="overfit_one_system", action="store_true", default=None)
@@ -378,6 +385,7 @@ def apply_overrides(config: ExperimentConfig, args: argparse.Namespace) -> Exper
         ("output_dir", "output_dir"),
         ("npz_glob", "npz_glob"),
         ("toy_dimensions", "toy_dimensions"),
+        ("toy_particle_mass", "toy_particle_mass"),
         ("auto_run_dir", "auto_run_dir"),
         ("overfit_one_system", "overfit_one_system"),
         ("overfit_system_index", "overfit_system_index"),

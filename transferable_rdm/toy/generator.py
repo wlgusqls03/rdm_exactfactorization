@@ -50,9 +50,11 @@ def solve_1d_schrodinger(
     axis: np.ndarray,
     potential: np.ndarray,
     n_keep: int,
+    particle_mass: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     step = float(axis[1] - axis[0])
-    hamiltonian = -0.5 * second_derivative_matrix(len(axis), step) + np.diag(
+    mass = max(float(particle_mass), 1e-12)
+    hamiltonian = -(0.5 / mass) * second_derivative_matrix(len(axis), step) + np.diag(
         potential.astype(np.float64)
     )
     eigenvalues, eigenvectors = np.linalg.eigh(hamiltonian)
@@ -327,9 +329,10 @@ def build_toy_raw_system(
     ]
     solutions = []
     keep_1d = max(4, min(config.axis_points, config.max_orbitals))
+    particle_mass = max(float(config.toy_particle_mass), 1e-12)
     for params in axis_params:
         axis_potential, _ = evaluate_axis_potential(axis, params)
-        solutions.append(solve_1d_schrodinger(axis, axis_potential, keep_1d))
+        solutions.append(solve_1d_schrodinger(axis, axis_potential, keep_1d, particle_mass))
 
     eigenvalues = tuple(solution[0] for solution in solutions)
     eigenvectors = tuple(solution[1] for solution in solutions)
@@ -381,6 +384,8 @@ def build_toy_raw_system(
         "toy_dimension": active_dimension,
         "toy_embedding": "active_axes_in_3d_grid",
         "toy_temperature": TOY_TEMPERATURE,
+        "particle_mass": particle_mass,
+        "kinetic_prefactor": 0.5 / particle_mass,
         "toy_source_count": sum(int(params["num_wells"]) for params in axis_params),
         "toy_density_baseline": "normalized_ground_state_orbital",
         "local_feature_schema": LOCAL_FEATURE_SCHEMA,
