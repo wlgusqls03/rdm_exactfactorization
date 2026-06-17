@@ -184,6 +184,8 @@ class ExperimentConfig:
     use_occ_loss: bool = env_flag("RDM_USE_OCC_LOSS", True)
     use_mode_loss: bool = env_flag("RDM_USE_MODE_LOSS", True)
     use_kinetic_loss: bool = env_flag("RDM_USE_KINETIC_LOSS", False)
+    use_tau_mse_loss: bool = env_flag("RDM_USE_TAU_MSE_LOSS", False)
+    use_kinetic_mse_loss: bool = env_flag("RDM_USE_KINETIC_MSE_LOSS", False)
 
     lambda_gamma: float = float(os.environ.get("RDM_LAMBDA_GAMMA", 1.0))
     lambda_rho: float = float(os.environ.get("RDM_LAMBDA_RHO", 8.0))
@@ -194,6 +196,8 @@ class ExperimentConfig:
     lambda_occ: float = float(os.environ.get("RDM_LAMBDA_OCC", 0.25))
     lambda_mode: float = float(os.environ.get("RDM_LAMBDA_MODE", 1e-4))
     lambda_kinetic: float = float(os.environ.get("RDM_LAMBDA_KINETIC", 1.0))
+    lambda_tau_mse: float = float(os.environ.get("RDM_LAMBDA_TAU_MSE", 0.0))
+    lambda_kinetic_mse: float = float(os.environ.get("RDM_LAMBDA_KINETIC_MSE", 0.0))
 
     # ------------------------------------------------------------------
     # loss schedule

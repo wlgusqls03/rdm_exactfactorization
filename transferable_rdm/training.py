@@ -38,17 +38,31 @@ from .systems import SystemRecord
 from .utils import print_block, topk_descending
 
 
-LOSS_NAMES = ("gamma", "rho", "kernel", "deriv", "tau", "trace", "occ", "mode", "kinetic")
+LOSS_NAMES = (
+    "gamma",
+    "rho",
+    "kernel",
+    "deriv",
+    "tau",
+    "tau_mse",
+    "trace",
+    "occ",
+    "mode",
+    "kinetic",
+    "kinetic_mse",
+)
 TRAIN_HISTORY_KEYS = (
     "pair_loss",
     "rho_loss",
     "kernel_loss",
     "deriv_loss",
     "tau_loss",
+    "tau_mse_loss",
     "trace_loss",
     "occ_penalty",
     "mode_reg",
     "kinetic_loss",
+    "kinetic_mse_loss",
 )
 VAL_HISTORY_KEYS = (
     "pair_loss",
@@ -66,13 +80,22 @@ VAL_HISTORY_KEYS = (
     "deriv_pred_fd_mae",
     "tau_loss",
     "tau_raw_mse",
+    "tau_rmse",
+    "tau_rel_mse_loss",
+    "tau_rel_rmse",
     "tau_mae",
     "tau_pred_ao_mae",
     "tau_fd_ao_mae",
     "tau_fd_ao_rms_ratio",
     "tau_pred_fd_mae",
     "kinetic_loss",
+    "kinetic_mse_loss",
     "kinetic_abs_error",
+    "kinetic_sq_error",
+    "kinetic_rmse",
+    "kinetic_rel_abs_error",
+    "kinetic_rel_sq_error",
+    "kinetic_rel_rmse",
     "energy_total_abs_error",
     "energy_total_rmse",
     "energy_grid_total_abs_error",
@@ -90,10 +113,12 @@ TRAIN_OBJECTIVE_TERMS = (
     ("kernel", "kernel_loss"),
     ("deriv", "deriv_loss"),
     ("tau", "tau_loss"),
+    ("tau_mse", "tau_mse_loss"),
     ("trace", "trace_loss"),
     ("occ", "occ_penalty"),
     ("mode", "mode_reg"),
     ("kinetic", "kinetic_loss"),
+    ("kinetic_mse", "kinetic_mse_loss"),
 )
 EVAL_OBJECTIVE_TERMS = (
     ("gamma", "pair_loss"),
@@ -101,9 +126,11 @@ EVAL_OBJECTIVE_TERMS = (
     ("kernel", "kernel_loss"),
     ("deriv", "deriv_loss"),
     ("tau", "tau_loss"),
+    ("tau_mse", "tau_mse_loss"),
     ("trace", "trace_loss"),
     ("occ", "occ_penalty"),
     ("kinetic", "kinetic_loss"),
+    ("kinetic_mse", "kinetic_mse_loss"),
 )
 
 PHYSICS_TARGET_MODES = ("orbital", "fd")
@@ -191,6 +218,19 @@ def rms_normalized_huber(
     quadratic = tf.minimum(scaled_abs_error, float(delta))
     linear = scaled_abs_error - quadratic
     return tf.reduce_mean(0.5 * tf.square(quadratic) + float(delta) * linear)
+
+
+def rms_normalized_mse(
+    y_true: tf.Tensor,
+    y_pred: tf.Tensor,
+    *,
+    scale_floor: float,
+) -> tf.Tensor:
+    """MSE after scaling errors by the target RMS."""
+    if scale_floor <= 0.0:
+        raise ValueError("RMS-normalized MSE scale_floor must be positive.")
+    scale_sq = tf.maximum(tf.reduce_mean(tf.square(y_true)), float(scale_floor) ** 2)
+    return tf.reduce_mean(tf.square(y_pred - y_true)) / scale_sq
 
 
 def to_tensor(array: np.ndarray) -> tf.Tensor:
@@ -1463,6 +1503,8 @@ def use_compiled_train_step(config: ExperimentConfig) -> bool:
 
 
 def loss_enabled(config: ExperimentConfig, name: str) -> bool:
+    if name in {"tau_mse", "kinetic_mse"}:
+        return bool(getattr(config, f"use_{name}_loss"))
     preset = config.loss_preset.strip().lower()
     if preset in {"core5", "simple5"}:
         return name in {"gamma", "rho", "kernel", "trace", "mode"}
@@ -1485,10 +1527,11 @@ def loss_weight(config: ExperimentConfig, name: str) -> float:
 
 def loss_schedule_multiplier(config: ExperimentConfig, name: str, epoch: int) -> float:
     """Epoch-dependent multiplier for staged loss terms."""
-    if name not in {"deriv", "tau", "kinetic"}:
+    if name not in {"deriv", "tau", "tau_mse", "kinetic", "kinetic_mse"}:
         return 1.0
-    start_epoch = max(int(getattr(config, f"{name}_start_epoch")), 0)
-    ramp_epochs = max(int(getattr(config, f"{name}_ramp_epochs")), 0)
+    schedule_name = {"tau_mse": "tau", "kinetic_mse": "kinetic"}.get(name, name)
+    start_epoch = max(int(getattr(config, f"{schedule_name}_start_epoch")), 0)
+    ramp_epochs = max(int(getattr(config, f"{schedule_name}_ramp_epochs")), 0)
 
     if epoch < start_epoch:
         return 0.0
@@ -1537,11 +1580,12 @@ def loss_stage_signature(config: ExperimentConfig, epoch: int) -> tuple[int, ...
 def fully_active_schedule_epoch(config: ExperimentConfig) -> int:
     """First epoch where every enabled scheduled loss has reached full weight."""
     epochs = [0]
-    for name in ("deriv", "tau", "kinetic"):
+    for name in ("deriv", "tau", "tau_mse", "kinetic", "kinetic_mse"):
         if loss_weight(config, name) == 0.0:
             continue
-        start = max(int(getattr(config, f"{name}_start_epoch")), 0)
-        ramp = max(int(getattr(config, f"{name}_ramp_epochs")), 0)
+        schedule_name = {"tau_mse": "tau", "kinetic_mse": "kinetic"}.get(name, name)
+        start = max(int(getattr(config, f"{schedule_name}_start_epoch")), 0)
+        ramp = max(int(getattr(config, f"{schedule_name}_ramp_epochs")), 0)
         epochs.append(start + max(ramp - 1, 0))
     return max(epochs)
 
@@ -1750,6 +1794,10 @@ def evaluate_system(
         stencil_integration_multiplier = float(total_stencil_centers) / max(float(stencil_eval_centers), 1.0)
     deriv_raw_mse = float(np.mean((derivative_pred - derivative_target) ** 2))
     tau_raw_mse = float(np.mean((tau_pred - tau_target) ** 2))
+    tau_rmse = float(np.sqrt(tau_raw_mse))
+    tau_target_rms_sq = float(max(np.mean(tau_target**2), config.tau_scale_floor**2))
+    tau_rel_mse_loss = float(tau_raw_mse / tau_target_rms_sq)
+    tau_rel_rmse = float(np.sqrt(tau_rel_mse_loss))
     deriv_pred_ao_raw_mse = float(np.mean((derivative_pred - derivative_true_orbital) ** 2))
     deriv_pred_ao_mae = float(np.mean(np.abs(derivative_pred - derivative_true_orbital)))
     deriv_fd_ao_raw_mse = float(np.mean((derivative_true_fd - derivative_true_orbital) ** 2))
@@ -1797,8 +1845,13 @@ def evaluate_system(
         control_variate=config.kinetic_control_variate,
     )
     kinetic_loss = float(kinetic_loss_t.numpy())
+    kinetic_mse_loss = kinetic_loss
     kinetic_pred = float(kinetic_pred_t.numpy())
     kinetic_ref_error = float(kinetic_pred - kinetic_ref)
+    kinetic_sq_error = float(kinetic_ref_error**2)
+    kinetic_scale = max(abs(kinetic_ref), 1.0)
+    kinetic_rel_abs_error = float(abs(kinetic_ref_error) / kinetic_scale)
+    kinetic_rel_sq_error = float((kinetic_ref_error / kinetic_scale) ** 2)
     stencil_indices = (
         np.arange(total_stencil_centers, dtype=np.int64)
         if eval_center_indices is None
@@ -1910,7 +1963,11 @@ def evaluate_system(
         "deriv_pred_fd_raw_mse": deriv_pred_fd_raw_mse,
         "deriv_pred_fd_mae": deriv_pred_fd_mae,
         "tau_loss": tau_loss,
+        "tau_mse_loss": tau_rel_mse_loss,
         "tau_raw_mse": tau_raw_mse,
+        "tau_rmse": tau_rmse,
+        "tau_rel_mse_loss": tau_rel_mse_loss,
+        "tau_rel_rmse": tau_rel_rmse,
         "tau_mae": tau_mae,
         "tau_pred_ao_raw_mse": tau_pred_ao_raw_mse,
         "tau_pred_ao_mae": tau_pred_ao_mae,
@@ -1920,10 +1977,16 @@ def evaluate_system(
         "tau_pred_fd_raw_mse": tau_pred_fd_raw_mse,
         "tau_pred_fd_mae": tau_pred_fd_mae,
         "kinetic_loss": kinetic_loss,
+        "kinetic_mse_loss": kinetic_mse_loss,
         "kinetic_pred": kinetic_pred,
         "kinetic_training_ref": kinetic_ref,
         "kinetic_ref_error": kinetic_ref_error,
         "kinetic_abs_error": abs(kinetic_ref_error),
+        "kinetic_sq_error": kinetic_sq_error,
+        "kinetic_rmse": abs(kinetic_ref_error),
+        "kinetic_rel_abs_error": kinetic_rel_abs_error,
+        "kinetic_rel_sq_error": kinetic_rel_sq_error,
+        "kinetic_rel_rmse": abs(kinetic_ref_error) / kinetic_scale,
         **kinetic_stencil_decomposition,
         "trace_loss": trace_loss,
         "trace_rel_error": trace_rel_error,
@@ -2043,7 +2106,11 @@ def evaluate_systems(
         "deriv_pred_fd_raw_mse",
         "deriv_pred_fd_mae",
         "tau_loss",
+        "tau_mse_loss",
         "tau_raw_mse",
+        "tau_rmse",
+        "tau_rel_mse_loss",
+        "tau_rel_rmse",
         "tau_mae",
         "tau_pred_ao_raw_mse",
         "tau_pred_ao_mae",
@@ -2053,10 +2120,16 @@ def evaluate_systems(
         "tau_pred_fd_raw_mse",
         "tau_pred_fd_mae",
         "kinetic_loss",
+        "kinetic_mse_loss",
         "kinetic_pred",
         "kinetic_training_ref",
         "kinetic_ref_error",
         "kinetic_abs_error",
+        "kinetic_sq_error",
+        "kinetic_rmse",
+        "kinetic_rel_abs_error",
+        "kinetic_rel_sq_error",
+        "kinetic_rel_rmse",
         "kinetic_stencil_diag_error",
         "kinetic_stencil_offdiag_error",
         "kinetic_stencil_total_error",
@@ -2126,6 +2199,8 @@ def evaluate_systems(
         values = np.asarray([entry[key] for entry in per_system], dtype=np.float64)
         averages[key] = float(np.nan) if np.all(np.isnan(values)) else float(np.nanmean(values))
     for src_key, dst_key in (
+        ("kinetic_sq_error", "kinetic_rmse"),
+        ("kinetic_rel_sq_error", "kinetic_rel_rmse"),
         ("energy_total_sq_error", "energy_total_rmse"),
         ("energy_grid_total_sq_error", "energy_grid_total_rmse"),
     ):
@@ -2219,6 +2294,8 @@ def make_compiled_train_step(
         occ_weight: tf.Tensor,
         mode_weight: tf.Tensor,
         kinetic_weight: tf.Tensor,
+        tau_mse_weight: tf.Tensor,
+        kinetic_mse_weight: tf.Tensor,
     ) -> tuple[tf.Tensor, ...]:
         del occ_weight
         with tf.GradientTape() as tape:
@@ -2255,7 +2332,7 @@ def make_compiled_train_step(
 
             zero = tf.constant(0.0, dtype=tf.float32)
 
-            def physics_losses() -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+            def physics_losses() -> tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
                 stencil_outputs = predict_from_features(
                     stencil_point_l,
                     stencil_point_r,
@@ -2298,6 +2375,11 @@ def make_compiled_train_step(
                     scale_floor=config.tau_scale_floor,
                     delta=config.physics_huber_delta,
                 )
+                tau_mse_loss_t = rms_normalized_mse(
+                    tau_target,
+                    tau_pred,
+                    scale_floor=config.tau_scale_floor,
+                )
                 if config.kinetic_control_variate:
                     kinetic_pred = kinetic_target_integral + (
                         tf.reduce_sum(tau_pred - tau_target) * kinetic_multiplier * cell_volume
@@ -2305,12 +2387,13 @@ def make_compiled_train_step(
                 else:
                     kinetic_pred = tf.reduce_sum(tau_pred) * kinetic_multiplier * cell_volume
                 kinetic_loss_t = tf.square((kinetic_pred - kinetic_ref) / kinetic_scale)
-                return deriv_loss_t, tau_loss_t, kinetic_loss_t
+                kinetic_mse_loss_t = kinetic_loss_t
+                return deriv_loss_t, tau_loss_t, kinetic_loss_t, tau_mse_loss_t, kinetic_mse_loss_t
 
-            deriv_loss, tau_loss, kinetic_loss = tf.cond(
+            deriv_loss, tau_loss, kinetic_loss, tau_mse_loss, kinetic_mse_loss = tf.cond(
                 tf.shape(derivative_target)[0] > 0,
                 physics_losses,
-                lambda: (zero, zero, zero),
+                lambda: (zero, zero, zero, zero, zero),
             )
             mode_reg = tf.reduce_mean(pair_outputs["mode_weights"])
 
@@ -2323,6 +2406,8 @@ def make_compiled_train_step(
                 + trace_weight * trace_loss
                 + mode_weight * mode_reg
                 + kinetic_weight * kinetic_loss
+                + tau_mse_weight * tau_mse_loss
+                + kinetic_mse_weight * kinetic_mse_loss
             )
 
         grads = tape.gradient(total_loss, vars_all)
@@ -2338,10 +2423,12 @@ def make_compiled_train_step(
             kernel_loss,
             deriv_loss,
             tau_loss,
+            tau_mse_loss,
             trace_loss,
             tf.constant(0.0, dtype=tf.float32),
             mode_reg,
             kinetic_loss,
+            kinetic_mse_loss,
         )
 
     return train_step
@@ -2387,7 +2474,13 @@ def compute_training_losses(
     kernel_loss = tf.reduce_mean(tf.square(diag_outputs["kernel"] - 1.0))
 
     zero = tf.constant(0.0, dtype=tf.float32)
-    if weights["deriv"] != 0.0 or weights["tau"] != 0.0 or weights["kinetic"] != 0.0:
+    if (
+        weights["deriv"] != 0.0
+        or weights["tau"] != 0.0
+        or weights["tau_mse"] != 0.0
+        or weights["kinetic"] != 0.0
+        or weights["kinetic_mse"] != 0.0
+    ):
         derivative_pred, tau_pred = stencil_predictions(
             system,
             models,
@@ -2417,6 +2510,11 @@ def compute_training_losses(
             scale_floor=config.tau_scale_floor,
             delta=config.physics_huber_delta,
         )
+        tau_mse_loss = rms_normalized_mse(
+            to_tensor(tau_target),
+            tau_pred,
+            scale_floor=config.tau_scale_floor,
+        )
         if stencil_center_indices is not None:
             n_sampled_centers = max(int(len(stencil_center_indices)), 1)
             kinetic_multiplier = float(system.stencil_left.shape[0]) / float(n_sampled_centers)
@@ -2434,10 +2532,13 @@ def compute_training_losses(
             target_integral=physics_tau_integral(system, config),
             control_variate=config.kinetic_control_variate,
         )
+        kinetic_mse_loss = kinetic_loss
     else:
         deriv_loss = zero
         tau_loss = zero
+        tau_mse_loss = zero
         kinetic_loss = zero
+        kinetic_mse_loss = zero
 
     if diagonal_indices is None:
         trace_pred = tf.reduce_sum(gamma_diag) * system.cell_volume
@@ -2459,10 +2560,12 @@ def compute_training_losses(
         "kernel_loss": kernel_loss,
         "deriv_loss": deriv_loss,
         "tau_loss": tau_loss,
+        "tau_mse_loss": tau_mse_loss,
         "trace_loss": trace_loss,
         "occ_penalty": occ_penalty,
         "mode_reg": mode_reg,
         "kinetic_loss": kinetic_loss,
+        "kinetic_mse_loss": kinetic_mse_loss,
     }
 
 
@@ -2495,7 +2598,9 @@ def print_gradient_diagnostics(
     diagnostic_weights = dict(weights)
     diagnostic_weights["deriv"] = 1.0
     diagnostic_weights["tau"] = 1.0
+    diagnostic_weights["tau_mse"] = 1.0
     diagnostic_weights["kinetic"] = 1.0
+    diagnostic_weights["kinetic_mse"] = 1.0
     diagnostic_stencil_centers = int(config.gradient_diagnostic_stencil_centers)
     diagnostic_center_indices = select_stencil_center_indices(
         system,
@@ -2546,10 +2651,11 @@ def print_gradient_diagnostics(
         ("local curvature sigma", f"{config.local_curvature_sigma:.6g} normalized domain units"),
         ("gamma-FD diagnostic source", diagnostic_gamma_fd_source),
         (
-            "scheduled weights gamma/deriv/tau/kinetic",
+            "scheduled weights gamma/deriv/tau/tau_mse/kinetic/kinetic_mse",
             (
                 f"{weights['gamma']:.3e} / {weights['deriv']:.3e} / "
-                f"{weights['tau']:.3e} / {weights['kinetic']:.3e}"
+                f"{weights['tau']:.3e} / {weights['tau_mse']:.3e} / "
+                f"{weights['kinetic']:.3e} / {weights['kinetic_mse']:.3e}"
             ),
         ),
         ("kinetic control variate", config.kinetic_control_variate),
@@ -2821,7 +2927,13 @@ def train_models(
             batch = sample_pair_batch(system, config, epoch, rng)
             stencil_center_indices = (
                 select_stencil_center_indices(system, config.train_stencil_centers, rng)
-                if (weights["deriv"] != 0.0 or weights["tau"] != 0.0 or weights["kinetic"] != 0.0)
+                if (
+                    weights["deriv"] != 0.0
+                    or weights["tau"] != 0.0
+                    or weights["tau_mse"] != 0.0
+                    or weights["kinetic"] != 0.0
+                    or weights["kinetic_mse"] != 0.0
+                )
                 else None
             )
             diagonal_indices = select_diagonal_indices(system, config.train_diagonal_points, rng)
@@ -2840,7 +2952,13 @@ def train_models(
                 diag_idx_t = tf.convert_to_tensor(diag_idx, dtype=tf.int64)
                 trace_multiplier = float(len(system.points)) / max(float(len(diag_idx)), 1.0)
 
-                physics_active = weights["deriv"] != 0.0 or weights["tau"] != 0.0 or weights["kinetic"] != 0.0
+                physics_active = (
+                    weights["deriv"] != 0.0
+                    or weights["tau"] != 0.0
+                    or weights["tau_mse"] != 0.0
+                    or weights["kinetic"] != 0.0
+                    or weights["kinetic_mse"] != 0.0
+                )
                 if physics_active:
                     stencil_idx = (
                         np.arange(int(system.stencil_left.shape[0]), dtype=np.int64)
@@ -2908,6 +3026,8 @@ def train_models(
                     tf.constant(float(weights["occ"]), dtype=tf.float32),
                     tf.constant(float(weights["mode"]), dtype=tf.float32),
                     tf.constant(float(weights["kinetic"]), dtype=tf.float32),
+                    tf.constant(float(weights["tau_mse"]), dtype=tf.float32),
+                    tf.constant(float(weights["kinetic_mse"]), dtype=tf.float32),
                 )
                 running_total += float(loss_values[0].numpy())
                 for key, value in zip(TRAIN_HISTORY_KEYS, loss_values[1:]):
@@ -3029,11 +3149,20 @@ def train_models(
                 )
                 print(
                     " " * 14
+                    + f"held-out rms T={val_metrics['kinetic_rmse']:.3e} "
+                    + f"T_rel={val_metrics['kinetic_rel_rmse']:.3e} "
+                    + f"tau={val_metrics['tau_rmse']:.3e} "
+                    + f"tau_rel={val_metrics['tau_rel_rmse']:.3e}"
+                )
+                print(
+                    " " * 14
                     + f"held-out loss gamma_pair={val_metrics['pair_loss']:.3e} "
                     + f"rho={val_metrics['rho_loss']:.3e} "
                     + f"T={val_metrics['kinetic_loss']:.3e} "
+                    + f"T_mse={val_metrics['kinetic_mse_loss']:.3e} "
                     + f"deriv_huber={val_metrics['deriv_loss']:.3e} "
                     + f"tau_huber={val_metrics['tau_loss']:.3e} "
+                    + f"tau_mse={val_metrics['tau_mse_loss']:.3e} "
                     + f"trace_rel={val_metrics['trace_abs_rel_error']:.3e} "
                     + f"occ_pen={val_metrics['occ_penalty']:.3e}"
                 )
@@ -3140,7 +3269,10 @@ def train_models(
         ("held-out gamma_pair loss", f"{final_val['pair_loss']:.6e}"),
         ("held-out density MAE", f"{final_val['density_mae']:.6e}"),
         ("held-out kinetic loss", f"{final_val['kinetic_loss']:.6e}"),
+        ("held-out kinetic MSE loss", f"{final_val['kinetic_mse_loss']:.6e}"),
         ("held-out kinetic abs err", f"{final_val['kinetic_abs_error']:.6e}"),
+        ("held-out kinetic RMSE", f"{final_val['kinetic_rmse']:.6e}"),
+        ("held-out kinetic rel RMSE", f"{final_val['kinetic_rel_rmse']:.6e}"),
         (
             "held-out systems evaluated",
             f"{final_val['evaluated_system_count']} / {final_val['available_system_count']}",
@@ -3161,6 +3293,9 @@ def train_models(
         ("held-out E pred T/Vext/J/Exc/Enn", energy_component_summary(final_val, "pred")),
         ("held-out trace rel err", f"{final_val['trace_abs_rel_error']:.6e}"),
         ("held-out tau MAE", f"{final_val['tau_mae']:.6e}"),
+        ("held-out tau RMSE", f"{final_val['tau_rmse']:.6e}"),
+        ("held-out tau rel MSE loss", f"{final_val['tau_rel_mse_loss']:.6e}"),
+        ("held-out tau rel RMSE", f"{final_val['tau_rel_rmse']:.6e}"),
         ("held-out tau gamma-FD-vs-orbital MAE", f"{final_val['tau_fd_ao_mae']:.6e}"),
         ("held-out tau pred-vs-FD MAE", f"{final_val['tau_pred_fd_mae']:.6e}"),
         ("held-out tau gamma-FD/orbital RMS", f"{final_val['tau_fd_ao_rms_ratio']:.6e}"),
@@ -3187,7 +3322,10 @@ def train_models(
                 ("test gamma_pair loss", f"{final_test['pair_loss']:.6e}"),
                 ("test density MAE", f"{final_test['density_mae']:.6e}"),
                 ("test kinetic loss", f"{final_test['kinetic_loss']:.6e}"),
+                ("test kinetic MSE loss", f"{final_test['kinetic_mse_loss']:.6e}"),
                 ("test kinetic abs err", f"{final_test['kinetic_abs_error']:.6e}"),
+                ("test kinetic RMSE", f"{final_test['kinetic_rmse']:.6e}"),
+                ("test kinetic rel RMSE", f"{final_test['kinetic_rel_rmse']:.6e}"),
                 (
                     "test systems evaluated",
                     f"{final_test['evaluated_system_count']} / {final_test['available_system_count']}",
@@ -3207,6 +3345,9 @@ def train_models(
                 ("test E ref T/Vext/J/Exc/Enn", energy_component_summary(final_test, "ref")),
                 ("test E pred T/Vext/J/Exc/Enn", energy_component_summary(final_test, "pred")),
                 ("test tau MAE", f"{final_test['tau_mae']:.6e}"),
+                ("test tau RMSE", f"{final_test['tau_rmse']:.6e}"),
+                ("test tau rel MSE loss", f"{final_test['tau_rel_mse_loss']:.6e}"),
+                ("test tau rel RMSE", f"{final_test['tau_rel_rmse']:.6e}"),
                 ("test tau gamma-FD-vs-orbital MAE", f"{final_test['tau_fd_ao_mae']:.6e}"),
                 ("test tau pred-vs-FD MAE", f"{final_test['tau_pred_fd_mae']:.6e}"),
         ]

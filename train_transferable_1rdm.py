@@ -85,7 +85,11 @@ CSV_METRIC_KEYS = [
     "deriv_pred_fd_raw_mse",
     "deriv_pred_fd_mae",
     "tau_loss",
+    "tau_mse_loss",
     "tau_raw_mse",
+    "tau_rmse",
+    "tau_rel_mse_loss",
+    "tau_rel_rmse",
     "tau_mae",
     "tau_pred_ao_raw_mse",
     "tau_pred_ao_mae",
@@ -95,10 +99,16 @@ CSV_METRIC_KEYS = [
     "tau_pred_fd_raw_mse",
     "tau_pred_fd_mae",
     "kinetic_loss",
+    "kinetic_mse_loss",
     "kinetic_pred",
     "kinetic_training_ref",
     "kinetic_ref_error",
     "kinetic_abs_error",
+    "kinetic_sq_error",
+    "kinetic_rmse",
+    "kinetic_rel_abs_error",
+    "kinetic_rel_sq_error",
+    "kinetic_rel_rmse",
     "kinetic_stencil_diag_error",
     "kinetic_stencil_offdiag_error",
     "kinetic_stencil_total_error",
@@ -198,6 +208,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-learning-rate", type=float, default=None)
     parser.add_argument("--loss-preset", type=str, default=None)
     parser.add_argument("--lambda-kinetic", type=float, default=None)
+    parser.add_argument("--lambda-tau-mse", type=float, default=None)
+    parser.add_argument("--lambda-kinetic-mse", type=float, default=None)
     parser.add_argument("--deriv-start-epoch", type=int, default=None)
     parser.add_argument("--deriv-ramp-epochs", type=int, default=None)
     parser.add_argument("--tau-start-epoch", type=int, default=None)
@@ -214,6 +226,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-use-kinetic-loss",
         dest="use_kinetic_loss",
+        action="store_false",
+    )
+    parser.add_argument(
+        "--use-tau-mse-loss",
+        dest="use_tau_mse_loss",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--no-use-tau-mse-loss",
+        dest="use_tau_mse_loss",
+        action="store_false",
+    )
+    parser.add_argument(
+        "--use-kinetic-mse-loss",
+        dest="use_kinetic_mse_loss",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--no-use-kinetic-mse-loss",
+        dest="use_kinetic_mse_loss",
         action="store_false",
     )
     parser.add_argument("--point-pretrain-epochs", type=int, default=None)
@@ -346,6 +380,8 @@ def apply_overrides(config: ExperimentConfig, args: argparse.Namespace) -> Exper
         ("min_lr", "min_learning_rate"),
         ("loss_preset", "loss_preset"),
         ("lambda_kinetic", "lambda_kinetic"),
+        ("lambda_tau_mse", "lambda_tau_mse"),
+        ("lambda_kinetic_mse", "lambda_kinetic_mse"),
         ("deriv_start_epoch", "deriv_start_epoch"),
         ("deriv_ramp_epochs", "deriv_ramp_epochs"),
         ("tau_start_epoch", "tau_start_epoch"),
@@ -354,6 +390,8 @@ def apply_overrides(config: ExperimentConfig, args: argparse.Namespace) -> Exper
         ("kinetic_ramp_epochs", "kinetic_ramp_epochs"),
         ("train_stencil_centers", "train_stencil_centers"),
         ("use_kinetic_loss", "use_kinetic_loss"),
+        ("use_tau_mse_loss", "use_tau_mse_loss"),
+        ("use_kinetic_mse_loss", "use_kinetic_mse_loss"),
         ("point_pretrain_epochs", "point_pretrain_epochs"),
         ("point_pretrain_steps_per_epoch", "point_pretrain_steps_per_epoch"),
         ("point_pretrain_lr", "point_pretrain_lr"),
