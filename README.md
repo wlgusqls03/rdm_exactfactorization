@@ -443,11 +443,11 @@ python train_transferable_1rdm.py \
 oracles do not increase this limit. The runtime prints both the expanded corpus
 estimate and the approximate frozen density GPU-cache size.
 
-Use `--pair-density-feature-mode off` for the original pair input, or
-`--pair-density-feature-mode rho-derivatives` to add predicted `rho_N`, gradient
-norm, and Laplacian descriptors without predicting charged densities. Fukui mode
-adds the same descriptors for `rho_N`, `f+ = rho_(N+1) - rho_N`, and
-`f- = rho_N - rho_(N-1)`.
+By default, the pair model receives density-derived descriptors from `rho_N`,
+its gradient norm, and its Laplacian (`--pair-density-feature-mode
+rho-derivatives`). Use `--pair-density-feature-mode off` for the original pair
+input without density descriptors. Fukui mode adds the same descriptors for
+`rho_N`, `f+ = rho_(N+1) - rho_N`, and `f- = rho_N - rho_(N-1)`.
 
 The charged-oracle NPZ files are needed to pretrain Fukui mode. Once those NPZ
 files exist, changing among the three training modes does not require rebuilding
@@ -468,11 +468,11 @@ left by older versions of the script.
 For a controlled comparison, keep all other options fixed and run:
 
 ```bash
-# Predicted rho_N only; no density descriptor enters the pair model.
+# Original pair input; no density descriptor enters the pair model.
 python train_transferable_1rdm.py ... --pair-density-feature-mode off --run-name v1_off
 
-# Predicted rho_N plus its gradient norm and Laplacian.
-python train_transferable_1rdm.py ... --pair-density-feature-mode rho-derivatives --run-name v1_rho_derivatives
+# Default: predicted/true rho_N plus its gradient norm and Laplacian.
+python train_transferable_1rdm.py ... --run-name v1_rho_derivatives
 
 # Predicted rho_N, f+, f- plus their gradient norms and Laplacians.
 python train_transferable_1rdm.py ... --pair-density-feature-mode fukui --run-name v1_fukui

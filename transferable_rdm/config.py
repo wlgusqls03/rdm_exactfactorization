@@ -75,7 +75,7 @@ class ExperimentConfig:
     normalize_rho: bool = env_flag("RDM_NORMALIZE_RHO", True)
     density_source: str = os.environ.get("RDM_DENSITY_SOURCE", "predicted")
     tau_stencil: str = os.environ.get("RDM_TAU_STENCIL", "central2")
-    pair_density_feature_mode: str = os.environ.get("RDM_PAIR_DENSITY_FEATURE_MODE", "off")
+    pair_density_feature_mode: str = os.environ.get("RDM_PAIR_DENSITY_FEATURE_MODE", "rho-derivatives")
     pair_density_symmetric: bool = env_flag("RDM_PAIR_DENSITY_SYMMETRIC", True)
     pair_density_hessian: bool = env_flag("RDM_PAIR_DENSITY_HESSIAN", False)
     pair_density_eps: float = float(os.environ.get("RDM_PAIR_DENSITY_EPS", 1e-14))

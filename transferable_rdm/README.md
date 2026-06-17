@@ -25,12 +25,11 @@ Reference density를 직접 넣어 density bottleneck을 제거하는 oracle 실
 RDM_DENSITY_SOURCE=true \
 python train_transferable_1rdm.py \
   --density-source true \
-  --pair-density-feature-mode rho-derivatives \
-  --pair-density-hessian
+  --pair-density-feature-mode rho-derivatives
 ```
 
 이 모드에서는 point-density pretrain을 건너뛰고 stored `rho_diag`와 동일한
-finite-difference gradient/Laplacian/Hessian descriptor를 pair 및 stencil
+finite-difference gradient/Laplacian descriptor를 pair 및 stencil
 예측에 사용한다. 따라서 density MAE는 0이어야 하며, 남는 gamma/tau/T 오차는
 kernel 및 physics 학습 경로의 한계를 나타낸다. 기본값은 `predicted`다.
 
@@ -58,7 +57,6 @@ python train_transferable_1rdm.py \
   --test-system-count 50 \
   --axis-points 9 \
   --pair-density-feature-mode rho-derivatives \
-  --pair-density-hessian \
   --density-baseline-mode sad-multiplicative
 ```
 
@@ -81,8 +79,9 @@ QM9 patched NPZ와 같은 `local=32`, `global=11` 크기를 사용한다.
 - SAD 대응 채널: 외부 potential의 정규화된 최저 product-orbital density
 - global atom summary: source count, active dimension, source strength/radius summary
 
-따라서 `rho-derivatives + Hessian` 설정에서는 QM9과 동일하게 point input 43,
-pair input 43이 된다. 기존 QM9 NPZ 생성 및 로딩 경로는 toy adapter를 사용하지
+따라서 기본 `rho-derivatives` 설정에서는 density value/gradient/Laplacian
+descriptor가 pair input에 추가된다. `--pair-density-hessian`을 켜면 Hessian
+descriptor도 추가된다. 기존 QM9 NPZ 생성 및 로딩 경로는 toy adapter를 사용하지
 않는다. Toy baseline은 target density 복사가 아니라 potential만으로 만든 초기
 추정치이며, baseline 영향 자체를 제거하려면 `--density-baseline-mode learned`를
 사용한다.
