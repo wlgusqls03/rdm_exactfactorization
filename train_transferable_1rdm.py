@@ -219,6 +219,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kinetic-start-epoch", type=int, default=None)
     parser.add_argument("--kinetic-ramp-epochs", type=int, default=None)
     parser.add_argument("--train-stencil-centers", type=int, default=None)
+    parser.add_argument("--stencil-feature-cache-max-centers", type=int, default=None)
+    parser.add_argument("--stencil-prediction-chunk-size", type=int, default=None)
+    parser.add_argument("--diagonal-prediction-chunk-size", type=int, default=None)
     parser.add_argument(
         "--use-kinetic-loss",
         dest="use_kinetic_loss",
@@ -391,6 +394,9 @@ def apply_overrides(config: ExperimentConfig, args: argparse.Namespace) -> Exper
         ("kinetic_start_epoch", "kinetic_start_epoch"),
         ("kinetic_ramp_epochs", "kinetic_ramp_epochs"),
         ("train_stencil_centers", "train_stencil_centers"),
+        ("stencil_feature_cache_max_centers", "stencil_feature_cache_max_centers"),
+        ("stencil_prediction_chunk_size", "stencil_prediction_chunk_size"),
+        ("diagonal_prediction_chunk_size", "diagonal_prediction_chunk_size"),
         ("use_kinetic_loss", "use_kinetic_loss"),
         ("use_tau_mse_loss", "use_tau_mse_loss"),
         ("use_kinetic_mse_loss", "use_kinetic_mse_loss"),
