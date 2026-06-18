@@ -91,9 +91,11 @@ VAL_HISTORY_KEYS = (
     "kinetic_loss",
     "kinetic_mse_loss",
     "kinetic_abs_error",
+    "kinetic_abs_error_p90",
     "kinetic_sq_error",
     "kinetic_rmse",
     "kinetic_rel_abs_error",
+    "kinetic_rel_abs_error_p90",
     "kinetic_rel_sq_error",
     "kinetic_rel_rmse",
     "energy_total_abs_error",
@@ -2199,6 +2201,12 @@ def evaluate_systems(
         values = np.asarray([entry[key] for entry in per_system], dtype=np.float64)
         averages[key] = float(np.nan) if np.all(np.isnan(values)) else float(np.nanmean(values))
     for src_key, dst_key in (
+        ("kinetic_abs_error", "kinetic_abs_error_p90"),
+        ("kinetic_rel_abs_error", "kinetic_rel_abs_error_p90"),
+    ):
+        values = np.asarray([entry[src_key] for entry in per_system], dtype=np.float64)
+        averages[dst_key] = float(np.nan) if np.all(np.isnan(values)) else float(np.nanpercentile(values, 90.0))
+    for src_key, dst_key in (
         ("kinetic_sq_error", "kinetic_rmse"),
         ("kinetic_rel_sq_error", "kinetic_rel_rmse"),
         ("energy_total_sq_error", "energy_total_rmse"),
@@ -3271,6 +3279,7 @@ def train_models(
         ("held-out kinetic loss", f"{final_val['kinetic_loss']:.6e}"),
         ("held-out kinetic MSE loss", f"{final_val['kinetic_mse_loss']:.6e}"),
         ("held-out kinetic abs err", f"{final_val['kinetic_abs_error']:.6e}"),
+        ("held-out kinetic abs err P90", f"{final_val['kinetic_abs_error_p90']:.6e}"),
         ("held-out kinetic RMSE", f"{final_val['kinetic_rmse']:.6e}"),
         ("held-out kinetic rel RMSE", f"{final_val['kinetic_rel_rmse']:.6e}"),
         (
@@ -3324,6 +3333,7 @@ def train_models(
                 ("test kinetic loss", f"{final_test['kinetic_loss']:.6e}"),
                 ("test kinetic MSE loss", f"{final_test['kinetic_mse_loss']:.6e}"),
                 ("test kinetic abs err", f"{final_test['kinetic_abs_error']:.6e}"),
+                ("test kinetic abs err P90", f"{final_test['kinetic_abs_error_p90']:.6e}"),
                 ("test kinetic RMSE", f"{final_test['kinetic_rmse']:.6e}"),
                 ("test kinetic rel RMSE", f"{final_test['kinetic_rel_rmse']:.6e}"),
                 (
