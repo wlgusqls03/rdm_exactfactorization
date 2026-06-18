@@ -68,6 +68,7 @@ class ExperimentConfig:
     # ------------------------------------------------------------------
     model_width: int = int(os.environ.get("RDM_MODEL_WIDTH", 192))
     point_model_depth: int = int(os.environ.get("RDM_POINT_MODEL_DEPTH", 3))
+    pair_model_depth: int = int(os.environ.get("RDM_PAIR_MODEL_DEPTH", 2))
     learned_rank: int = int(os.environ.get("RDM_LEARNED_RANK", 8))
     rff_features: int = int(os.environ.get("RDM_RFF_FEATURES", 32))
     rff_scale: float = float(os.environ.get("RDM_RFF_SCALE", 2.0))
