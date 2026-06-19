@@ -45,6 +45,7 @@ LOSS_NAMES = (
     "deriv",
     "tau",
     "tau_mse",
+    "stencil_gamma",
     "trace",
     "occ",
     "mode",
@@ -58,6 +59,7 @@ TRAIN_HISTORY_KEYS = (
     "deriv_loss",
     "tau_loss",
     "tau_mse_loss",
+    "stencil_gamma_loss",
     "trace_loss",
     "occ_penalty",
     "mode_reg",
@@ -67,6 +69,15 @@ TRAIN_HISTORY_KEYS = (
 VAL_HISTORY_KEYS = (
     "pair_loss",
     "pair_mae",
+    "pair_rmse",
+    "diag_pair_mae",
+    "diag_pair_rmse",
+    "near_diag_mae",
+    "near_diag_rmse",
+    "mid_pair_mae",
+    "mid_pair_rmse",
+    "far_offdiag_mae",
+    "far_offdiag_rmse",
     "rho_loss",
     "density_mae",
     "kernel_loss",
@@ -88,6 +99,11 @@ VAL_HISTORY_KEYS = (
     "tau_fd_ao_mae",
     "tau_fd_ao_rms_ratio",
     "tau_pred_fd_mae",
+    "stencil_gamma_huber",
+    "stencil_gamma_mae",
+    "stencil_gamma_rmse",
+    "stencil_gamma_rel_mae",
+    "stencil_gamma_rel_rmse",
     "kinetic_loss",
     "kinetic_mse_loss",
     "kinetic_abs_error",
@@ -106,8 +122,6 @@ VAL_HISTORY_KEYS = (
     "trace_abs_rel_error",
     "occ_penalty",
     "symmetry_mae",
-    "near_diag_mae",
-    "far_offdiag_mae",
 )
 TRAIN_OBJECTIVE_TERMS = (
     ("gamma", "pair_loss"),
@@ -116,6 +130,7 @@ TRAIN_OBJECTIVE_TERMS = (
     ("deriv", "deriv_loss"),
     ("tau", "tau_loss"),
     ("tau_mse", "tau_mse_loss"),
+    ("stencil_gamma", "stencil_gamma_loss"),
     ("trace", "trace_loss"),
     ("occ", "occ_penalty"),
     ("mode", "mode_reg"),
@@ -129,6 +144,7 @@ EVAL_OBJECTIVE_TERMS = (
     ("deriv", "deriv_loss"),
     ("tau", "tau_loss"),
     ("tau_mse", "tau_mse_loss"),
+    ("stencil_gamma", "stencil_gamma_huber"),
     ("trace", "trace_loss"),
     ("occ", "occ_penalty"),
     ("kinetic", "kinetic_loss"),
@@ -216,6 +232,27 @@ def rms_normalized_huber(
     if delta <= 0.0:
         raise ValueError("RMS-normalized Huber delta must be positive.")
     scale = tf.maximum(tf.sqrt(tf.reduce_mean(tf.square(y_true))), float(scale_floor))
+    scaled_abs_error = tf.abs((y_pred - y_true) / scale)
+    quadratic = tf.minimum(scaled_abs_error, float(delta))
+    linear = scaled_abs_error - quadratic
+    return tf.reduce_mean(0.5 * tf.square(quadratic) + float(delta) * linear)
+
+
+def density_normalized_huber(
+    y_true: tf.Tensor,
+    y_pred: tf.Tensor,
+    rho_left: tf.Tensor,
+    rho_right: tf.Tensor,
+    *,
+    scale_floor: float,
+    delta: float,
+) -> tf.Tensor:
+    """Huber loss after normalizing gamma errors by sqrt(rho_l rho_r)."""
+    if scale_floor <= 0.0:
+        raise ValueError("Density-normalized Huber scale_floor must be positive.")
+    if delta <= 0.0:
+        raise ValueError("Density-normalized Huber delta must be positive.")
+    scale = tf.sqrt(tf.maximum(rho_left * rho_right, 0.0)) + float(scale_floor)
     scaled_abs_error = tf.abs((y_pred - y_true) / scale)
     quadratic = tf.minimum(scaled_abs_error, float(delta))
     linear = scaled_abs_error - quadratic
@@ -1308,6 +1345,64 @@ def kinetic_stencil_error_decomposition(
         "kinetic_stencil_diag_error": diag_error,
         "kinetic_stencil_offdiag_error": offdiag_error,
         "kinetic_stencil_total_error": total_error,
+        "kinetic_stencil_diag_abs_error": abs(diag_error),
+        "kinetic_stencil_offdiag_abs_error": abs(offdiag_error),
+    }
+
+
+def gamma_error_by_category(
+    gamma_pred: np.ndarray,
+    gamma_true: np.ndarray,
+    categories: np.ndarray,
+) -> dict[str, float]:
+    """MAE/RMSE diagnostics for sampled pair categories."""
+    pred = np.asarray(gamma_pred, dtype=np.float64).reshape(-1)
+    true = np.asarray(gamma_true, dtype=np.float64).reshape(-1)
+    cats = np.asarray(categories, dtype=np.int64).reshape(-1)
+    error = pred - true
+    metrics: dict[str, float] = {}
+    for category_id, name in enumerate(("diag", "near", "mid", "far")):
+        mask = cats == category_id
+        if np.any(mask):
+            cat_error = error[mask]
+            metrics[f"{name}_pair_mae"] = float(np.mean(np.abs(cat_error)))
+            metrics[f"{name}_pair_rmse"] = float(np.sqrt(np.mean(cat_error**2)))
+        else:
+            metrics[f"{name}_pair_mae"] = float("nan")
+            metrics[f"{name}_pair_rmse"] = float("nan")
+    metrics["near_diag_mae"] = metrics["near_pair_mae"]
+    metrics["near_diag_rmse"] = metrics["near_pair_rmse"]
+    metrics["far_offdiag_mae"] = metrics["far_pair_mae"]
+    metrics["far_offdiag_rmse"] = metrics["far_pair_rmse"]
+    return metrics
+
+
+def gamma_stencil_error_metrics(
+    gamma_pred: np.ndarray,
+    gamma_true: np.ndarray,
+    rho_left: np.ndarray,
+    rho_right: np.ndarray,
+    *,
+    scale_floor: float,
+    delta: float,
+) -> dict[str, float]:
+    """Raw and density-normalized diagnostics for stencil gamma values."""
+    pred = np.asarray(gamma_pred, dtype=np.float64).reshape(-1)
+    true = np.asarray(gamma_true, dtype=np.float64).reshape(-1)
+    rho_l = np.asarray(rho_left, dtype=np.float64).reshape(-1)
+    rho_r = np.asarray(rho_right, dtype=np.float64).reshape(-1)
+    error = pred - true
+    scale = np.sqrt(np.maximum(rho_l * rho_r, 0.0)) + float(scale_floor)
+    rel_error = error / scale
+    abs_rel = np.abs(rel_error)
+    quadratic = np.minimum(abs_rel, float(delta))
+    linear = abs_rel - quadratic
+    return {
+        "stencil_gamma_huber": float(np.mean(0.5 * quadratic**2 + float(delta) * linear)),
+        "stencil_gamma_mae": float(np.mean(np.abs(error))),
+        "stencil_gamma_rmse": float(np.sqrt(np.mean(error**2))),
+        "stencil_gamma_rel_mae": float(np.mean(abs_rel)),
+        "stencil_gamma_rel_rmse": float(np.sqrt(np.mean(rel_error**2))),
     }
 
 
@@ -1529,9 +1624,9 @@ def loss_weight(config: ExperimentConfig, name: str) -> float:
 
 def loss_schedule_multiplier(config: ExperimentConfig, name: str, epoch: int) -> float:
     """Epoch-dependent multiplier for staged loss terms."""
-    if name not in {"deriv", "tau", "tau_mse", "kinetic", "kinetic_mse"}:
+    if name not in {"deriv", "tau", "tau_mse", "stencil_gamma", "kinetic", "kinetic_mse"}:
         return 1.0
-    schedule_name = {"tau_mse": "tau", "kinetic_mse": "kinetic"}.get(name, name)
+    schedule_name = {"tau_mse": "tau", "stencil_gamma": "tau", "kinetic_mse": "kinetic"}.get(name, name)
     start_epoch = max(int(getattr(config, f"{schedule_name}_start_epoch")), 0)
     ramp_epochs = max(int(getattr(config, f"{schedule_name}_ramp_epochs")), 0)
 
@@ -1582,10 +1677,10 @@ def loss_stage_signature(config: ExperimentConfig, epoch: int) -> tuple[int, ...
 def fully_active_schedule_epoch(config: ExperimentConfig) -> int:
     """First epoch where every enabled scheduled loss has reached full weight."""
     epochs = [0]
-    for name in ("deriv", "tau", "tau_mse", "kinetic", "kinetic_mse"):
+    for name in ("deriv", "tau", "tau_mse", "stencil_gamma", "kinetic", "kinetic_mse"):
         if loss_weight(config, name) == 0.0:
             continue
-        schedule_name = {"tau_mse": "tau", "kinetic_mse": "kinetic"}.get(name, name)
+        schedule_name = {"tau_mse": "tau", "stencil_gamma": "tau", "kinetic_mse": "kinetic"}.get(name, name)
         start = max(int(getattr(config, f"{schedule_name}_start_epoch")), 0)
         ramp = max(int(getattr(config, f"{schedule_name}_ramp_epochs")), 0)
         epochs.append(start + max(ramp - 1, 0))
@@ -1740,6 +1835,8 @@ def evaluate_system(
 
     pair_loss = float(np.sum(pair_weights * (gamma_pred_pairs - gamma_true_pairs) ** 2) / np.sum(pair_weights))
     pair_mae = float(np.mean(np.abs(gamma_pred_pairs - gamma_true_pairs)))
+    pair_rmse = float(np.sqrt(np.mean((gamma_pred_pairs - gamma_true_pairs) ** 2)))
+    category_gamma_metrics = gamma_error_by_category(gamma_pred_pairs, gamma_true_pairs, categories)
 
     diag_outputs = diagonal_predictions(system, models, config, rho_all=rho_all, density_state=density_state)
     gamma_diag = diag_outputs["gamma"].numpy()
@@ -1864,6 +1961,16 @@ def evaluate_system(
         system.stencil_left[stencil_indices].reshape(-1),
         system.stencil_right[stencil_indices].reshape(-1),
     ).reshape(stencil_shape)
+    stencil_left_flat = system.stencil_left[stencil_indices].reshape(-1)
+    stencil_right_flat = system.stencil_right[stencil_indices].reshape(-1)
+    stencil_gamma_metrics = gamma_stencil_error_metrics(
+        gamma_stencil_pred_t.numpy(),
+        gamma_stencil_true,
+        gather_density(rho_all, stencil_left_flat).numpy(),
+        gather_density(rho_all, stencil_right_flat).numpy(),
+        scale_floor=config.stencil_gamma_scale_floor,
+        delta=config.physics_huber_delta,
+    )
     kinetic_stencil_decomposition = kinetic_stencil_error_decomposition(
         system,
         gamma_stencil_pred_t.numpy(),
@@ -1895,11 +2002,6 @@ def evaluate_system(
     trace_scale = max(trace_true, 1.0)
     trace_rel_error = float((trace_pred - trace_true) / trace_scale)
     trace_loss = float(trace_rel_error**2)
-
-    near_mask = categories == 1
-    far_mask = categories == 3
-    near_diag_mae = float(np.mean(np.abs(gamma_pred_pairs[near_mask] - gamma_true_pairs[near_mask]))) if np.any(near_mask) else float("nan")
-    far_offdiag_mae = float(np.mean(np.abs(gamma_pred_pairs[far_mask] - gamma_true_pairs[far_mask]))) if np.any(far_mask) else float("nan")
 
     gamma_pred_reverse = predict_pair_values(
         system, models, config, right, left, rho_all=rho_all, density_state=density_state
@@ -1949,6 +2051,8 @@ def evaluate_system(
         ),
         "pair_loss": pair_loss,
         "pair_mae": pair_mae,
+        "pair_rmse": pair_rmse,
+        **category_gamma_metrics,
         "rho_loss": rho_loss,
         "density_mae": density_mae,
         "rho_point_mae": rho_point_mae,
@@ -1978,6 +2082,7 @@ def evaluate_system(
         "tau_fd_ao_rms_ratio": tau_fd_ao_rms_ratio,
         "tau_pred_fd_raw_mse": tau_pred_fd_raw_mse,
         "tau_pred_fd_mae": tau_pred_fd_mae,
+        **stencil_gamma_metrics,
         "kinetic_loss": kinetic_loss,
         "kinetic_mse_loss": kinetic_mse_loss,
         "kinetic_pred": kinetic_pred,
@@ -1996,8 +2101,6 @@ def evaluate_system(
         "trace_true": trace_true,
         "trace_pred": trace_pred,
         "occ_penalty": occ_penalty,
-        "near_diag_mae": near_diag_mae,
-        "far_offdiag_mae": far_offdiag_mae,
         "symmetry_mae": symmetry_mae,
         "subset_eigs_true": subset_eigs_true,
         "subset_eigs_pred": subset_eigs_pred,
@@ -2092,6 +2195,15 @@ def evaluate_systems(
         "stencil_eval_sampled",
         "pair_loss",
         "pair_mae",
+        "pair_rmse",
+        "diag_pair_mae",
+        "diag_pair_rmse",
+        "near_diag_mae",
+        "near_diag_rmse",
+        "mid_pair_mae",
+        "mid_pair_rmse",
+        "far_offdiag_mae",
+        "far_offdiag_rmse",
         "rho_loss",
         "density_mae",
         "rho_point_mae",
@@ -2121,6 +2233,11 @@ def evaluate_systems(
         "tau_fd_ao_rms_ratio",
         "tau_pred_fd_raw_mse",
         "tau_pred_fd_mae",
+        "stencil_gamma_huber",
+        "stencil_gamma_mae",
+        "stencil_gamma_rmse",
+        "stencil_gamma_rel_mae",
+        "stencil_gamma_rel_rmse",
         "kinetic_loss",
         "kinetic_mse_loss",
         "kinetic_pred",
@@ -2133,7 +2250,9 @@ def evaluate_systems(
         "kinetic_rel_sq_error",
         "kinetic_rel_rmse",
         "kinetic_stencil_diag_error",
+        "kinetic_stencil_diag_abs_error",
         "kinetic_stencil_offdiag_error",
+        "kinetic_stencil_offdiag_abs_error",
         "kinetic_stencil_total_error",
         "kinetic_stencil_reconstruction_residual",
         "kinetic_stencil_reference_gap",
@@ -2280,6 +2399,7 @@ def make_compiled_train_step(
         stencil_density_feat: tf.Tensor,
         stencil_rho_l: tf.Tensor,
         stencil_rho_r: tf.Tensor,
+        stencil_gamma_true: tf.Tensor,
         derivative_target: tf.Tensor,
         tau_target: tf.Tensor,
         global_context: tf.Tensor,
@@ -2298,6 +2418,7 @@ def make_compiled_train_step(
         kernel_weight: tf.Tensor,
         deriv_weight: tf.Tensor,
         tau_weight: tf.Tensor,
+        stencil_gamma_weight: tf.Tensor,
         trace_weight: tf.Tensor,
         occ_weight: tf.Tensor,
         mode_weight: tf.Tensor,
@@ -2340,7 +2461,7 @@ def make_compiled_train_step(
 
             zero = tf.constant(0.0, dtype=tf.float32)
 
-            def physics_losses() -> tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
+            def physics_losses() -> tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
                 stencil_outputs = predict_from_features(
                     stencil_point_l,
                     stencil_point_r,
@@ -2351,6 +2472,14 @@ def make_compiled_train_step(
                     rho_rp_override=stencil_rho_r,
                     pair_density_feat_t=stencil_density_feat,
                     local_curvature_basis_scale=basis_scale,
+                )
+                stencil_gamma_loss_t = density_normalized_huber(
+                    stencil_gamma_true,
+                    stencil_outputs["gamma"],
+                    stencil_rho_l,
+                    stencil_rho_r,
+                    scale_floor=config.stencil_gamma_scale_floor,
+                    delta=config.physics_huber_delta,
                 )
                 n_centers = tf.shape(derivative_target)[0]
                 gamma_stencil = tf.reshape(stencil_outputs["gamma"], (n_centers, 3, stencil_order))
@@ -2396,12 +2525,19 @@ def make_compiled_train_step(
                     kinetic_pred = tf.reduce_sum(tau_pred) * kinetic_multiplier * cell_volume
                 kinetic_loss_t = tf.square((kinetic_pred - kinetic_ref) / kinetic_scale)
                 kinetic_mse_loss_t = kinetic_loss_t
-                return deriv_loss_t, tau_loss_t, kinetic_loss_t, tau_mse_loss_t, kinetic_mse_loss_t
+                return (
+                    deriv_loss_t,
+                    tau_loss_t,
+                    kinetic_loss_t,
+                    tau_mse_loss_t,
+                    kinetic_mse_loss_t,
+                    stencil_gamma_loss_t,
+                )
 
-            deriv_loss, tau_loss, kinetic_loss, tau_mse_loss, kinetic_mse_loss = tf.cond(
+            deriv_loss, tau_loss, kinetic_loss, tau_mse_loss, kinetic_mse_loss, stencil_gamma_loss = tf.cond(
                 tf.shape(derivative_target)[0] > 0,
                 physics_losses,
-                lambda: (zero, zero, zero, zero, zero),
+                lambda: (zero, zero, zero, zero, zero, zero),
             )
             mode_reg = tf.reduce_mean(pair_outputs["mode_weights"])
 
@@ -2411,6 +2547,7 @@ def make_compiled_train_step(
                 + kernel_weight * kernel_loss
                 + deriv_weight * deriv_loss
                 + tau_weight * tau_loss
+                + stencil_gamma_weight * stencil_gamma_loss
                 + trace_weight * trace_loss
                 + mode_weight * mode_reg
                 + kinetic_weight * kinetic_loss
@@ -2432,6 +2569,7 @@ def make_compiled_train_step(
             deriv_loss,
             tau_loss,
             tau_mse_loss,
+            stencil_gamma_loss,
             trace_loss,
             tf.constant(0.0, dtype=tf.float32),
             mode_reg,
@@ -2486,10 +2624,11 @@ def compute_training_losses(
         weights["deriv"] != 0.0
         or weights["tau"] != 0.0
         or weights["tau_mse"] != 0.0
+        or weights["stencil_gamma"] != 0.0
         or weights["kinetic"] != 0.0
         or weights["kinetic_mse"] != 0.0
     ):
-        derivative_pred, tau_pred = stencil_predictions(
+        derivative_pred, tau_pred, gamma_stencil_pred = stencil_predictions(
             system,
             models,
             config,
@@ -2497,15 +2636,38 @@ def compute_training_losses(
             density_state=density_state,
             max_centers=stencil_center_limit,
             center_indices=stencil_center_indices,
+            return_gamma_stencil=True,
         )
         derivative_target, tau_target = physics_stencil_targets(system, config)
+        selected_stencil_indices = None
         if stencil_center_indices is not None:
             stencil_center_indices = np.asarray(stencil_center_indices, dtype=np.int64)
+            selected_stencil_indices = stencil_center_indices
             derivative_target = derivative_target[stencil_center_indices]
             tau_target = tau_target[stencil_center_indices]
         elif stencil_center_limit is not None and int(stencil_center_limit) > 0:
-            derivative_target = derivative_target[: int(stencil_center_limit)]
-            tau_target = tau_target[: int(stencil_center_limit)]
+            selected_stencil_indices = select_stencil_center_indices(system, stencil_center_limit)
+            if selected_stencil_indices is not None:
+                derivative_target = derivative_target[selected_stencil_indices]
+                tau_target = tau_target[selected_stencil_indices]
+            else:
+                derivative_target = derivative_target[: int(stencil_center_limit)]
+                tau_target = tau_target[: int(stencil_center_limit)]
+        if selected_stencil_indices is None:
+            stencil_indices_for_gamma = np.arange(int(system.stencil_left.shape[0]), dtype=np.int64)
+        else:
+            stencil_indices_for_gamma = np.asarray(selected_stencil_indices, dtype=np.int64)
+        stencil_left = system.stencil_left[stencil_indices_for_gamma].reshape(-1)
+        stencil_right = system.stencil_right[stencil_indices_for_gamma].reshape(-1)
+        stencil_gamma_true = system.gamma_values(stencil_left, stencil_right).reshape(-1, 1)
+        stencil_gamma_loss = density_normalized_huber(
+            to_tensor(stencil_gamma_true),
+            tf.reshape(gamma_stencil_pred, (-1, 1)),
+            gather_density(rho_all, stencil_left),
+            gather_density(rho_all, stencil_right),
+            scale_floor=config.stencil_gamma_scale_floor,
+            delta=config.physics_huber_delta,
+        )
         deriv_loss = rms_normalized_huber(
             to_tensor(derivative_target),
             derivative_pred,
@@ -2545,6 +2707,7 @@ def compute_training_losses(
         deriv_loss = zero
         tau_loss = zero
         tau_mse_loss = zero
+        stencil_gamma_loss = zero
         kinetic_loss = zero
         kinetic_mse_loss = zero
 
@@ -2569,6 +2732,7 @@ def compute_training_losses(
         "deriv_loss": deriv_loss,
         "tau_loss": tau_loss,
         "tau_mse_loss": tau_mse_loss,
+        "stencil_gamma_loss": stencil_gamma_loss,
         "trace_loss": trace_loss,
         "occ_penalty": occ_penalty,
         "mode_reg": mode_reg,
@@ -2939,6 +3103,7 @@ def train_models(
                     weights["deriv"] != 0.0
                     or weights["tau"] != 0.0
                     or weights["tau_mse"] != 0.0
+                    or weights["stencil_gamma"] != 0.0
                     or weights["kinetic"] != 0.0
                     or weights["kinetic_mse"] != 0.0
                 )
@@ -2964,6 +3129,7 @@ def train_models(
                     weights["deriv"] != 0.0
                     or weights["tau"] != 0.0
                     or weights["tau_mse"] != 0.0
+                    or weights["stencil_gamma"] != 0.0
                     or weights["kinetic"] != 0.0
                     or weights["kinetic_mse"] != 0.0
                 )
@@ -2975,6 +3141,7 @@ def train_models(
                     )
                     stencil_left = system.stencil_left[stencil_idx].reshape(-1)
                     stencil_right = system.stencil_right[stencil_idx].reshape(-1)
+                    stencil_gamma_true = system.gamma_values(stencil_left, stencil_right).reshape(-1, 1)
                     stencil_pair_feat = stencil_pair_features_for_centers(system, stencil_idx, config)
                     derivative_target, tau_target = physics_stencil_targets(system, config)
                     derivative_target = derivative_target[stencil_idx]
@@ -2983,6 +3150,7 @@ def train_models(
                 else:
                     stencil_left = np.zeros((0,), dtype=np.int64)
                     stencil_right = np.zeros((0,), dtype=np.int64)
+                    stencil_gamma_true = np.zeros((0, 1), dtype=np.float32)
                     stencil_pair_feat = np.zeros((0, batch.pair_feat.shape[1]), dtype=np.float32)
                     derivative_target = np.zeros((0, 3), dtype=np.float32)
                     tau_target = np.zeros((0, 1), dtype=np.float32)
@@ -3012,6 +3180,7 @@ def train_models(
                     pair_density_features(system, density_state, stencil_left, stencil_right, config),
                     tf.gather(density_state.rho_neutral, stencil_left_t),
                     tf.gather(density_state.rho_neutral, stencil_right_t),
+                    to_tensor(stencil_gamma_true),
                     to_tensor(derivative_target),
                     to_tensor(tau_target),
                     system_t.global_context,
@@ -3030,6 +3199,7 @@ def train_models(
                     tf.constant(float(weights["kernel"]), dtype=tf.float32),
                     tf.constant(float(weights["deriv"]), dtype=tf.float32),
                     tf.constant(float(weights["tau"]), dtype=tf.float32),
+                    tf.constant(float(weights["stencil_gamma"]), dtype=tf.float32),
                     tf.constant(float(weights["trace"]), dtype=tf.float32),
                     tf.constant(float(weights["occ"]), dtype=tf.float32),
                     tf.constant(float(weights["mode"]), dtype=tf.float32),
@@ -3168,6 +3338,7 @@ def train_models(
                     + f"rho={val_metrics['rho_loss']:.3e} "
                     + f"T={val_metrics['kinetic_loss']:.3e} "
                     + f"T_mse={val_metrics['kinetic_mse_loss']:.3e} "
+                    + f"stencil_gamma={val_metrics['stencil_gamma_huber']:.3e} "
                     + f"deriv_huber={val_metrics['deriv_loss']:.3e} "
                     + f"tau_huber={val_metrics['tau_loss']:.3e} "
                     + f"tau_mse={val_metrics['tau_mse_loss']:.3e} "
@@ -3177,7 +3348,9 @@ def train_models(
                 print(
                     " " * 14
                     + f"held-out raw mse deriv={val_metrics['deriv_raw_mse']:.3e} "
-                    + f"tau={val_metrics['tau_raw_mse']:.3e}"
+                    + f"tau={val_metrics['tau_raw_mse']:.3e} "
+                    + f"gamma_rmse={val_metrics['pair_rmse']:.3e} "
+                    + f"stencil_gamma_rmse={val_metrics['stencil_gamma_rmse']:.3e}"
                 )
                 print(
                     " " * 14
@@ -3243,9 +3416,9 @@ def train_models(
         config.final_val_eval_system_count,
     )
     clear_gpu_evaluation_caches()
-    final_train = evaluate_systems(final_train_systems, models, config, epoch=last_epoch)
+    final_train = evaluate_systems(final_train_systems, models, config, epoch=None)
     clear_gpu_evaluation_caches()
-    final_val = evaluate_systems(final_val_systems, models, config, epoch=last_epoch)
+    final_val = evaluate_systems(final_val_systems, models, config, epoch=None)
     final_train["evaluated_system_count"] = len(final_train_systems)
     final_train["available_system_count"] = len(split.train_systems)
     final_val["evaluated_system_count"] = len(final_val_systems)
@@ -3257,7 +3430,7 @@ def train_models(
             config.final_test_eval_system_count,
         )
         clear_gpu_evaluation_caches()
-        summary["test"] = evaluate_systems(final_test_systems, models, config, epoch=last_epoch)
+        summary["test"] = evaluate_systems(final_test_systems, models, config, epoch=None)
         summary["test"]["evaluated_system_count"] = len(final_test_systems)
         summary["test"]["available_system_count"] = len(split.test_systems)
     clear_gpu_evaluation_caches()
@@ -3275,12 +3448,26 @@ def train_models(
         ("train objective", f"{final_train['objective']:.6e}"),
         ("val objective", f"{final_val['objective']:.6e}"),
         ("held-out gamma_pair loss", f"{final_val['pair_loss']:.6e}"),
+        ("held-out gamma_pair MAE/RMSE", f"{final_val['pair_mae']:.6e} / {final_val['pair_rmse']:.6e}"),
+        ("held-out gamma diag/near/mid/far MAE", (
+            f"{final_val['diag_pair_mae']:.3e} / {final_val['near_diag_mae']:.3e} / "
+            f"{final_val['mid_pair_mae']:.3e} / {final_val['far_offdiag_mae']:.3e}"
+        )),
+        ("held-out stencil gamma Huber/MAE/RMSE", (
+            f"{final_val['stencil_gamma_huber']:.6e} / "
+            f"{final_val['stencil_gamma_mae']:.6e} / "
+            f"{final_val['stencil_gamma_rmse']:.6e}"
+        )),
         ("held-out density MAE", f"{final_val['density_mae']:.6e}"),
         ("held-out kinetic loss", f"{final_val['kinetic_loss']:.6e}"),
         ("held-out kinetic MSE loss", f"{final_val['kinetic_mse_loss']:.6e}"),
         ("held-out kinetic abs err", f"{final_val['kinetic_abs_error']:.6e}"),
         ("held-out kinetic abs err P90", f"{final_val['kinetic_abs_error_p90']:.6e}"),
         ("held-out kinetic RMSE", f"{final_val['kinetic_rmse']:.6e}"),
+        ("held-out kinetic stencil diag/offdiag", (
+            f"{final_val['kinetic_stencil_diag_error']:.6e} / "
+            f"{final_val['kinetic_stencil_offdiag_error']:.6e}"
+        )),
         ("held-out kinetic rel RMSE", f"{final_val['kinetic_rel_rmse']:.6e}"),
         (
             "held-out systems evaluated",
@@ -3329,12 +3516,26 @@ def train_models(
         test_rows = [
                 ("test objective", f"{final_test['objective']:.6e}"),
                 ("test gamma_pair loss", f"{final_test['pair_loss']:.6e}"),
+                ("test gamma_pair MAE/RMSE", f"{final_test['pair_mae']:.6e} / {final_test['pair_rmse']:.6e}"),
+                ("test gamma diag/near/mid/far MAE", (
+                    f"{final_test['diag_pair_mae']:.3e} / {final_test['near_diag_mae']:.3e} / "
+                    f"{final_test['mid_pair_mae']:.3e} / {final_test['far_offdiag_mae']:.3e}"
+                )),
+                ("test stencil gamma Huber/MAE/RMSE", (
+                    f"{final_test['stencil_gamma_huber']:.6e} / "
+                    f"{final_test['stencil_gamma_mae']:.6e} / "
+                    f"{final_test['stencil_gamma_rmse']:.6e}"
+                )),
                 ("test density MAE", f"{final_test['density_mae']:.6e}"),
                 ("test kinetic loss", f"{final_test['kinetic_loss']:.6e}"),
                 ("test kinetic MSE loss", f"{final_test['kinetic_mse_loss']:.6e}"),
                 ("test kinetic abs err", f"{final_test['kinetic_abs_error']:.6e}"),
                 ("test kinetic abs err P90", f"{final_test['kinetic_abs_error_p90']:.6e}"),
                 ("test kinetic RMSE", f"{final_test['kinetic_rmse']:.6e}"),
+                ("test kinetic stencil diag/offdiag", (
+                    f"{final_test['kinetic_stencil_diag_error']:.6e} / "
+                    f"{final_test['kinetic_stencil_offdiag_error']:.6e}"
+                )),
                 ("test kinetic rel RMSE", f"{final_test['kinetic_rel_rmse']:.6e}"),
                 (
                     "test systems evaluated",

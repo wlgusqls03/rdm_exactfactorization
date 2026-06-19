@@ -213,6 +213,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda-kinetic", type=float, default=None)
     parser.add_argument("--lambda-tau-mse", type=float, default=None)
     parser.add_argument("--lambda-kinetic-mse", type=float, default=None)
+    parser.add_argument("--lambda-stencil-gamma", type=float, default=None)
     parser.add_argument("--deriv-start-epoch", type=int, default=None)
     parser.add_argument("--deriv-ramp-epochs", type=int, default=None)
     parser.add_argument("--tau-start-epoch", type=int, default=None)
@@ -254,6 +255,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-use-kinetic-mse-loss",
         dest="use_kinetic_mse_loss",
+        action="store_false",
+    )
+    parser.add_argument(
+        "--use-stencil-gamma-loss",
+        dest="use_stencil_gamma_loss",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--no-use-stencil-gamma-loss",
+        dest="use_stencil_gamma_loss",
         action="store_false",
     )
     parser.add_argument("--point-pretrain-epochs", type=int, default=None)
@@ -389,6 +401,7 @@ def apply_overrides(config: ExperimentConfig, args: argparse.Namespace) -> Exper
         ("lambda_kinetic", "lambda_kinetic"),
         ("lambda_tau_mse", "lambda_tau_mse"),
         ("lambda_kinetic_mse", "lambda_kinetic_mse"),
+        ("lambda_stencil_gamma", "lambda_stencil_gamma"),
         ("deriv_start_epoch", "deriv_start_epoch"),
         ("deriv_ramp_epochs", "deriv_ramp_epochs"),
         ("tau_start_epoch", "tau_start_epoch"),
@@ -402,6 +415,7 @@ def apply_overrides(config: ExperimentConfig, args: argparse.Namespace) -> Exper
         ("use_kinetic_loss", "use_kinetic_loss"),
         ("use_tau_mse_loss", "use_tau_mse_loss"),
         ("use_kinetic_mse_loss", "use_kinetic_mse_loss"),
+        ("use_stencil_gamma_loss", "use_stencil_gamma_loss"),
         ("point_pretrain_epochs", "point_pretrain_epochs"),
         ("point_pretrain_steps_per_epoch", "point_pretrain_steps_per_epoch"),
         ("point_pretrain_lr", "point_pretrain_lr"),

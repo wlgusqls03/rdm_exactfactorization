@@ -181,6 +181,7 @@ class ExperimentConfig:
     use_kernel_loss: bool = env_flag("RDM_USE_KERNEL_LOSS", True)
     use_deriv_loss: bool = env_flag("RDM_USE_DERIV_LOSS", True)
     use_tau_loss: bool = env_flag("RDM_USE_TAU_LOSS", True)
+    use_stencil_gamma_loss: bool = env_flag("RDM_USE_STENCIL_GAMMA_LOSS", False)
     use_trace_loss: bool = env_flag("RDM_USE_TRACE_LOSS", True)
     use_occ_loss: bool = env_flag("RDM_USE_OCC_LOSS", True)
     use_mode_loss: bool = env_flag("RDM_USE_MODE_LOSS", True)
@@ -193,6 +194,7 @@ class ExperimentConfig:
     lambda_kernel: float = float(os.environ.get("RDM_LAMBDA_KERNEL", 1.0))
     lambda_deriv: float = float(os.environ.get("RDM_LAMBDA_DERIV", 2.0))
     lambda_tau: float = float(os.environ.get("RDM_LAMBDA_TAU", 0.5))
+    lambda_stencil_gamma: float = float(os.environ.get("RDM_LAMBDA_STENCIL_GAMMA", 0.0))
     lambda_trace: float = float(os.environ.get("RDM_LAMBDA_TRACE", 3.0))
     lambda_occ: float = float(os.environ.get("RDM_LAMBDA_OCC", 0.25))
     lambda_mode: float = float(os.environ.get("RDM_LAMBDA_MODE", 1e-4))
@@ -215,6 +217,7 @@ class ExperimentConfig:
     physics_huber_delta: float = float(os.environ.get("RDM_PHYSICS_HUBER_DELTA", 1.0))
     deriv_scale_floor: float = float(os.environ.get("RDM_DERIV_SCALE_FLOOR", 1e-6))
     tau_scale_floor: float = float(os.environ.get("RDM_TAU_SCALE_FLOOR", 1e-6))
+    stencil_gamma_scale_floor: float = float(os.environ.get("RDM_STENCIL_GAMMA_SCALE_FLOOR", 1e-6))
 
     # ------------------------------------------------------------------
     # 출력 설정
