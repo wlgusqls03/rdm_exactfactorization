@@ -212,17 +212,71 @@ def add_kinetic_energy_plot(ax, representative: dict[str, object]) -> None:
 def build_metrics_text(summary: dict[str, object], representative: dict[str, object]) -> str:
     val_avg = summary["val"]
     metadata = summary.get("evaluation_metadata", {})
+    run_config = metadata.get("run_config", {})
+    loss_weights = metadata.get("final_scheduled_loss_weights", metadata.get("loss_weights", {}))
     sampled_stencil = bool(val_avg.get("stencil_eval_sampled", 0.0))
+    active_loss_parts = [
+        f"{name}={float(weight):g}"
+        for name, weight in loss_weights.items()
+        if isinstance(weight, (int, float)) and float(weight) != 0.0
+    ]
+    if not active_loss_parts:
+        active_loss_lines = ["active losses   : none"]
+    else:
+        active_loss_lines = []
+        current = "active losses   : "
+        continuation = "                  "
+        for part in active_loss_parts:
+            candidate = f"{current}{part}" if current.endswith(": ") else f"{current}, {part}"
+            if len(candidate) > 64 and current.strip() != "active losses":
+                active_loss_lines.append(current)
+                current = continuation + part
+            else:
+                current = candidate
+        active_loss_lines.append(current)
     lines = [
+        "RUN SETTINGS",
+        f"loss preset     : {run_config.get('loss_preset', 'unknown')}",
+        (
+            "rank/width/depth: "
+            f"{run_config.get('rank', 'n/a')} / "
+            f"{run_config.get('width', 'n/a')} / "
+            f"pair{run_config.get('pair_model_depth', 'n/a')}"
+        ),
+        f"pair rho feat   : {run_config.get('pair_density_feature_mode', 'unknown')}",
+        *active_loss_lines,
+        (
+            "batch/stencil   : "
+            f"{run_config.get('batch_size', 'n/a')} / "
+            f"{run_config.get('train_stencil_centers', 'n/a')}"
+        ),
+        "",
         "HELD-OUT AVERAGE",
-        f"gamma pair loss : {val_avg['pair_loss']:10.3e}",
+        f"gamma loss      : {val_avg['pair_loss']:10.3e}",
+        f"gamma MAE/RMSE  : {val_avg.get('pair_mae', np.nan):10.3e} / {val_avg.get('pair_rmse', np.nan):10.3e}",
+        (
+            "gamma d/n/m/f  : "
+            f"{val_avg.get('diag_pair_mae', np.nan):.2e} / "
+            f"{val_avg.get('near_diag_mae', np.nan):.2e} / "
+            f"{val_avg.get('mid_pair_mae', np.nan):.2e} / "
+            f"{val_avg.get('far_offdiag_mae', np.nan):.2e}"
+        ),
+        (
+            "stencil gamma  : "
+            f"{val_avg.get('stencil_gamma_mae', np.nan):.2e} / "
+            f"{val_avg.get('stencil_gamma_rmse', np.nan):.2e}"
+        ),
         f"density MAE     : {val_avg['density_mae']:10.3e}",
-        f"tau MAE         : {val_avg['tau_mae']:10.3e}",
+        f"tau MAE/RMSE    : {val_avg['tau_mae']:10.3e} / {val_avg.get('tau_rmse', np.nan):10.3e}",
         f"KINETIC ABS [Ha]: {val_avg.get('kinetic_abs_error', np.nan):10.3e}",
+        f"KINETIC RMSE/P90: {val_avg.get('kinetic_rmse', np.nan):10.3e} / {val_avg.get('kinetic_abs_error_p90', np.nan):10.3e}",
+        (
+            "T stencil d/off: "
+            f"{val_avg.get('kinetic_stencil_diag_error', np.nan):+.2e} / "
+            f"{val_avg.get('kinetic_stencil_offdiag_error', np.nan):+.2e}"
+        ),
         f"GRID E REF-PRED : {val_avg.get('energy_total_grid_ref_minus_pred', np.nan):+10.3e}",
         f"grid E MAE [Ha] : {val_avg.get('energy_grid_total_abs_error', np.nan):10.3e}",
-        f"trace loss      : {val_avg['trace_loss']:10.3e}",
-        f"symmetry MAE    : {val_avg['symmetry_mae']:10.3e}",
         (
             "final eval systems = "
             f"{val_avg.get('evaluated_system_count', len(val_avg.get('per_system', [])))} / "
@@ -242,7 +296,13 @@ def build_metrics_text(summary: dict[str, object], representative: dict[str, obj
         "REPRESENTATIVE SYSTEM",
         f"id              : {representative['system_id']}",
         f"near-diag MAE   : {representative['near_diag_mae']:10.3e}",
+        f"mid-pair MAE    : {representative.get('mid_pair_mae', np.nan):10.3e}",
         f"far-offdiag MAE : {representative['far_offdiag_mae']:10.3e}",
+        (
+            "stencil g MAE/RMSE: "
+            f"{representative.get('stencil_gamma_mae', np.nan):.2e} / "
+            f"{representative.get('stencil_gamma_rmse', np.nan):.2e}"
+        ),
         f"gamma samples   : {np.asarray(representative['gamma_true_sample']).size:10d}",
         f"|K(r,r)-1|      : {representative['kernel_diag_error']:10.3e}",
         f"tau MAE         : {representative['tau_mae']:10.3e}",
@@ -442,8 +502,8 @@ def plot_training_summary(
         va="top",
         ha="left",
         family="monospace",
-        fontsize=8.8,
-        linespacing=1.18,
+        fontsize=7.3,
+        linespacing=1.08,
         transform=ax.transAxes,
     )
 

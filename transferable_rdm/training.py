@@ -3434,6 +3434,7 @@ def train_models(
         summary["test"]["evaluated_system_count"] = len(final_test_systems)
         summary["test"]["available_system_count"] = len(split.test_systems)
     clear_gpu_evaluation_caches()
+    final_epoch = max(len(history.train_objective) - 1, 0)
     summary["evaluation_metadata"] = {
         "density_source": (
             "true oracle"
@@ -3442,6 +3443,24 @@ def train_models(
         ),
         "kinetic_integral_active": bool(loss_enabled(config, "kinetic")),
         "eval_full_final": bool(config.eval_full_final),
+        "run_config": {
+            "loss_preset": config.loss_preset,
+            "rank": int(config.learned_rank),
+            "width": int(config.model_width),
+            "pair_model_depth": int(config.pair_model_depth),
+            "pair_density_feature_mode": pair_density_feature_mode(config),
+            "density_hessian": bool(config.pair_density_hessian),
+            "epochs_completed": int(len(history.train_objective)),
+            "steps_per_epoch": int(config.steps_per_epoch),
+            "batch_size": int(config.batch_size),
+            "train_stencil_centers": int(config.train_stencil_centers),
+            "eval_pair_count": int(config.eval_pair_count),
+            "eval_stencil_centers": int(config.eval_stencil_centers),
+        },
+        "loss_weights": {name: float(loss_weight(config, name)) for name in LOSS_NAMES},
+        "final_scheduled_loss_weights": {
+            name: float(scheduled_loss_weight(config, name, final_epoch)) for name in LOSS_NAMES
+        },
     }
 
     rows = [
