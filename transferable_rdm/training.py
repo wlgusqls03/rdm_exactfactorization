@@ -114,6 +114,12 @@ VAL_HISTORY_KEYS = (
     "kinetic_rel_abs_error_p90",
     "kinetic_rel_sq_error",
     "kinetic_rel_rmse",
+    "rho_vw_kinetic",
+    "rho_vw_kinetic_gradient",
+    "rho_vw_kinetic_form_gap",
+    "rho_vw_minus_gamma_kinetic",
+    "rho_vw_abs_error",
+    "rho_vw_rel_error",
     "energy_total_abs_error",
     "energy_total_rmse",
     "energy_grid_total_abs_error",
@@ -866,6 +872,49 @@ def kinetic_energy_reference(
 
 def kinetic_prefactor(system: SystemRecord) -> float:
     return float(system.metadata.get("kinetic_prefactor", 0.5))
+
+
+def rho_von_weizsaecker_kinetic(system: SystemRecord, rho: np.ndarray | None = None) -> dict[str, float]:
+    """Density-only von Weizsaecker kinetic diagnostic on the interior grid.
+
+    For a single real orbital this equals the kinetic energy from the
+    one-particle density. For many occupied orbitals it is only a lower-level
+    density-only diagnostic, not the exact orbital/1-RDM kinetic energy.
+    """
+    values = system.rho_diag if rho is None else rho
+    rho_flat = np.asarray(values, dtype=np.float64).reshape(-1)
+    n_axis = int(round(rho_flat.size ** (1.0 / 3.0)))
+    if n_axis**3 != rho_flat.size or n_axis < 3:
+        return {
+            "rho_vw_kinetic_laplacian": float("nan"),
+            "rho_vw_kinetic_gradient": float("nan"),
+            "rho_vw_kinetic_form_gap": float("nan"),
+        }
+    sqrt_rho = np.sqrt(np.maximum(rho_flat, 0.0)).reshape(n_axis, n_axis, n_axis)
+    center = sqrt_rho[1:-1, 1:-1, 1:-1]
+    h2 = float(system.step) ** 2
+    laplacian = (
+        sqrt_rho[2:, 1:-1, 1:-1]
+        + sqrt_rho[:-2, 1:-1, 1:-1]
+        + sqrt_rho[1:-1, 2:, 1:-1]
+        + sqrt_rho[1:-1, :-2, 1:-1]
+        + sqrt_rho[1:-1, 1:-1, 2:]
+        + sqrt_rho[1:-1, 1:-1, :-2]
+        - 6.0 * center
+    ) / h2
+    grad_x = (sqrt_rho[2:, 1:-1, 1:-1] - sqrt_rho[:-2, 1:-1, 1:-1]) / (2.0 * float(system.step))
+    grad_y = (sqrt_rho[1:-1, 2:, 1:-1] - sqrt_rho[1:-1, :-2, 1:-1]) / (2.0 * float(system.step))
+    grad_z = (sqrt_rho[1:-1, 1:-1, 2:] - sqrt_rho[1:-1, 1:-1, :-2]) / (2.0 * float(system.step))
+    prefactor = kinetic_prefactor(system)
+    kinetic_laplacian = -prefactor * float(np.sum(center * laplacian, dtype=np.float64) * system.cell_volume)
+    kinetic_gradient = prefactor * float(
+        np.sum(grad_x**2 + grad_y**2 + grad_z**2, dtype=np.float64) * system.cell_volume
+    )
+    return {
+        "rho_vw_kinetic_laplacian": kinetic_laplacian,
+        "rho_vw_kinetic_gradient": kinetic_gradient,
+        "rho_vw_kinetic_form_gap": kinetic_gradient - kinetic_laplacian,
+    }
 
 
 def physics_tau_integral(system: SystemRecord, config: ExperimentConfig) -> float:
@@ -1951,6 +2000,11 @@ def evaluate_system(
     kinetic_scale = max(abs(kinetic_ref), 1.0)
     kinetic_rel_abs_error = float(abs(kinetic_ref_error) / kinetic_scale)
     kinetic_rel_sq_error = float((kinetic_ref_error / kinetic_scale) ** 2)
+    rho_vw_stats = rho_von_weizsaecker_kinetic(system, system.rho_diag)
+    rho_vw_kinetic = float(rho_vw_stats["rho_vw_kinetic_laplacian"])
+    rho_vw_minus_gamma = float(rho_vw_kinetic - kinetic_ref)
+    rho_vw_abs_error = float(abs(rho_vw_minus_gamma))
+    rho_vw_rel_error = float(rho_vw_minus_gamma / kinetic_scale)
     stencil_indices = (
         np.arange(total_stencil_centers, dtype=np.int64)
         if eval_center_indices is None
@@ -2094,6 +2148,12 @@ def evaluate_system(
         "kinetic_rel_abs_error": kinetic_rel_abs_error,
         "kinetic_rel_sq_error": kinetic_rel_sq_error,
         "kinetic_rel_rmse": abs(kinetic_ref_error) / kinetic_scale,
+        "rho_vw_kinetic": rho_vw_kinetic,
+        "rho_vw_kinetic_gradient": float(rho_vw_stats["rho_vw_kinetic_gradient"]),
+        "rho_vw_kinetic_form_gap": float(rho_vw_stats["rho_vw_kinetic_form_gap"]),
+        "rho_vw_minus_gamma_kinetic": rho_vw_minus_gamma,
+        "rho_vw_abs_error": rho_vw_abs_error,
+        "rho_vw_rel_error": rho_vw_rel_error,
         **kinetic_stencil_decomposition,
         "trace_loss": trace_loss,
         "trace_rel_error": trace_rel_error,
@@ -2249,6 +2309,12 @@ def evaluate_systems(
         "kinetic_rel_abs_error",
         "kinetic_rel_sq_error",
         "kinetic_rel_rmse",
+        "rho_vw_kinetic",
+        "rho_vw_kinetic_gradient",
+        "rho_vw_kinetic_form_gap",
+        "rho_vw_minus_gamma_kinetic",
+        "rho_vw_abs_error",
+        "rho_vw_rel_error",
         "kinetic_stencil_diag_error",
         "kinetic_stencil_diag_abs_error",
         "kinetic_stencil_offdiag_error",
@@ -3483,6 +3549,12 @@ def train_models(
         ("held-out kinetic abs err", f"{final_val['kinetic_abs_error']:.6e}"),
         ("held-out kinetic abs err P90", f"{final_val['kinetic_abs_error_p90']:.6e}"),
         ("held-out kinetic RMSE", f"{final_val['kinetic_rmse']:.6e}"),
+        ("held-out rho-vW kinetic", f"{final_val['rho_vw_kinetic']:.6e}"),
+        ("held-out rho-vW minus gamma T", f"{final_val['rho_vw_minus_gamma_kinetic']:.6e}"),
+        ("held-out rho-vW abs/rel error", (
+            f"{final_val['rho_vw_abs_error']:.6e} / "
+            f"{final_val['rho_vw_rel_error']:.6e}"
+        )),
         ("held-out kinetic stencil diag/offdiag", (
             f"{final_val['kinetic_stencil_diag_error']:.6e} / "
             f"{final_val['kinetic_stencil_offdiag_error']:.6e}"
@@ -3551,6 +3623,12 @@ def train_models(
                 ("test kinetic abs err", f"{final_test['kinetic_abs_error']:.6e}"),
                 ("test kinetic abs err P90", f"{final_test['kinetic_abs_error_p90']:.6e}"),
                 ("test kinetic RMSE", f"{final_test['kinetic_rmse']:.6e}"),
+                ("test rho-vW kinetic", f"{final_test['rho_vw_kinetic']:.6e}"),
+                ("test rho-vW minus gamma T", f"{final_test['rho_vw_minus_gamma_kinetic']:.6e}"),
+                ("test rho-vW abs/rel error", (
+                    f"{final_test['rho_vw_abs_error']:.6e} / "
+                    f"{final_test['rho_vw_rel_error']:.6e}"
+                )),
                 ("test kinetic stencil diag/offdiag", (
                     f"{final_test['kinetic_stencil_diag_error']:.6e} / "
                     f"{final_test['kinetic_stencil_offdiag_error']:.6e}"
