@@ -114,12 +114,24 @@ VAL_HISTORY_KEYS = (
     "kinetic_rel_abs_error_p90",
     "kinetic_rel_sq_error",
     "kinetic_rel_rmse",
+    "rho_tf_kinetic",
+    "rho_tf_minus_gamma_kinetic",
+    "rho_tf_abs_error",
+    "rho_tf_rel_error",
     "rho_vw_kinetic",
     "rho_vw_kinetic_gradient",
     "rho_vw_kinetic_form_gap",
     "rho_vw_minus_gamma_kinetic",
     "rho_vw_abs_error",
     "rho_vw_rel_error",
+    "rho_ge2_kinetic",
+    "rho_ge2_minus_gamma_kinetic",
+    "rho_ge2_abs_error",
+    "rho_ge2_rel_error",
+    "rho_ge4_kinetic",
+    "rho_ge4_minus_gamma_kinetic",
+    "rho_ge4_abs_error",
+    "rho_ge4_rel_error",
     "energy_total_abs_error",
     "energy_total_rmse",
     "energy_grid_total_abs_error",
@@ -874,26 +886,32 @@ def kinetic_prefactor(system: SystemRecord) -> float:
     return float(system.metadata.get("kinetic_prefactor", 0.5))
 
 
-def rho_von_weizsaecker_kinetic(system: SystemRecord, rho: np.ndarray | None = None) -> dict[str, float]:
-    """Density-only von Weizsaecker kinetic diagnostic on the interior grid.
+def density_only_kinetic_diagnostics(system: SystemRecord, rho: np.ndarray | None = None) -> dict[str, float]:
+    """Density-only kinetic diagnostics on the interior grid.
 
-    For a single real orbital this equals the kinetic energy from the
-    one-particle density. For many occupied orbitals it is only a lower-level
-    density-only diagnostic, not the exact orbital/1-RDM kinetic energy.
+    TF, vW, GE2, and GE4 are orbital-free density functionals. They are useful
+    baselines against the orbital/1-RDM kinetic reference, but they are not used
+    as training targets here.
     """
     values = system.rho_diag if rho is None else rho
     rho_flat = np.asarray(values, dtype=np.float64).reshape(-1)
     n_axis = int(round(rho_flat.size ** (1.0 / 3.0)))
     if n_axis**3 != rho_flat.size or n_axis < 3:
         return {
+            "rho_tf_kinetic": float("nan"),
             "rho_vw_kinetic_laplacian": float("nan"),
             "rho_vw_kinetic_gradient": float("nan"),
             "rho_vw_kinetic_form_gap": float("nan"),
+            "rho_ge2_kinetic": float("nan"),
+            "rho_ge4_kinetic": float("nan"),
         }
-    sqrt_rho = np.sqrt(np.maximum(rho_flat, 0.0)).reshape(n_axis, n_axis, n_axis)
+    rho_cube = np.maximum(rho_flat, 0.0).reshape(n_axis, n_axis, n_axis)
+    sqrt_rho = np.sqrt(rho_cube)
+    h = float(system.step)
+    h2 = h**2
+    rho_center = rho_cube[1:-1, 1:-1, 1:-1]
     center = sqrt_rho[1:-1, 1:-1, 1:-1]
-    h2 = float(system.step) ** 2
-    laplacian = (
+    sqrt_laplacian = (
         sqrt_rho[2:, 1:-1, 1:-1]
         + sqrt_rho[:-2, 1:-1, 1:-1]
         + sqrt_rho[1:-1, 2:, 1:-1]
@@ -902,18 +920,86 @@ def rho_von_weizsaecker_kinetic(system: SystemRecord, rho: np.ndarray | None = N
         + sqrt_rho[1:-1, 1:-1, :-2]
         - 6.0 * center
     ) / h2
-    grad_x = (sqrt_rho[2:, 1:-1, 1:-1] - sqrt_rho[:-2, 1:-1, 1:-1]) / (2.0 * float(system.step))
-    grad_y = (sqrt_rho[1:-1, 2:, 1:-1] - sqrt_rho[1:-1, :-2, 1:-1]) / (2.0 * float(system.step))
-    grad_z = (sqrt_rho[1:-1, 1:-1, 2:] - sqrt_rho[1:-1, 1:-1, :-2]) / (2.0 * float(system.step))
+    sqrt_grad_x = (sqrt_rho[2:, 1:-1, 1:-1] - sqrt_rho[:-2, 1:-1, 1:-1]) / (2.0 * h)
+    sqrt_grad_y = (sqrt_rho[1:-1, 2:, 1:-1] - sqrt_rho[1:-1, :-2, 1:-1]) / (2.0 * h)
+    sqrt_grad_z = (sqrt_rho[1:-1, 1:-1, 2:] - sqrt_rho[1:-1, 1:-1, :-2]) / (2.0 * h)
+    rho_grad_x = (rho_cube[2:, 1:-1, 1:-1] - rho_cube[:-2, 1:-1, 1:-1]) / (2.0 * h)
+    rho_grad_y = (rho_cube[1:-1, 2:, 1:-1] - rho_cube[1:-1, :-2, 1:-1]) / (2.0 * h)
+    rho_grad_z = (rho_cube[1:-1, 1:-1, 2:] - rho_cube[1:-1, 1:-1, :-2]) / (2.0 * h)
+    rho_laplacian = (
+        rho_cube[2:, 1:-1, 1:-1]
+        + rho_cube[:-2, 1:-1, 1:-1]
+        + rho_cube[1:-1, 2:, 1:-1]
+        + rho_cube[1:-1, :-2, 1:-1]
+        + rho_cube[1:-1, 1:-1, 2:]
+        + rho_cube[1:-1, 1:-1, :-2]
+        - 6.0 * rho_center
+    ) / h2
     prefactor = kinetic_prefactor(system)
-    kinetic_laplacian = -prefactor * float(np.sum(center * laplacian, dtype=np.float64) * system.cell_volume)
-    kinetic_gradient = prefactor * float(
-        np.sum(grad_x**2 + grad_y**2 + grad_z**2, dtype=np.float64) * system.cell_volume
+    mass_scale = 2.0 * prefactor
+    cf = mass_scale * (3.0 / 10.0) * (3.0 * np.pi**2) ** (2.0 / 3.0)
+    rho_floor = max(float(np.max(rho_center)) * 1e-12, 1e-30)
+    rho_safe = np.maximum(rho_center, rho_floor)
+    grad_rho_sq = rho_grad_x**2 + rho_grad_y**2 + rho_grad_z**2
+    tau_tf = cf * rho_safe ** (5.0 / 3.0)
+    s_sq = grad_rho_sq / (
+        4.0 * (3.0 * np.pi**2) ** (2.0 / 3.0) * rho_safe ** (8.0 / 3.0)
     )
+    q = rho_laplacian / (
+        4.0 * (3.0 * np.pi**2) ** (2.0 / 3.0) * rho_safe ** (5.0 / 3.0)
+    )
+    kinetic_tf = float(np.sum(tau_tf, dtype=np.float64) * system.cell_volume)
+    kinetic_vw_laplacian = -prefactor * float(np.sum(center * sqrt_laplacian, dtype=np.float64) * system.cell_volume)
+    kinetic_vw_gradient = prefactor * float(
+        np.sum(sqrt_grad_x**2 + sqrt_grad_y**2 + sqrt_grad_z**2, dtype=np.float64) * system.cell_volume
+    )
+    kinetic_ge2 = float(np.sum(tau_tf * (1.0 + (5.0 / 27.0) * s_sq), dtype=np.float64) * system.cell_volume)
+    enhancement_ge4 = (
+        1.0
+        + (5.0 / 27.0) * s_sq
+        + (20.0 / 9.0) * q
+        + (8.0 / 81.0) * q**2
+        - (1.0 / 9.0) * s_sq * q
+        + (8.0 / 243.0) * s_sq**2
+    )
+    kinetic_ge4 = float(np.sum(tau_tf * enhancement_ge4, dtype=np.float64) * system.cell_volume)
     return {
-        "rho_vw_kinetic_laplacian": kinetic_laplacian,
-        "rho_vw_kinetic_gradient": kinetic_gradient,
-        "rho_vw_kinetic_form_gap": kinetic_gradient - kinetic_laplacian,
+        "rho_tf_kinetic": kinetic_tf,
+        "rho_vw_kinetic_laplacian": kinetic_vw_laplacian,
+        "rho_vw_kinetic_gradient": kinetic_vw_gradient,
+        "rho_vw_kinetic_form_gap": kinetic_vw_gradient - kinetic_vw_laplacian,
+        "rho_ge2_kinetic": kinetic_ge2,
+        "rho_ge4_kinetic": kinetic_ge4,
+    }
+
+
+def density_only_error_metrics(
+    diagnostics: dict[str, float],
+    reference: float,
+    scale: float,
+) -> dict[str, float]:
+    metrics = {}
+    for label, key in (
+        ("tf", "rho_tf_kinetic"),
+        ("vw", "rho_vw_kinetic_laplacian"),
+        ("ge2", "rho_ge2_kinetic"),
+        ("ge4", "rho_ge4_kinetic"),
+    ):
+        value = float(diagnostics[key])
+        delta = value - reference
+        metrics[f"rho_{label}_minus_gamma_kinetic"] = delta
+        metrics[f"rho_{label}_abs_error"] = abs(delta)
+        metrics[f"rho_{label}_rel_error"] = delta / scale
+    return metrics
+
+
+def rho_von_weizsaecker_kinetic(system: SystemRecord, rho: np.ndarray | None = None) -> dict[str, float]:
+    """Backward-compatible wrapper for the original vW diagnostic."""
+    diagnostics = density_only_kinetic_diagnostics(system, rho)
+    return {
+        "rho_vw_kinetic_laplacian": diagnostics["rho_vw_kinetic_laplacian"],
+        "rho_vw_kinetic_gradient": diagnostics["rho_vw_kinetic_gradient"],
+        "rho_vw_kinetic_form_gap": diagnostics["rho_vw_kinetic_form_gap"],
     }
 
 
@@ -2000,11 +2086,12 @@ def evaluate_system(
     kinetic_scale = max(abs(kinetic_ref), 1.0)
     kinetic_rel_abs_error = float(abs(kinetic_ref_error) / kinetic_scale)
     kinetic_rel_sq_error = float((kinetic_ref_error / kinetic_scale) ** 2)
-    rho_vw_stats = rho_von_weizsaecker_kinetic(system, system.rho_diag)
-    rho_vw_kinetic = float(rho_vw_stats["rho_vw_kinetic_laplacian"])
-    rho_vw_minus_gamma = float(rho_vw_kinetic - kinetic_ref)
-    rho_vw_abs_error = float(abs(rho_vw_minus_gamma))
-    rho_vw_rel_error = float(rho_vw_minus_gamma / kinetic_scale)
+    density_kinetic_stats = density_only_kinetic_diagnostics(system, system.rho_diag)
+    density_kinetic_errors = density_only_error_metrics(
+        density_kinetic_stats,
+        kinetic_ref,
+        kinetic_scale,
+    )
     stencil_indices = (
         np.arange(total_stencil_centers, dtype=np.int64)
         if eval_center_indices is None
@@ -2148,12 +2235,13 @@ def evaluate_system(
         "kinetic_rel_abs_error": kinetic_rel_abs_error,
         "kinetic_rel_sq_error": kinetic_rel_sq_error,
         "kinetic_rel_rmse": abs(kinetic_ref_error) / kinetic_scale,
-        "rho_vw_kinetic": rho_vw_kinetic,
-        "rho_vw_kinetic_gradient": float(rho_vw_stats["rho_vw_kinetic_gradient"]),
-        "rho_vw_kinetic_form_gap": float(rho_vw_stats["rho_vw_kinetic_form_gap"]),
-        "rho_vw_minus_gamma_kinetic": rho_vw_minus_gamma,
-        "rho_vw_abs_error": rho_vw_abs_error,
-        "rho_vw_rel_error": rho_vw_rel_error,
+        "rho_tf_kinetic": float(density_kinetic_stats["rho_tf_kinetic"]),
+        "rho_vw_kinetic": float(density_kinetic_stats["rho_vw_kinetic_laplacian"]),
+        "rho_vw_kinetic_gradient": float(density_kinetic_stats["rho_vw_kinetic_gradient"]),
+        "rho_vw_kinetic_form_gap": float(density_kinetic_stats["rho_vw_kinetic_form_gap"]),
+        "rho_ge2_kinetic": float(density_kinetic_stats["rho_ge2_kinetic"]),
+        "rho_ge4_kinetic": float(density_kinetic_stats["rho_ge4_kinetic"]),
+        **density_kinetic_errors,
         **kinetic_stencil_decomposition,
         "trace_loss": trace_loss,
         "trace_rel_error": trace_rel_error,
@@ -2309,12 +2397,24 @@ def evaluate_systems(
         "kinetic_rel_abs_error",
         "kinetic_rel_sq_error",
         "kinetic_rel_rmse",
+        "rho_tf_kinetic",
+        "rho_tf_minus_gamma_kinetic",
+        "rho_tf_abs_error",
+        "rho_tf_rel_error",
         "rho_vw_kinetic",
         "rho_vw_kinetic_gradient",
         "rho_vw_kinetic_form_gap",
         "rho_vw_minus_gamma_kinetic",
         "rho_vw_abs_error",
         "rho_vw_rel_error",
+        "rho_ge2_kinetic",
+        "rho_ge2_minus_gamma_kinetic",
+        "rho_ge2_abs_error",
+        "rho_ge2_rel_error",
+        "rho_ge4_kinetic",
+        "rho_ge4_minus_gamma_kinetic",
+        "rho_ge4_abs_error",
+        "rho_ge4_rel_error",
         "kinetic_stencil_diag_error",
         "kinetic_stencil_diag_abs_error",
         "kinetic_stencil_offdiag_error",
@@ -3549,11 +3649,17 @@ def train_models(
         ("held-out kinetic abs err", f"{final_val['kinetic_abs_error']:.6e}"),
         ("held-out kinetic abs err P90", f"{final_val['kinetic_abs_error_p90']:.6e}"),
         ("held-out kinetic RMSE", f"{final_val['kinetic_rmse']:.6e}"),
-        ("held-out rho-vW kinetic", f"{final_val['rho_vw_kinetic']:.6e}"),
-        ("held-out rho-vW minus gamma T", f"{final_val['rho_vw_minus_gamma_kinetic']:.6e}"),
-        ("held-out rho-vW abs/rel error", (
+        ("held-out density-only T TF/vW/GE2/GE4", (
+            f"{final_val['rho_tf_kinetic']:.6e} / "
+            f"{final_val['rho_vw_kinetic']:.6e} / "
+            f"{final_val['rho_ge2_kinetic']:.6e} / "
+            f"{final_val['rho_ge4_kinetic']:.6e}"
+        )),
+        ("held-out density-only |T-rdmT| TF/vW/GE2/GE4", (
+            f"{final_val['rho_tf_abs_error']:.6e} / "
             f"{final_val['rho_vw_abs_error']:.6e} / "
-            f"{final_val['rho_vw_rel_error']:.6e}"
+            f"{final_val['rho_ge2_abs_error']:.6e} / "
+            f"{final_val['rho_ge4_abs_error']:.6e}"
         )),
         ("held-out kinetic stencil diag/offdiag", (
             f"{final_val['kinetic_stencil_diag_error']:.6e} / "
@@ -3623,11 +3729,17 @@ def train_models(
                 ("test kinetic abs err", f"{final_test['kinetic_abs_error']:.6e}"),
                 ("test kinetic abs err P90", f"{final_test['kinetic_abs_error_p90']:.6e}"),
                 ("test kinetic RMSE", f"{final_test['kinetic_rmse']:.6e}"),
-                ("test rho-vW kinetic", f"{final_test['rho_vw_kinetic']:.6e}"),
-                ("test rho-vW minus gamma T", f"{final_test['rho_vw_minus_gamma_kinetic']:.6e}"),
-                ("test rho-vW abs/rel error", (
+                ("test density-only T TF/vW/GE2/GE4", (
+                    f"{final_test['rho_tf_kinetic']:.6e} / "
+                    f"{final_test['rho_vw_kinetic']:.6e} / "
+                    f"{final_test['rho_ge2_kinetic']:.6e} / "
+                    f"{final_test['rho_ge4_kinetic']:.6e}"
+                )),
+                ("test density-only |T-rdmT| TF/vW/GE2/GE4", (
+                    f"{final_test['rho_tf_abs_error']:.6e} / "
                     f"{final_test['rho_vw_abs_error']:.6e} / "
-                    f"{final_test['rho_vw_rel_error']:.6e}"
+                    f"{final_test['rho_ge2_abs_error']:.6e} / "
+                    f"{final_test['rho_ge4_abs_error']:.6e}"
                 )),
                 ("test kinetic stencil diag/offdiag", (
                     f"{final_test['kinetic_stencil_diag_error']:.6e} / "

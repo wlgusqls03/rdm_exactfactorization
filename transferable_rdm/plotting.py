@@ -270,8 +270,20 @@ def build_metrics_text(summary: dict[str, object], representative: dict[str, obj
         f"tau MAE/RMSE    : {val_avg['tau_mae']:10.3e} / {val_avg.get('tau_rmse', np.nan):10.3e}",
         f"KINETIC ABS [Ha]: {val_avg.get('kinetic_abs_error', np.nan):10.3e}",
         f"KINETIC RMSE/P90: {val_avg.get('kinetic_rmse', np.nan):10.3e} / {val_avg.get('kinetic_abs_error_p90', np.nan):10.3e}",
-        f"rho-vW T [Ha]  : {val_avg.get('rho_vw_kinetic', np.nan):10.3e}",
-        f"rho-vW - gammaT: {val_avg.get('rho_vw_minus_gamma_kinetic', np.nan):+10.3e}",
+        (
+            "rho T TF/vW/G2/G4: "
+            f"{val_avg.get('rho_tf_kinetic', np.nan):.2e} / "
+            f"{val_avg.get('rho_vw_kinetic', np.nan):.2e} / "
+            f"{val_avg.get('rho_ge2_kinetic', np.nan):.2e} / "
+            f"{val_avg.get('rho_ge4_kinetic', np.nan):.2e}"
+        ),
+        (
+            "rho |dT| TF/vW/G2/G4: "
+            f"{val_avg.get('rho_tf_abs_error', np.nan):.2e} / "
+            f"{val_avg.get('rho_vw_abs_error', np.nan):.2e} / "
+            f"{val_avg.get('rho_ge2_abs_error', np.nan):.2e} / "
+            f"{val_avg.get('rho_ge4_abs_error', np.nan):.2e}"
+        ),
         (
             "T stencil d/off: "
             f"{val_avg.get('kinetic_stencil_diag_error', np.nan):+.2e} / "
@@ -310,7 +322,7 @@ def build_metrics_text(summary: dict[str, object], representative: dict[str, obj
         f"tau MAE         : {representative['tau_mae']:10.3e}",
         f"T true [Ha]     : {representative.get('kinetic_training_ref', np.nan):10.3e}",
         f"T pred [Ha]     : {representative.get('kinetic_pred', np.nan):10.3e}",
-        f"rho-vW T [Ha]   : {representative.get('rho_vw_kinetic', np.nan):10.3e}",
+        f"rho TF/vW/GE2/GE4: {representative.get('rho_tf_kinetic', np.nan):.2e} / {representative.get('rho_vw_kinetic', np.nan):.2e} / {representative.get('rho_ge2_kinetic', np.nan):.2e} / {representative.get('rho_ge4_kinetic', np.nan):.2e}",
         (
             "anchor xyz idx  : "
             + np.array2string(
